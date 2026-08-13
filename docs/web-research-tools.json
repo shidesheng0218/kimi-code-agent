@@ -1,0 +1,47 @@
+{
+  "tools": [
+    {
+      "name": "web.search",
+      "purpose": "Search a configured, user-authorized web search provider and return compact, source-identifiable results that can be fetched or cited in a task.",
+      "category": "search",
+      "inputs": [
+        {"name": "query", "type": "string", "description": "Search query", "required": true, "min_length": 1, "max_length": 500, "examples": ["Kimi Code ACP migration guide"]},
+        {"name": "maxResults", "type": "integer", "description": "Maximum number of results", "required": false, "default": 5, "minimum": 1, "maximum": 10},
+        {"name": "language", "type": "string", "description": "Preferred result language", "required": false, "default": "zh-Hans", "max_length": 32},
+        {"name": "freshness", "type": "string", "description": "Result freshness window", "required": false, "default": "any", "enum": ["any", "day", "week", "month", "year"]}
+      ],
+      "outputs": [
+        {"name": "results", "type": "array", "description": "Source records containing sourceID, title, URL, snippet, domain, and optional publication date"},
+        {"name": "metadata", "type": "object", "description": "Provider, cache status, elapsed time, and query metadata"}
+      ],
+      "error_conditions": ["Search provider is not configured", "Invalid query", "Provider authentication failed", "Rate limit", "Network timeout", "No results"],
+      "side_effects": ["Creates a local in-memory cache entry and an auditable tool event"],
+      "idempotent": true,
+      "rate_limits": {"requests_per_minute": 30, "requests_per_hour": 120, "burst_limit": 5},
+      "dependencies": ["Configured Brave Search API or self-hosted SearxNG endpoint"],
+      "examples": [{"description": "Search for current official documentation", "input": {"query": "Kimi Code ACP official documentation", "maxResults": 5, "language": "en", "freshness": "year"}, "expected_output": {"results": [{"sourceID": "src_1", "title": "Kimi Code ACP", "url": "https://example.com/acp", "snippet": "Official migration guide", "domain": "example.com"}]}}],
+      "security_requirements": ["No key in output", "Provider endpoint is validated", "Search results are read-only provenance records"]
+    },
+    {
+      "name": "web.fetch",
+      "purpose": "Fetch a user-authorized or search-provenance URL, extract readable text, and return a bounded source record for evidence-backed task work.",
+      "category": "fetch",
+      "inputs": [
+        {"name": "url", "type": "string", "description": "HTTP(S) URL to fetch", "required": true, "min_length": 10, "max_length": 4096, "examples": ["https://example.com/docs"]},
+        {"name": "sourceID", "type": "string", "description": "Optional source identifier returned by web.search", "required": false, "max_length": 128},
+        {"name": "maxChars", "type": "integer", "description": "Maximum extracted characters returned to the model", "required": false, "default": 24000, "minimum": 1000, "maximum": 64000}
+      ],
+      "outputs": [
+        {"name": "source", "type": "object", "description": "URL, title, domain, content type, sourceID, cache status, and fetch metadata"},
+        {"name": "content", "type": "string", "description": "Readable, bounded document text"}
+      ],
+      "error_conditions": ["Invalid URL", "Domain is not authorized", "Unsafe local/private network target", "Response too large", "Network timeout", "Unsupported content type"],
+      "side_effects": ["Creates a local in-memory cache entry and an auditable tool event"],
+      "idempotent": true,
+      "rate_limits": {"requests_per_minute": 60, "requests_per_hour": 240, "burst_limit": 10},
+      "dependencies": ["Network gateway", "Domain authorization policy"],
+      "examples": [{"description": "Fetch a source returned by search", "input": {"url": "https://example.com/docs", "sourceID": "src_1", "maxChars": 12000}, "expected_output": {"source": {"sourceID": "src_1", "url": "https://example.com/docs", "domain": "example.com"}, "content": "Extracted readable content"}}],
+      "security_requirements": ["HTTP(S) only", "Bounded bytes and text", "Never expose authorization headers or secrets", "Only read operations"]
+    }
+  ]
+}

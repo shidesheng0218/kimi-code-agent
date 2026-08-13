@@ -1,0 +1,42 @@
+{
+  "tools": [
+    {
+      "name": "acp_session",
+      "purpose": "Creates, resumes, prompts, cancels, and closes one Kimi ACP stdio session.",
+      "category": "agent_runtime",
+      "inputs": [
+        { "name": "operation", "type": "string", "description": "ACP operation", "required": true, "enum": ["initialize", "new", "resume", "prompt", "cancel", "close"] },
+        { "name": "workspace_path", "type": "string", "description": "Absolute workspace directory", "required": false },
+        { "name": "session_id", "type": "string", "description": "Existing ACP session identifier", "required": false },
+        { "name": "prompt", "type": "string", "description": "User prompt", "required": false, "max_length": 20000 }
+      ],
+      "outputs": [{ "name": "events", "type": "array", "description": "Structured ACP event envelopes" }],
+      "error_conditions": ["ACP runtime unavailable", "session not found", "authentication required", "prompt cancelled"],
+      "side_effects": ["Creates or updates a local runtime session"],
+      "idempotent": false,
+      "rate_limits": { "requests_per_minute": 30, "requests_per_hour": 300, "burst_limit": 4 },
+      "dependencies": ["Kimi ACP stdio runtime"],
+      "examples": [{ "description": "Start a prompt", "input": { "operation": "prompt", "prompt": "Run the project tests" }, "expected_output": { "events": [] } }],
+      "security_requirements": ["Workspace path must be explicit", "approval requests must be surfaced"]
+    },
+    {
+      "name": "web_research_source",
+      "purpose": "Records a search or fetch source with a safe public URL and no provider credential.",
+      "category": "research",
+      "inputs": [
+        { "name": "operation", "type": "string", "description": "Research action", "required": true, "enum": ["search", "fetch", "retry"] },
+        { "name": "url", "type": "string", "description": "Public HTTP(S) source URL", "required": false },
+        { "name": "title", "type": "string", "description": "Source title", "required": false },
+        { "name": "summary", "type": "string", "description": "Short evidence summary", "required": false, "max_length": 4000 }
+      ],
+      "outputs": [{ "name": "source_id", "type": "string", "description": "Stable local source identifier" }],
+      "error_conditions": ["unsafe URL", "provider unavailable", "approval denied"],
+      "side_effects": ["Writes local task audit metadata"],
+      "idempotent": true,
+      "rate_limits": { "requests_per_minute": 60, "requests_per_hour": 500, "burst_limit": 10 },
+      "dependencies": ["Web research gateway"],
+      "examples": [{ "description": "Capture a fetched page", "input": { "operation": "fetch", "url": "https://example.com" }, "expected_output": { "source_id": "source-1" } }],
+      "security_requirements": ["Do not persist secrets", "Do not persist full page body"]
+    }
+  ]
+}

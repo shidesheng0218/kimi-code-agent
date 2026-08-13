@@ -1,0 +1,54 @@
+{
+  "goal": "Add a local-first, auditable web research loop to Kimi Agent Desktop: query the web, select sources, fetch readable content, and return source-backed answers without losing user control.",
+  "description": "The desktop coding agent needs a dependable web.search and web.fetch tool pair. Search must return structured, source-identifiable results; fetch must enforce read-only network policy, extract readable text, preserve provenance, cache safe repeated requests, and emit actionable errors. The existing Native Agent Host and CLI fallback must not imply web capability when the host cannot run external tools.",
+  "tasks": [
+    "Search configured web providers with query, locale, freshness, and result-limit controls",
+    "Fetch and extract readable text from selected HTTP(S) sources",
+    "Apply domain, URL, size, timeout, retry, and private-network safeguards",
+    "Cache short-lived repeated search and fetch requests to reduce latency and API spend",
+    "Return provenance-rich structured results suitable for citations and task audit trails",
+    "Expose clear configuration and error-recovery paths for provider credentials",
+    "Keep direct fetch, search-provider requests, and third-party MCP integrations composable"
+  ],
+  "constraints": {
+    "max_response_time": 15000,
+    "budget_per_task": 0.05,
+    "quality_threshold": 0.95,
+    "concurrent_tasks": 1,
+    "data_retention_days": 0,
+    "security_level": "high",
+    "compliance_requirements": ["local-first", "least-privilege", "no-secret-logging"]
+  },
+  "team_size": 2,
+  "performance_requirements": {
+    "high_throughput": false,
+    "fault_tolerance": true,
+    "low_latency": true,
+    "scalability": "small",
+    "availability": 0.99
+  },
+  "safety_requirements": [
+    "HTTP(S)-only URL validation",
+    "Domain allowlists and provider endpoint validation",
+    "Block unsafe private-network fetch targets except explicitly local development paths",
+    "Bounded response sizes, timeouts, retries, and cache TTLs",
+    "No API key, authorization header, or raw sensitive request header in logs",
+    "Structured audit metadata for source, provider, cache status, and failures"
+  ],
+  "integration_requirements": [
+    "Native Agent Host external tools",
+    "Kimi desktop runtime environment injection",
+    "macOS Keychain-backed search provider credentials",
+    "SwiftUI connection settings",
+    "Task prompt citation instructions",
+    "HTTP MCP interoperability"
+  ],
+  "scale_requirements": {
+    "initial_users": 1,
+    "peak_concurrent_users": 8,
+    "data_volume_gb": 0.1,
+    "requests_per_hour": 120,
+    "geographic_regions": ["local"],
+    "growth_projection": "local-first"
+  }
+}

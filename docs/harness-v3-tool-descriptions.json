@@ -1,0 +1,74 @@
+{
+  "tools": [
+    {
+      "name": "workspace_read",
+      "purpose": "Read or search files inside the current workspace or worktree without side effects",
+      "category": "file",
+      "inputs": [{"name":"path","type":"string","description":"Workspace-relative path","required":true}],
+      "outputs": [{"name":"content","type":"string","description":"File content or search results"}],
+      "error_conditions": ["path outside workspace", "file missing", "binary file too large"],
+      "side_effects": [],
+      "idempotent": true,
+      "rate_limits": {"requests_per_minute": 120, "requests_per_hour": 5000, "burst_limit": 20},
+      "dependencies": ["workspace-boundary-service", "secret-redactor"],
+      "examples": [{"description": "Read a workspace file", "input": {"path": "README.md"}, "expected_output": {"content": "# Project"}}],
+      "security_requirements": ["workspace boundary validation", "secret redaction"]
+    },
+    {
+      "name": "workspace_write",
+      "purpose": "Write a file only inside an approved isolated worktree",
+      "category": "file",
+      "inputs": [{"name":"path","type":"string","description":"Worktree-relative path","required":true},{"name":"content","type":"string","description":"Replacement content","required":true}],
+      "outputs": [{"name":"receipt","type":"object","description":"Path, bytes, diff reference, and idempotency key"}],
+      "error_conditions": ["path outside worktree", "permission denied", "write conflict"],
+      "side_effects": ["modifies an approved worktree"],
+      "idempotent": false,
+      "rate_limits": {"requests_per_minute": 30, "requests_per_hour": 500, "burst_limit": 4},
+      "dependencies": ["worktree-manager", "permission-gate", "effect-journal"],
+      "examples": [{"description": "Write inside an approved worktree", "input": {"path": "Sources/App.swift", "content": "import Foundation"}, "expected_output": {"receipt": {"path": "Sources/App.swift", "bytes": 17}}}],
+      "security_requirements": ["worktree boundary validation", "task approval", "intent before write"]
+    },
+    {
+      "name": "shell_execute",
+      "purpose": "Run a bounded shell command in an approved workspace or terminal session",
+      "category": "command",
+      "inputs": [{"name":"command","type":"string","description":"Shell command","required":true},{"name":"cwd","type":"string","description":"Approved working directory","required":false}],
+      "outputs": [{"name":"result","type":"object","description":"Exit code, redacted stdout, stderr, duration, and receipt"}],
+      "error_conditions": ["approval denied", "timeout", "non-zero exit", "process cancelled"],
+      "side_effects": ["starts a process"],
+      "idempotent": false,
+      "rate_limits": {"requests_per_minute": 20, "requests_per_hour": 300, "burst_limit": 3},
+      "dependencies": ["terminal-pty", "command-risk-classifier", "effect-journal"],
+      "examples": [{"description": "Run a bounded test command", "input": {"command": "swift test", "cwd": "."}, "expected_output": {"result": {"exit_code": 0, "duration_ms": 1200}}}],
+      "security_requirements": ["command risk classification", "process-group cancellation", "secret redaction"]
+    },
+    {
+      "name": "browser_execute",
+      "purpose": "Execute an approved browser verification step and return screenshot, DOM, console, and navigation evidence",
+      "category": "browser",
+      "inputs": [{"name":"plan","type":"object","description":"Typed browser verification plan","required":true}],
+      "outputs": [{"name":"evidence","type":"object","description":"URL, step receipts, screenshot paths, console and network artifacts"}],
+      "error_conditions": ["domain not approved", "selector missing", "navigation failed", "cancelled"],
+      "side_effects": ["browser navigation and optional interaction"],
+      "idempotent": false,
+      "rate_limits": {"requests_per_minute": 12, "requests_per_hour": 120, "burst_limit": 2},
+      "dependencies": ["browser-verification-controller", "domain-permission-gate", "artifact-store"],
+      "examples": [{"description": "Verify a local page", "input": {"plan": {"steps": [{"action": "open", "url": "http://localhost:3000"}, {"action": "screenshot"}]}}, "expected_output": {"evidence": {"url": "http://localhost:3000", "step_count": 2}}}],
+      "security_requirements": ["domain approval", "action-level approval", "artifact redaction"]
+    },
+    {
+      "name": "mcp_call",
+      "purpose": "Invoke one discovered MCP tool through an isolated server worker",
+      "category": "integration",
+      "inputs": [{"name":"server_id","type":"string","description":"Trusted MCP server identifier","required":true},{"name":"tool","type":"string","description":"Discovered MCP tool name","required":true},{"name":"arguments","type":"object","description":"Tool arguments","required":false}],
+      "outputs": [{"name":"result","type":"object","description":"Redacted structured MCP response and receipt"}],
+      "error_conditions": ["server offline", "tool missing", "timeout", "permission denied"],
+      "side_effects": ["depends on selected MCP tool"],
+      "idempotent": false,
+      "rate_limits": {"requests_per_minute": 30, "requests_per_hour": 600, "burst_limit": 5},
+      "dependencies": ["mcp-worker-supervisor", "permission-gate", "effect-journal"],
+      "examples": [{"description": "Call a discovered read-only MCP tool", "input": {"server_id": "docs", "tool": "search", "arguments": {"query": "API"}}, "expected_output": {"result": {"items": []}}}],
+      "security_requirements": ["server trust", "tool-level approval", "output size limit"]
+    }
+  ]
+}
