@@ -1,0 +1,32 @@
+{
+  "name": "kimi-agent-desktop-macos",
+  "displayName": "Kimi Agent Desktop for macOS",
+  "description": "Native macOS local-first Kimi coding agent workbench.",
+  "version": "0.3.0",
+  "private": true,
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "bundle:cli": "node scripts/bundle-cli.mjs",
+    "build:full": "npm run build && npm run bundle:cli",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "native:check": "cd macos && swift run KimiAgentCoreChecks",
+    "native:build": "node scripts/package-native-macos.mjs",
+    "native:package": "npm run build:full && node scripts/package-native-macos.mjs",
+    "verify": "npm run check && npm test && npm run native:check"
+  },
+  "dependencies": {
+    "@moonshot-ai/kimi-agent-sdk": "0.1.8",
+    "@moonshot-ai/kimi-code": "0.33.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^7.0.2",
+    "vitest": "^3.2.4"
+  }
+}
