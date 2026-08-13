@@ -1079,12 +1079,28 @@ let apiConfigWithTaskModel = try String(contentsOf: apiConfigURL, encoding: .utf
 expect(apiConfigWithTaskModel.contains("[models.\"kimi-k3\"]"), "任务选择的模型也必须写入 Kimi Code models 配置，确保 ACP 可切换")
 expect(apiConfig.contains("pattern = \"WebSearch\""), "Kimi API 模式必须将 WebSearch 纳入桌面审批策略")
 expect(apiConfig.contains("pattern = \"FetchURL\""), "Kimi API 模式必须将 FetchURL 纳入桌面审批策略")
+let apiConfigAttributes = try? FileManager.default.attributesOfItem(atPath: apiConfigURL.path)
+let apiConfigPermissions = (apiConfigAttributes?[.posixPermissions] as? NSNumber)?.intValue ?? 0
+expect(apiConfigPermissions & 0o777 == 0o600, "API 模式配置必须始终以 0600 权限原子写入")
 try runtimeIdentityStore.useKimiCode()
 let codeRuntimeEnvironment = try runtimeIdentityStore.runtimeEnvironment(applicationSupportDirectory: temporaryDirectory)
 expect(
   codeRuntimeEnvironment["KIMI_SHARE_DIR"] == temporaryDirectory.appendingPathComponent("kimi-code", isDirectory: true).path,
   "Kimi Code 登录模式必须使用独立配置目录，避免覆盖 API 模式"
 )
+try runtimeIdentityStore.disconnectAPI(applicationSupportDirectory: temporaryDirectory)
+expect(
+  !FileManager.default.fileExists(atPath: apiConfigURL.path),
+  "断开 API 连接必须删除明文 config.toml"
+)
+try runtimeIdentityStore.connectAPI(
+  apiKey: "sk-test-api-quota",
+  baseURL: "https://api.moonshot.cn/v1",
+  modelID: "kimi-latest"
+)
+let reconnectedConfigAttributes = try? FileManager.default.attributesOfItem(atPath: apiConfigURL.path)
+let reconnectedConfigPermissions = (reconnectedConfigAttributes?[.posixPermissions] as? NSNumber)?.intValue ?? 0
+expect(reconnectedConfigPermissions & 0o777 == 0o600, "重新连接后 config.toml 必须保持 0600 权限")
 let countedVault = CountingCredentialVault()
 let cachedVault = CachingCredentialVault(base: countedVault)
 try cachedVault.write("cached-secret", key: "api")
@@ -3562,6 +3578,45 @@ let nativeShellEscapeResult = try awaitValue {
 expect(
   nativeShellEscapeResult.exitCode != 0 && !FileManager.default.fileExists(atPath: nativeShellEscapeURL.path),
   "Harness Shell 必须由 Seatbelt 阻止 Worktree 外写入"
+)
+let secretOutsideWorkspace = temporaryDirectory.appendingPathComponent("kimi-secret-\(UUID().uuidString).txt")
+try "top-secret".write(to: secretOutsideWorkspace, atomically: true, encoding: .utf8)
+try FileManager.default.createSymbolicLink(
+  at: nativeToolWorkspace.appendingPathComponent("leak-link.txt"),
+  withDestinationURL: secretOutsideWorkspace
+)
+let nativeSymlinkReadResult = try? awaitValue {
+  try await nativeToolRuntime.execute(ToolExecutionRequest(
+    taskID: kernelTaskID,
+    sessionID: kernelSessionID,
+    operationID: operationID,
+    agentID: "main",
+    toolID: "read",
+    input: ["path": "leak-link.txt"]
+  ))
+}
+expect(
+  nativeSymlinkReadResult?.output.contains("top-secret") != true,
+  "Harness Native Tool 必须解析符号链接并阻止工作区外读取"
+)
+let symlinkWriteTarget = temporaryDirectory.appendingPathComponent("kimi-symlink-write-\(UUID().uuidString).txt")
+try FileManager.default.createSymbolicLink(
+  at: nativeToolWorkspace.appendingPathComponent("write-link.txt"),
+  withDestinationURL: symlinkWriteTarget
+)
+let nativeSymlinkWriteResult = try? awaitValue {
+  try await nativeToolRuntime.execute(ToolExecutionRequest(
+    taskID: kernelTaskID,
+    sessionID: kernelSessionID,
+    operationID: operationID,
+    agentID: "main",
+    toolID: "write",
+    input: ["path": "write-link.txt", "content": "should-not-land"]
+  ))
+}
+expect(
+  nativeSymlinkWriteResult == nil && !FileManager.default.fileExists(atPath: symlinkWriteTarget.path),
+  "Harness Native Tool 必须阻止通过符号链接向工作区外写入"
 )
 
 // Specialized adapters must be executable through the same native runtime
