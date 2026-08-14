@@ -61,7 +61,6 @@ jobs:
       KIMI_DEVELOPER_ID_APPLICATION: ${{ secrets.KIMI_DEVELOPER_ID_APPLICATION }}
       KIMI_NOTARY_KEYCHAIN_PROFILE: KimiAgentNotary
       KIMI_NATIVE_VERIFY_RELEASE: '1'
-      KEYCHAIN_PATH: ${{ runner.temp }}/kimi-agent-release.keychain-db
       KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
 
     steps:
@@ -81,6 +80,7 @@ jobs:
         env:
           BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PATH: ${{ runner.temp }}/kimi-agent-release.keychain-db
         run: |
           test -n "$BUILD_CERTIFICATE_BASE64"
           test -n "$P12_PASSWORD"
@@ -99,6 +99,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          KEYCHAIN_PATH: ${{ runner.temp }}/kimi-agent-release.keychain-db
         run: |
           test -n "$APPLE_ID"
           test -n "$APPLE_TEAM_ID"
