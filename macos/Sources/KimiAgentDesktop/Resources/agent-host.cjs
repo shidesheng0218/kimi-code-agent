@@ -424,7 +424,7 @@ if (input) {
     const request = parseRequest(line);
     if (!request) return;
     if (request.type === "start") void start(request);
-    if (request.type === "approve") void acp?.approve(request.id, request.response);
+    if (request.type === "approve") void acp?.approve(request.id, request.response).catch(() => void 0);
     if (request.type === "interrupt") acp?.cancel();
     if (request.type === "close") void closeActiveSession();
   });

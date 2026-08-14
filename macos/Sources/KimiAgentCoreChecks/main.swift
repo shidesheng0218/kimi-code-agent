@@ -38,6 +38,36 @@ final class InvocationCounter: @unchecked Sendable {
   }
 }
 
+final class ThreadSafeStringTrace: @unchecked Sendable {
+  private let lock = NSLock()
+  private var values: [String] = []
+
+  func append(_ value: String) {
+    lock.lock(); values.append(value); lock.unlock()
+  }
+
+  var snapshot: [String] {
+    lock.lock(); defer { lock.unlock() }; return values
+  }
+}
+
+final class ThreadSafePromptQueue: @unchecked Sendable {
+  private let lock = NSLock()
+  private var values: [PromptInput] = []
+
+  func append(_ value: PromptInput) {
+    lock.lock(); values.append(value); lock.unlock()
+  }
+
+  func take() -> [PromptInput] {
+    lock.lock()
+    defer { lock.unlock() }
+    let result = values
+    values.removeAll()
+    return result
+  }
+}
+
 func awaitValue<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) throws -> T {
   let semaphore = DispatchSemaphore(value: 0)
   let box = ResultBox<T>()
@@ -431,7 +461,11 @@ _ = try awaitValue {
       scratchURL: temporaryDirectory.appendingPathComponent("sandboxed-plugin-scratch", isDirectory: true)
     )
   )
-  try await Task.sleep(nanoseconds: 350_000_000)
+  let deadline = Date().addingTimeInterval(3)
+  while Date() < deadline,
+        await sandboxedPluginSupervisor.status(pluginID: "sandboxed-plugin")?.state == .running {
+    try await Task.sleep(nanoseconds: 50_000_000)
+  }
   return true
 }
 let sandboxedPluginStatus = try awaitValue { await sandboxedPluginSupervisor.status(pluginID: "sandboxed-plugin") }
@@ -915,6 +949,16 @@ let researchFetchDecision = await researchResolver.resolve(
   definition: ToolCatalog.defaultDefinitions.first(where: { $0.id == "web.fetch" })!
 )
 expect(researchFetchDecision == .allow, "Web Research 对 HTTPS Fetch 应按只读域名复用授权")
+let researchPrivateFetchDecision = await researchResolver.resolve(
+  request: ToolExecutionRequest(taskID: approvalTaskID, sessionID: UUID(), agentID: "web-research", toolID: "web.fetch", input: ["url": "http://127.0.0.1:8080/admin"]),
+  definition: ToolCatalog.defaultDefinitions.first(where: { $0.id == "web.fetch" })!
+)
+expect(researchPrivateFetchDecision == .ask, "Web Research 抓取本机/私有地址必须回到审批")
+let browserLocalhostOpenDecision = await ChildAgentToolPermissionResolver(definition: browserReadDefinition).resolve(
+  request: ToolExecutionRequest(taskID: approvalTaskID, sessionID: UUID(), agentID: "browser", toolID: "browser", input: ["action": "open", "url": "http://localhost:8080"]),
+  definition: ToolCatalog.defaultDefinitions.first(where: { $0.id == "browser" })!
+)
+expect(browserLocalhostOpenDecision == .ask, "Browser 打开本机地址必须回到审批")
 let computerInspectDefinition = ToolCatalog.defaultDefinitions.first(where: { $0.id == "computer_use.inspect" })!
 let computerInspectDecision = await ChildAgentToolPermissionResolver(definition: AgentOrchestrator.builtInDefinition(for: .browser)).resolve(
   request: ToolExecutionRequest(taskID: approvalTaskID, sessionID: UUID(), agentID: "browser", toolID: "computer_use.inspect"),
@@ -946,6 +990,7 @@ let browserVerificationPlan = BrowserVerificationPlan(
 expect(browserVerificationPlan.steps.count == 3, "浏览器验证计划必须保存可回放步骤")
 expect(!browserVerificationPlan.requiresApproval(for: URL(string: "http://localhost:5173")!), "本地浏览器验证不应额外审批")
 expect(browserVerificationPlan.requiresApproval(for: URL(string: "https://example.com")!), "未授权外部域名必须审批")
+expect(browserVerificationPlan.requiresApproval(for: URL(fileURLWithPath: "/tmp/page.html")), "Browser 打开本地 file:// 文件必须审批")
 let failedBrowserResult = BrowserVerificationResult(
   passed: false,
   currentURL: URL(string: "http://localhost:5173/login")!,
@@ -1098,6 +1143,7 @@ try runtimeIdentityStore.connectAPI(
   baseURL: "https://api.moonshot.cn/v1",
   modelID: "kimi-latest"
 )
+_ = try runtimeIdentityStore.runtimeEnvironment(applicationSupportDirectory: temporaryDirectory)
 let reconnectedConfigAttributes = try? FileManager.default.attributesOfItem(atPath: apiConfigURL.path)
 let reconnectedConfigPermissions = (reconnectedConfigAttributes?[.posixPermissions] as? NSNumber)?.intValue ?? 0
 expect(reconnectedConfigPermissions & 0o777 == 0o600, "重新连接后 config.toml 必须保持 0600 权限")
@@ -1276,6 +1322,26 @@ MockURLProtocol.requestHandler = nil
 let structuredToolArguments = KimiHTTPModelProvider.normalizedToolArguments(["url": "https://example.com"])
 let structuredToolObject = try JSONSerialization.jsonObject(with: Data(structuredToolArguments.utf8)) as? [String: String]
 expect(structuredToolObject?["url"] == "https://example.com", "Provider 必须保留结构化 JSON Tool 参数，不能把对象当成空参数")
+let nestedToolInput: HarnessJSONValue = .object([
+  "query": .string("Kimi docs"),
+  "filters": .object(["domains": .array([.string("example.com"), .string("moonshot.cn")])]),
+  "limit": .number(2),
+  "fresh": .bool(true)
+])
+let structuredToolRequest = ToolExecutionRequest(
+  taskID: UUID(),
+  sessionID: UUID(),
+  agentID: "test",
+  toolID: "web.search",
+  inputJSON: nestedToolInput
+)
+let restoredStructuredToolRequest = try JSONDecoder().decode(
+  ToolExecutionRequest.self,
+  from: JSONEncoder().encode(structuredToolRequest)
+)
+expect(restoredStructuredToolRequest.inputJSON == nestedToolInput, "Tool Request 必须完整保留嵌套 JSON 参数")
+expect(restoredStructuredToolRequest.input["query"] == "Kimi docs", "旧 Tool Executor 必须继续获得字符串参数兼容投影")
+expect(restoredStructuredToolRequest.inputJSON.objectValue?["filters"]?.objectValue?["domains"]?.arrayValue?.count == 2, "数组和对象参数不得在 Provider 与 Tool Runtime 之间丢失")
 
 MockURLProtocol.requestHandler = { request in
   let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "text/event-stream"])!
@@ -1333,42 +1399,52 @@ let repeatedObjectArguments = HarnessConversationLoop.appendToolArguments(
 let repeatedObjectObject = try JSONSerialization.jsonObject(with: Data(repeatedObjectArguments.utf8)) as? [String: String]
 expect(repeatedObjectObject?["url"] == "https://www.apple.com/", "重复发送完整 Tool 参数对象时不得拼接成非法 JSON")
 
-let recoveredFetchCall = HarnessConversationLoop.recoverToolCall(
+var streamAssembler = HarnessModelStreamAssembler()
+streamAssembler.push(.reasoning("内部计划"))
+streamAssembler.push(.text("先检查"))
+streamAssembler.push(.toolCallDelta(id: "stream-tool", name: "web.search", argumentsDelta: #"{"query":"Kimi"#))
+streamAssembler.push(.toolCallDelta(id: "stream-tool", name: nil, argumentsDelta: #" docs"}"#))
+streamAssembler.push(.usage(HarnessModelUsage(inputTokens: 13, outputTokens: 5, reasoningTokens: 2)))
+streamAssembler.push(.finish(.toolCalls))
+expect(streamAssembler.text == "先检查", "流式块组装器必须保留可见文本")
+expect(streamAssembler.reasoning == "内部计划", "流式块组装器必须保存仅回放的推理文本")
+expect(streamAssembler.toolCalls.first?.argumentsJSON == #"{"query":"Kimi docs"}"#, "流式块组装器必须按 call ID 组装参数分片")
+expect(streamAssembler.usage?.reasoningTokens == 2 && streamAssembler.finish == .toolCalls, "流式块组装器必须保留 Usage 与 finish reason")
+
+let invalidFetchCall = HarnessConversationLoop.recoverToolCall(
   HarnessToolCall(id: "missing-url", name: "web.fetch", argumentsJSON: "{}"),
   request: HarnessConversationRequest(
     modelID: "kimi-k2.7-code",
     messages: [.user("请抓取 https://www.apple.com/ 并总结")]
   )
 )
-let recoveredFetchObject = try JSONSerialization.jsonObject(with: Data(recoveredFetchCall.argumentsJSON.utf8)) as? [String: String]
-expect(recoveredFetchObject?["url"] == "https://www.apple.com/", "Web Fetch 缺失 url 时必须从当前用户请求恢复明确 URL")
-let recoveredEmptyFetchCall = HarnessConversationLoop.recoverToolCall(
+expect(invalidFetchCall.name == "web.fetch" && invalidFetchCall.argumentsJSON == "{}", "Harness 不能从用户文本猜测缺失的 Web Fetch URL")
+let invalidEmptyFetchCall = HarnessConversationLoop.recoverToolCall(
   HarnessToolCall(id: "empty-url", name: "web.fetch", argumentsJSON: #"{"url":""}"#),
   request: HarnessConversationRequest(
     modelID: "kimi-k2.7-code",
     messages: [.user("请抓取 https://www.apple.com/ 并总结")]
   )
 )
-let recoveredEmptyFetchObject = try JSONSerialization.jsonObject(with: Data(recoveredEmptyFetchCall.argumentsJSON.utf8)) as? [String: String]
-expect(recoveredEmptyFetchObject?["url"] == "https://www.apple.com/", "Web Fetch 的空 url 必须从当前用户请求恢复明确 URL")
-let recoveredAliasFetchCall = HarnessConversationLoop.recoverToolCall(
+let invalidEmptyFetchObject = try JSONSerialization.jsonObject(with: Data(invalidEmptyFetchCall.argumentsJSON.utf8)) as? [String: String]
+expect(invalidEmptyFetchCall.name == "web.fetch" && invalidEmptyFetchObject?["url"] == "", "Harness 不能从用户文本补全空 Web Fetch URL")
+let canonicalAliasFetchCall = HarnessConversationLoop.recoverToolCall(
   HarnessToolCall(id: "alias-fetch", name: "web_fetch", argumentsJSON: "{}"),
   request: HarnessConversationRequest(
     modelID: "kimi-k3",
     messages: [.user("请读取 https://www.apple.com/ 的首页内容")]
   )
 )
-let recoveredAliasFetchObject = try JSONSerialization.jsonObject(with: Data(recoveredAliasFetchCall.argumentsJSON.utf8)) as? [String: String]
-expect(recoveredAliasFetchCall.name == "web.fetch" && recoveredAliasFetchObject?["url"] == "https://www.apple.com/", "web_fetch 别名必须恢复为带 URL 的 web.fetch")
-let weatherFallbackCall = HarnessConversationLoop.recoverToolCall(
+expect(canonicalAliasFetchCall.name == "web.fetch" && canonicalAliasFetchCall.argumentsJSON == "{}", "旧 Web 工具别名只能规范化名称，不能推断参数")
+let invalidLegacyFetchCall = HarnessConversationLoop.recoverToolCall(
   HarnessToolCall(id: "weather-fetch", name: "FetchURL", argumentsJSON: "{}"),
   request: HarnessConversationRequest(
     modelID: "kimi-k3",
     messages: [.user("明天天气怎么样？")]
   )
 )
-let weatherFallbackObject = try JSONSerialization.jsonObject(with: Data(weatherFallbackCall.argumentsJSON.utf8)) as? [String: String]
-expect(weatherFallbackCall.name == "web.search" && weatherFallbackObject?["query"] == "明天天气怎么样？", "没有 URL 的 FetchURL 必须自动降级为 Web Search")
+expect(invalidLegacyFetchCall.name == "web.fetch" && invalidLegacyFetchCall.argumentsJSON == "{}", "FetchURL 缺失 URL 时必须交给模型修正，不能变成搜索")
+expect(!ToolCatalog.defaultDefinitions.contains(where: { ["WebSearch", "FetchURL", "network.fetch"].contains($0.id) }), "模型工具目录只能暴露规范 Web 工具名")
 MockURLProtocol.requestHandler = nil
 
 let failingVerification = VerificationResult(passed: false, steps: [
@@ -2318,8 +2394,8 @@ expect(
     prompt: "修复登录失败",
     mode: .agent,
     workspacePath: "/Users/eastbuy/Projects/sample"
-  ).contains("network.fetch"),
-  "提示词必须明确列出可用的网络工具"
+  ).contains("web.fetch"),
+  "提示词必须明确列出规范网络工具"
 )
 expect(
   TaskPromptComposer.compose(
@@ -2346,8 +2422,8 @@ expect(
     prompt: "查找并总结当前文档",
     mode: .agent,
     workspacePath: "/Users/eastbuy/Projects/sample"
-  ).contains("WebSearch / FetchURL"),
-  "CLI 回退链必须明确使用 Kimi Code 原生 WebSearch / FetchURL 工具"
+  ).contains("web.search / web.fetch"),
+  "提示词必须只声明 Harness 规范 Web 工具"
 )
 expect(
   TaskPromptComposer.compose(
@@ -3324,6 +3400,90 @@ let harnessEvents = try awaitValue { await harnessStore.events(operationID: oper
 expect(harnessEvents.contains { $0.kind == .effectIntentWritten }, "副作用执行前必须写入 intent")
 expect(harnessEvents.contains { $0.kind == .effectSettled }, "副作用完成后必须写入 receipt")
 
+let transcriptStore = HarnessEventStore()
+let transcriptHarness = AgentHarness(store: transcriptStore) { context, emit in
+  let turnID = UUID()
+  await emit(.turnStarted(HarnessTurnRecord(turnID: turnID, modelID: "kimi-test")))
+  await emit(.stepStarted(HarnessStepRecord(turnID: turnID, step: 1)))
+  await emit(.requestHeader(HarnessModelRequestHeader(
+    turnID: turnID,
+    step: 1,
+    modelID: "kimi-test",
+    toolIDs: ["web.search"],
+    maximumOutputTokens: 512
+  )))
+  await emit(.modelChunk(ModelStreamBlock(step: 1, kind: .text, text: "正在查找资料")))
+  let call = HarnessToolCall(id: "call-search", name: "web.search", argumentsJSON: #"{"query":"Kimi"}"#)
+  await emit(.assistantMessage(HarnessAssistantMessageRecord(
+    turnID: turnID,
+    step: 1,
+    message: .assistant("", toolCalls: [call])
+  )))
+  await emit(.toolCallDeclared(HarnessToolCallRecord(turnID: turnID, step: 1, call: call)))
+  await emit(.toolResultRecorded(HarnessToolResultRecord(
+    turnID: turnID,
+    step: 1,
+    result: HarnessToolResult(callID: call.id, toolName: call.name, output: "[]", isError: false)
+  )))
+  await emit(.stepEnded(HarnessStepRecord(turnID: turnID, step: 1, status: .toolCalls)))
+  await emit(.turnEnded(HarnessTurnRecord(turnID: turnID, modelID: "kimi-test", status: .completed)))
+}
+let transcriptOperation = try awaitValue { try await transcriptHarness.prompt(PromptInput(text: "查 Kimi")) }
+_ = try awaitValue { try await transcriptHarness.wait(for: transcriptOperation, timeout: 1); return true }
+let transcriptEvents = try awaitValue { await transcriptStore.events(operationID: transcriptOperation) }
+expect(transcriptEvents.contains { $0.kind == .turnStarted }, "Harness 必须持久化 turnStarted")
+expect(transcriptEvents.contains { $0.kind == .requestHeader }, "Harness 必须持久化模型请求头")
+expect(transcriptEvents.contains { $0.kind == .modelChunk }, "Harness 必须持久化原始模型流块")
+expect(transcriptEvents.contains { $0.kind == .assistantMessage }, "Harness 必须持久化规范 assistant message")
+expect(transcriptEvents.contains { $0.kind == .toolCallDeclared }, "Harness 必须持久化模型声明的 tool call")
+expect(transcriptEvents.contains { $0.kind == .toolResultRecorded }, "Harness 必须持久化 tool result")
+expect(transcriptEvents.contains { $0.kind == .turnEnded }, "Harness 必须持久化 turnEnded")
+
+let steeringTrace = ThreadSafeStringTrace()
+let steeringHarness = AgentHarness { context, _ in
+  try await Task.sleep(nanoseconds: 80_000_000)
+  let steering = await context.takeSteering()
+  steeringTrace.append(steering.map(\.text).joined(separator: "|"))
+}
+let steeringOperation = try awaitValue { try await steeringHarness.prompt(PromptInput(text: "先开始")) }
+try? await Task.sleep(nanoseconds: 20_000_000)
+_ = try awaitValue { try await steeringHarness.steer(PromptInput(text: "改为只读"), lane: .main); return true }
+_ = try awaitValue { try await steeringHarness.wait(for: steeringOperation, timeout: 1); return true }
+expect(steeringTrace.snapshot == ["改为只读"], "next-step steering 必须在当前 Operation 的下一模型步骤读取")
+
+let followUpTrace = ThreadSafeStringTrace()
+let followUpHarness = AgentHarness { context, _ in
+  followUpTrace.append(context.prompt.text)
+  try await Task.sleep(nanoseconds: 80_000_000)
+}
+let followUpOperation = try awaitValue { try await followUpHarness.prompt(PromptInput(text: "第一回合")) }
+_ = try awaitValue { try await followUpHarness.followUp(PromptInput(text: "第二回合"), lane: .main); return true }
+_ = try awaitValue { try await followUpHarness.wait(for: followUpOperation, timeout: 1); return true }
+try? await Task.sleep(nanoseconds: 150_000_000)
+expect(followUpTrace.snapshot == ["第一回合", "第二回合"], "next-turn follow-up 必须在当前回合结束后创建下一 Operation")
+
+let repairStore = HarnessEventStore()
+let repairSessionID = UUID()
+let repairHarness = AgentHarness(sessionID: repairSessionID, store: repairStore) { context, emit in
+  let call = HarnessToolCall(id: "interrupted-search", name: "web.search", argumentsJSON: #"{"query":"Kimi"}"#)
+  await emit(.toolCallDeclared(HarnessToolCallRecord(turnID: UUID(), step: 1, call: call)))
+  try await Task.sleep(nanoseconds: 1_000_000_000)
+}
+let repairOperation = try awaitValue { try await repairHarness.prompt(PromptInput(text: "查资料")) }
+try? await Task.sleep(nanoseconds: 30_000_000)
+_ = try awaitValue { await repairHarness.suspend(repairOperation); return true }
+try? await Task.sleep(nanoseconds: 30_000_000)
+let restoredRepairHarness = AgentHarness(sessionID: repairSessionID, store: repairStore)
+_ = try awaitValue { try await restoredRepairHarness.restore(); return true }
+let repairedEvents = try awaitValue { await repairStore.events(operationID: repairOperation) }
+let repairedResult = repairedEvents.compactMap { event -> HarnessToolResultRecord? in
+  guard event.kind == .toolResultRecorded, let payload = event.payload else { return nil }
+  return try? JSONDecoder().decode(HarnessToolResultRecord.self, from: payload)
+}.first
+expect(repairedResult?.result.isError == true, "中断回合的未结算 Tool Call 必须补写可回放错误结果")
+let restoredRepairSnapshot = try awaitValue { await restoredRepairHarness.snapshot() }
+expect(restoredRepairSnapshot.operations[repairOperation]?.state == .suspended, "中断回合恢复后必须等待用户显式继续")
+
 let singleWriterStore = HarnessEventStore()
 let singleWriterDefinition = ToolDefinition(id: "single-writer.tool", title: "单写入工具", description: "验证 Harness 是唯一 effect writer", permissionScopes: [.readWorkspace])
 let singleWriterRegistry = ToolRegistry(definitions: [singleWriterDefinition])
@@ -3437,10 +3597,29 @@ let nativeLoopProvider = ScriptedHarnessConversationProvider(turns: [
   [.text("我先读取文件。"), .toolCall(id: "call-1", name: "read", argumentsJSON: "{\"path\":\"README.md\"}")],
   [.text("文件读取完成。")]
 ])
-let nativeLoop = HarnessConversationLoop(provider: nativeLoopProvider, maxRounds: 4) { call, _ in
-  expect(call.name == "read", "Native Harness Loop 必须接收模型 Tool Call")
-  return HarnessToolResult(callID: call.id, toolName: call.name, output: "README 内容", isError: false)
-}
+let nativeLoopTrace = ThreadSafeStringTrace()
+let nativeLoop = HarnessConversationLoop(
+  provider: nativeLoopProvider,
+  maxRounds: 4,
+  executeTool: { call, _ in
+    expect(call.name == "read", "Native Harness Loop 必须接收模型 Tool Call")
+    return HarnessToolResult(callID: call.id, toolName: call.name, output: "README 内容", isError: false)
+  },
+  eventSink: { event in
+    switch event {
+    case .turnStarted: nativeLoopTrace.append("turnStarted")
+    case .stepStarted: nativeLoopTrace.append("stepStarted")
+    case .requestHeader: nativeLoopTrace.append("requestHeader")
+    case .modelChunk: nativeLoopTrace.append("modelChunk")
+    case .assistantMessage: nativeLoopTrace.append("assistantMessage")
+    case .toolCallDeclared: nativeLoopTrace.append("toolCallDeclared")
+    case .toolResultRecorded: nativeLoopTrace.append("toolResultRecorded")
+    case .stepEnded: nativeLoopTrace.append("stepEnded")
+    case .turnEnded: nativeLoopTrace.append("turnEnded")
+    default: break
+    }
+  }
+)
 let nativeLoopResult = try awaitValue {
   try await nativeLoop.run(
     request: HarnessConversationRequest(
@@ -3452,6 +3631,36 @@ let nativeLoopResult = try awaitValue {
 }
 expect(nativeLoopResult.text.contains("文件读取完成"), "Native Harness Loop 必须把 Tool Result 回传后继续请求模型")
 expect(nativeLoopResult.toolResults.count == 1, "Native Harness Loop 必须记录 Tool Result")
+expect(nativeLoopTrace.snapshot.contains("requestHeader") && nativeLoopTrace.snapshot.contains("modelChunk"), "Native Harness Loop 必须把请求头和原始模型流交给 durable Harness")
+expect(nativeLoopTrace.snapshot.contains("assistantMessage") && nativeLoopTrace.snapshot.contains("toolResultRecorded"), "Native Harness Loop 必须输出规范 assistant message 和 tool result 事实")
+expect(nativeLoopTrace.snapshot.last == "turnEnded", "Native Harness Loop 必须在每个回合结束时写入 turnEnded")
+
+let injectedStepQueue = ThreadSafePromptQueue()
+let steeredLoopProvider = ScriptedHarnessConversationProvider(turns: [
+  [.toolCall(id: "step-read", name: "read", argumentsJSON: #"{"path":"README.md"}"#)],
+  [.text("已按补充要求继续。")]
+])
+let steeredLoop = HarnessConversationLoop(
+  provider: steeredLoopProvider,
+  maxRounds: 3,
+  executeTool: { call, _ in
+    injectedStepQueue.append(PromptInput(text: "只读取，不修改文件"))
+    return HarnessToolResult(callID: call.id, toolName: call.name, output: "README", isError: false)
+  },
+  nextStepInput: { injectedStepQueue.take() }
+)
+_ = try awaitValue {
+  try await steeredLoop.run(
+    request: HarnessConversationRequest(modelID: "kimi-k2.7-code", messages: [.user("读取 README")]),
+    tools: []
+  )
+}
+let steeredRequests = try awaitValue { await steeredLoopProvider.requests() }
+let secondSteeredRequest = steeredRequests.count > 1 ? steeredRequests[1] : nil
+let didInjectSteering = secondSteeredRequest?.messages.contains { message in
+  message.role == .user && (message.content?.contains("只读取，不修改文件") ?? false)
+} ?? false
+expect(didInjectSteering, "next-step 输入必须在工具结算后的下一模型请求注入，不需要重新启动回合")
 let repeatedFailureProvider = ScriptedHarnessConversationProvider(turns: [
   [.toolCall(id: "bad-1", name: "web.fetch", argumentsJSON: "{}")],
   [.toolCall(id: "bad-2", name: "web.fetch", argumentsJSON: "{}")]
@@ -3477,8 +3686,8 @@ let missingSearchObject = try? JSONSerialization.jsonObject(
 ) as? [String: Any]
 expect(
   missingSearchArguments.name == "web.search" &&
-    missingSearchObject?["query"] as? String == "明天天气怎么样？",
-  "web.search 缺少 query 时必须从当前用户问题恢复查询参数"
+    missingSearchObject?.isEmpty == true,
+  "web.search 缺少 query 时必须由模型在下一步显式修正"
 )
 
 let longComposedSearchPrompt = TaskPromptComposer.compose(
@@ -3495,12 +3704,12 @@ let recoveredComposedPromptObject = try? JSONSerialization.jsonObject(
   with: Data(recoveredComposedPromptSearch.argumentsJSON.utf8)
 ) as? [String: Any]
 expect(
-  recoveredComposedPromptObject?["query"] as? String == "明天北京天气如何",
-  "web.search 从长任务提示恢复 query 时必须只使用真实用户消息，不能把系统规则和工具说明当搜索词"
+  recoveredComposedPromptObject?.isEmpty == true,
+  "长任务提示不能被 Harness 反向解析为 Web Search 参数"
 )
 expect(
-  (recoveredComposedPromptObject?["query"] as? String ?? "").count < 500,
-  "恢复出的 Web Search query 必须短于公开检索限制"
+  recoveredComposedPromptSearch.argumentsJSON == "{}",
+  "Harness 必须原样保留模型缺失的 Web Search 参数"
 )
 
 let emptySearchArguments = HarnessConversationLoop.recoverToolCall(
@@ -3512,9 +3721,55 @@ let emptySearchObject = try? JSONSerialization.jsonObject(
 ) as? [String: Any]
 expect(
   emptySearchArguments.name == "web.search" &&
-    emptySearchObject?["query"] as? String == "上海今天下雨吗？",
-  "web_search 空 query 必须规范化为 web.search 并恢复用户问题"
+    emptySearchObject?["query"] as? String == "",
+  "web_search 空 query 只能规范化名称，不能恢复用户问题"
 )
+
+expect(WebFetchPolicy.isPrivateOrLocalHost("127.0.0.1"), "Swift Web Fetch 必须拦截 IPv4 loopback")
+expect(WebFetchPolicy.isPrivateOrLocalHost("[::1]"), "Swift Web Fetch 必须拦截 IPv6 loopback")
+expect(WebFetchPolicy.isPrivateOrLocalHost("169.254.169.254"), "Swift Web Fetch 必须拦截链路本地元数据地址")
+expect(!WebFetchPolicy.isPrivateOrLocalHost("www.apple.com"), "公网域名不应被静态私网策略误拦截")
+let validatedPublicWebURL = try WebFetchPolicy.validate(url: "https://example.com/docs")
+expect(validatedPublicWebURL.host == "example.com", "Swift Web Fetch 必须接受规范 HTTPS URL")
+let invalidCredentialURL: Result<URL, Error> = Result { try WebFetchPolicy.validate(url: "https://user:pass@example.com/") }
+if case .success = invalidCredentialURL { expect(false, "Swift Web Fetch 不得接受 URL 凭据") }
+let invalidPrivateURL: Result<URL, Error> = Result { try WebFetchPolicy.validate(url: "http://127.0.0.1:8080/") }
+if case .success = invalidPrivateURL { expect(false, "Swift Web Fetch 不得接受私网字面地址") }
+
+let formulaConfiguration = URLSessionConfiguration.ephemeral
+formulaConfiguration.protocolClasses = [MockURLProtocol.self]
+let formulaSession = URLSession(configuration: formulaConfiguration)
+var formulaRequests: [String] = []
+var formulaCompletionCount = 0
+MockURLProtocol.requestHandler = { request in
+  let path = request.url?.path ?? ""
+  formulaRequests.append(path)
+  let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+  if path.hasSuffix("/tools") {
+    return (response, try JSONSerialization.data(withJSONObject: ["tools": [["type": "function", "function": ["name": "web_search", "description": "Search", "parameters": ["type": "object"]]]]]))
+  }
+  if path.hasSuffix("/fibers") {
+    return (response, try JSONSerialization.data(withJSONObject: ["context": ["output": "{\"results\":[{\"title\":\"Kimi Docs\",\"url\":\"https://platform.kimi.com/docs\",\"snippet\":\"官方文档\"}]"]]))
+  }
+  if path.hasSuffix("/chat/completions") {
+    formulaCompletionCount += 1
+    if formulaCompletionCount == 1 {
+      return (response, try JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": "", "tool_calls": [["id": "formula-search-1", "function": ["name": "web_search", "arguments": "{\"query\":\"Kimi docs\"}"]]]]]], "usage": ["prompt_tokens": 12, "completion_tokens": 3]]))
+    }
+    return (response, try JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": "{\"sources\":[{\"title\":\"Kimi Docs\",\"url\":\"https://platform.kimi.com/docs\",\"snippet\":\"官方文档\"}]}" ]]], "usage": ["prompt_tokens": 9, "completion_tokens": 4]]))
+  }
+  throw NSError(domain: "FormulaMock", code: 404, userInfo: [NSLocalizedDescriptionKey: path])
+}
+let formulaProvider = KimiOfficialWebProvider(
+  apiKey: "kimi-formula-test-key",
+  baseURL: URL(string: "https://api.moonshot.cn/v1")!,
+  modelID: "kimi-k3",
+  session: formulaSession
+)
+let formulaSearch = try awaitValue { try await formulaProvider.search(WebSearchRequest(query: "Kimi docs")) }
+expect(formulaSearch.sources.first?.url == "https://platform.kimi.com/docs", "Swift Kimi Formula Provider 必须返回可验证来源")
+expect(formulaSearch.providerID == "kimi_official" && formulaRequests.contains(where: { $0.hasSuffix("/fibers") }), "Swift Kimi Formula Provider 必须实际读取 Formula 工具并执行 Fiber")
+MockURLProtocol.requestHandler = nil
 
 let nativeToolWorkspace = temporaryDirectory.appendingPathComponent("native-tool-workspace", isDirectory: true)
 try FileManager.default.createDirectory(at: nativeToolWorkspace, withIntermediateDirectories: true)
@@ -3713,6 +3968,18 @@ expect(
   WebToolApprovalPolicy.approvalKey(toolID: "web.search", input: ["query": "Swift concurrency"]) == "web.search",
   "Web Search 的授权记忆必须按工具范围复用"
 )
+expect(
+  WebToolApprovalPolicy.canAutoApprovePublicRead(toolID: "web.fetch", input: ["url": "https://docs.example.com/guide"]),
+  "公网只读 Web Fetch 必须默认自动执行，不应反复弹出审批"
+)
+expect(
+  !WebToolApprovalPolicy.canAutoApprovePublicRead(toolID: "web.fetch", input: ["url": "http://127.0.0.1:8080/admin"]),
+  "私网 Web Fetch 不得自动批准"
+)
+expect(
+  !WebToolApprovalPolicy.canAutoApprovePublicRead(toolID: "web.fetch", input: ["url": "https://user:pass@example.com/"]),
+  "带凭据 URL 的 Web Fetch 不得自动批准"
+)
 
 let childEvents = ChildEventCollector()
 let childRuntimeConfiguration = KimiChildRuntimeConfiguration(
@@ -3759,6 +4026,29 @@ let cancellableChild = try awaitValue {
 }
 _ = try awaitValue { await cancellableCoordinator.cancel(cancellableChild.id); return true }
 expect(cancellationCollector.ids.contains(cancellableChild.id), "取消 Child Session 必须通知真实 Runtime 终止进程")
+let pausableCollector = CancellationCollector()
+let pausableCoordinator = ChildSessionCoordinator(onCancel: pausableCollector.record) { _, _, _ in
+  try await Task.sleep(nanoseconds: 2_000_000_000)
+  return AgentResult(summary: "不应完成")
+}
+let pausableChild = try awaitValue {
+  await pausableCoordinator.createChild(
+    parent: kernelSession,
+    taskID: kernelTaskID,
+    definition: AgentOrchestrator.builtInDefinition(for: .explore),
+    prompt: "可暂停测试"
+  )
+}
+let pausableRunTask = Task.detached { try? await pausableCoordinator.run(pausableChild.id) }
+try? await Task.sleep(nanoseconds: 100_000_000)
+_ = try awaitValue { await pausableCoordinator.pause(pausableChild.id); return true }
+let pausedStatus = try awaitValue { await pausableCoordinator.session(id: pausableChild.id)?.status }
+expect(pausableCollector.ids.contains(pausableChild.id), "暂停 Child Session 必须中断真实 Runtime")
+expect(pausedStatus == .paused, "暂停后 Child Session 必须保持 paused 状态")
+_ = try awaitValue { await pausableCoordinator.resume(pausableChild.id); return true }
+let resumedStatus = try awaitValue { await pausableCoordinator.session(id: pausableChild.id)?.status }
+expect(resumedStatus == .idle, "恢复后 Child Session 必须回到 idle 可重新执行")
+pausableRunTask.cancel()
 var linkedRun = orchestrationPlan.runs[0]
 linkedRun.childSessionID = childSession.id
 let restoredLinkedRun = try JSONDecoder().decode(AgentRun.self, from: JSONEncoder().encode(linkedRun))

@@ -922,7 +922,7 @@ export function buildNetworkTools(options: {
     }),
     createExternalTool({
       name: 'web.search',
-      description: 'Search the configured web provider and return compact, source-identifiable results. Use web.fetch with the returned sourceID to read a result.',
+      description: 'Search the configured web provider and return compact, source-identifiable results. Use web.fetch with the returned sourceID to read a result. Use this proactively whenever the user asks about real-time or current information (weather, news, prices, latest docs, etc.) instead of declining due to lack of built-in knowledge — try this tool first and only explain a limitation if the call itself fails.',
       parameters: z.object({
         query: z.string().trim().min(1).max(500),
         maxResults: z.number().int().min(1).max(10).default(5),
@@ -939,7 +939,7 @@ export function buildNetworkTools(options: {
     }),
     createExternalTool({
       name: 'web.fetch',
-      description: 'Fetch readable text from an authorized URL or a source returned by web.search. This is read-only and returns provenance metadata for citation.',
+      description: 'Fetch readable text from an authorized URL or a source returned by web.search. This is read-only and returns provenance metadata for citation. Use this proactively whenever the user provides a URL or asks you to read a specific page — try it first rather than saying you cannot access the internet.',
       parameters: z.object({
         url: z.string().url().max(4_096),
         sourceID: z.string().trim().min(1).max(128).optional(),

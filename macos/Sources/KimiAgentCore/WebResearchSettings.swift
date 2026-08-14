@@ -188,9 +188,15 @@ public final class WebResearchSettingsStore: @unchecked Sendable {
     let candidate = trimmed.isEmpty ? fallback : trimmed
     guard let url = URL(string: candidate),
           let scheme = url.scheme?.lowercased(),
-          (scheme == "https" || scheme == "http"),
+          (scheme == "https" || (scheme == "http" && provider != .kimiOfficial)),
           url.host(percentEncoded: false) != nil else {
-      throw NSError(domain: "WebResearchSettingsStore", code: 3, userInfo: [NSLocalizedDescriptionKey: "搜索服务地址必须是合法的 HTTP(S) URL。"])
+      throw NSError(
+        domain: "WebResearchSettingsStore",
+        code: 3,
+        userInfo: [NSLocalizedDescriptionKey: provider == .kimiOfficial
+          ? "Kimi 官方联网地址必须是 HTTPS URL，避免 API Key 明文传输。"
+          : "搜索服务地址必须是合法的 HTTP(S) URL。"]
+      )
     }
     return candidate.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
   }

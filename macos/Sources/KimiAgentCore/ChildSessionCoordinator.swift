@@ -4,12 +4,14 @@ public enum ChildSessionError: LocalizedError, Equatable {
   case missingSession(UUID)
   case alreadyRunning(UUID)
   case cancelled(UUID)
+  case paused(UUID)
 
   public var errorDescription: String? {
     switch self {
     case let .missingSession(id): "找不到 Child Session：\(id)"
     case let .alreadyRunning(id): "Child Session 已经在运行：\(id)"
     case let .cancelled(id): "Child Session 已取消：\(id)"
+    case let .paused(id): "Child Session 已暂停：\(id)"
     }
   }
 }
@@ -25,6 +27,7 @@ public actor ChildSessionCoordinator {
   private var tools: [UUID: [ToolDefinition]] = [:]
   private var results: [UUID: AgentResult] = [:]
   private var cancelledIDs: Set<UUID> = []
+  private var pausedIDs: Set<UUID> = []
   private var eventSequences: [UUID: Int64] = [:]
 
   public init(
@@ -70,6 +73,7 @@ public actor ChildSessionCoordinator {
     }
     guard session.status != .running else { throw ChildSessionError.alreadyRunning(sessionID) }
     guard !cancelledIDs.contains(sessionID) else { throw ChildSessionError.cancelled(sessionID) }
+    guard !pausedIDs.contains(sessionID) else { throw ChildSessionError.paused(sessionID) }
     session.status = .running
     session.updatedAt = .now
     sessions[sessionID] = session
@@ -77,6 +81,13 @@ public actor ChildSessionCoordinator {
 
     do {
       let result = try await executor(session, prompt, tools)
+      if pausedIDs.contains(sessionID) {
+        session.status = .paused
+        session.updatedAt = .now
+        sessions[sessionID] = session
+        emit(.sessionPaused, session: session)
+        throw ChildSessionError.paused(sessionID)
+      }
       guard !cancelledIDs.contains(sessionID) else {
         session.status = .cancelled
         sessions[sessionID] = session
@@ -95,6 +106,13 @@ public actor ChildSessionCoordinator {
       emit(.sessionCompleted, session: session)
       return result
     } catch {
+      if pausedIDs.contains(sessionID) {
+        session.status = .paused
+        session.updatedAt = .now
+        sessions[sessionID] = session
+        emit(.sessionPaused, session: session)
+        throw ChildSessionError.paused(sessionID)
+      }
       session.status = cancelledIDs.contains(sessionID) ? .cancelled : .failed
       session.updatedAt = .now
       sessions[sessionID] = session
@@ -103,15 +121,32 @@ public actor ChildSessionCoordinator {
     }
   }
 
+  /// Pauses the child by interrupting the underlying runtime session so no
+  /// further tool effects run; the status stays `.paused` and the stored
+  /// prompt is kept so `resume` can re-execute it later.
   public func pause(_ sessionID: UUID) {
     guard var session = sessions[sessionID], session.status == .running else { return }
+    pausedIDs.insert(sessionID)
+    onCancel(sessionID)
     session.status = .paused
     session.updatedAt = .now
     sessions[sessionID] = session
+    emit(.sessionPaused, session: session)
+  }
+
+  public func resume(_ sessionID: UUID) {
+    guard var session = sessions[sessionID], session.status == .paused else { return }
+    pausedIDs.remove(sessionID)
+    cancelledIDs.remove(sessionID)
+    session.status = .idle
+    session.updatedAt = .now
+    sessions[sessionID] = session
+    emit(.sessionResumed, session: session)
   }
 
   public func cancel(_ sessionID: UUID) {
     cancelledIDs.insert(sessionID)
+    pausedIDs.remove(sessionID)
     onCancel(sessionID)
     guard var session = sessions[sessionID], !session.status.isTerminal else { return }
     session.status = .cancelled

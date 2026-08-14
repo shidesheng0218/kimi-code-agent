@@ -68,9 +68,33 @@ public struct HarnessConversationRequest: Codable, Equatable, Sendable {
   }
 }
 
+public struct HarnessModelUsage: Codable, Equatable, Sendable {
+  public let inputTokens: Int
+  public let outputTokens: Int
+  public let reasoningTokens: Int
+  public let cachedTokens: Int
+
+  public init(inputTokens: Int = 0, outputTokens: Int = 0, reasoningTokens: Int = 0, cachedTokens: Int = 0) {
+    self.inputTokens = max(0, inputTokens)
+    self.outputTokens = max(0, outputTokens)
+    self.reasoningTokens = max(0, reasoningTokens)
+    self.cachedTokens = max(0, cachedTokens)
+  }
+}
+
+public enum HarnessConversationFinishReason: String, Codable, Equatable, Sendable {
+  case stop
+  case toolCalls
+  case maxTokens
+  case error
+}
+
 public enum HarnessConversationEvent: Equatable, Sendable {
   case text(String)
+  case reasoning(String)
   case toolCallDelta(id: String, name: String?, argumentsDelta: String)
+  case usage(HarnessModelUsage)
+  case finish(HarnessConversationFinishReason)
   case done
 }
 
@@ -98,46 +122,112 @@ public struct HarnessToolResult: Codable, Equatable, Sendable {
 
 public struct HarnessConversationResult: Codable, Equatable, Sendable {
   public let text: String
+  public let reasoning: String
   public let messages: [HarnessChatMessage]
   public let toolResults: [HarnessToolResult]
   public let rounds: Int
   public let blockedByToolFailure: Bool
+  public let usage: HarnessModelUsage?
+  public let finish: HarnessConversationFinishReason
 
-  public init(text: String, messages: [HarnessChatMessage], toolResults: [HarnessToolResult], rounds: Int, blockedByToolFailure: Bool = false) {
+  public init(
+    text: String,
+    reasoning: String = "",
+    messages: [HarnessChatMessage],
+    toolResults: [HarnessToolResult],
+    rounds: Int,
+    blockedByToolFailure: Bool = false,
+    usage: HarnessModelUsage? = nil,
+    finish: HarnessConversationFinishReason = .stop
+  ) {
     self.text = text
+    self.reasoning = reasoning
     self.messages = messages
     self.toolResults = toolResults
     self.rounds = rounds
     self.blockedByToolFailure = blockedByToolFailure
+    self.usage = usage
+    self.finish = finish
+  }
+}
+
+/// Canonically assembles a streamed model response without making streamed
+/// reasoning user-visible.  The same ordered calls are used for the final
+/// assistant message and later provider replay.
+public struct HarnessModelStreamAssembler: Sendable {
+  private var order: [String] = []
+  private var names: [String: String] = [:]
+  private var arguments: [String: String] = [:]
+  public private(set) var text = ""
+  public private(set) var reasoning = ""
+  public private(set) var usage: HarnessModelUsage?
+  public private(set) var finish: HarnessConversationFinishReason = .stop
+
+  public init() {}
+
+  public mutating func push(_ event: HarnessConversationEvent) {
+    switch event {
+    case let .text(value): text += value
+    case let .reasoning(value): reasoning += value
+    case let .toolCallDelta(id, name, argumentsDelta):
+      if !order.contains(id) { order.append(id) }
+      if let name, !name.isEmpty { names[id] = name }
+      arguments[id] = HarnessConversationLoop.appendToolArguments(existing: arguments[id] ?? "", delta: argumentsDelta)
+    case let .usage(value): usage = value
+    case let .finish(value): finish = value
+    case .done: break
+    }
+  }
+
+  public var toolCalls: [HarnessToolCall] {
+    order.compactMap { id in
+      guard let name = names[id], !name.isEmpty else { return nil }
+      return HarnessToolCall(id: id, name: name, argumentsJSON: arguments[id] ?? "{}")
+    }
   }
 }
 
 public struct HarnessConversationLoop: Sendable {
   public typealias ToolExecutor = @Sendable (HarnessToolCall, HarnessConversationRequest) async throws -> HarnessToolResult
+  public typealias BatchToolExecutor = @Sendable ([HarnessToolCall], HarnessConversationRequest) async -> [HarnessToolResult]
+  public typealias EventSink = @Sendable (HarnessDriverEvent) async -> Void
+  public typealias NextStepInput = @Sendable () async -> [PromptInput]
 
   private let provider: any HarnessConversationProvider
   private let maxRounds: Int
+  private let maximumOutputTokens: Int
   private let executeTool: ToolExecutor
+  private let executeBatch: BatchToolExecutor?
+  private let eventSink: EventSink?
+  private let nextStepInput: NextStepInput
 
   public init(
     provider: any HarnessConversationProvider,
     maxRounds: Int = 8,
-    executeTool: @escaping ToolExecutor
+    executeTool: @escaping ToolExecutor,
+    executeBatch: BatchToolExecutor? = nil,
+    maximumOutputTokens: Int = 0,
+    eventSink: EventSink? = nil,
+    nextStepInput: @escaping NextStepInput = { [] }
   ) {
     self.provider = provider
     self.maxRounds = max(1, maxRounds)
+    self.maximumOutputTokens = max(0, maximumOutputTokens)
     self.executeTool = executeTool
+    self.executeBatch = executeBatch
+    self.eventSink = eventSink
+    self.nextStepInput = nextStepInput
   }
 
   /// Providers are allowed to emit either JSON fragments or the complete
   /// arguments object on every delta. Merge complete objects idempotently so
   /// repeated `{ "url": "…" }` chunks never become invalid concatenated JSON.
   public static func appendToolArguments(existing: String, delta: String) -> String {
-    let incoming = delta.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !incoming.isEmpty else { return existing }
-    guard !existing.isEmpty else { return incoming }
+    let normalizedIncoming = delta.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !normalizedIncoming.isEmpty else { return existing }
+    guard !existing.isEmpty else { return delta }
 
-    if let existingObject = jsonObject(existing), let incomingObject = jsonObject(incoming) {
+    if let existingObject = jsonObject(existing), let incomingObject = jsonObject(normalizedIncoming) {
       var merged = existingObject
       for (key, value) in incomingObject { merged[key] = value }
       if let data = try? JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys]),
@@ -146,107 +236,28 @@ public struct HarnessConversationLoop: Sendable {
       }
     }
 
-    return existing + incoming
+    // JSON string boundaries are data, not formatting: a later delta can
+    // legitimately start with a space.  Never trim it before concatenation.
+    return existing + delta
   }
 
-  /// Some Kimi tool-call streams omit web arguments even though the current
-  /// user turn contains enough deterministic input. Recover only read-only web
-  /// tools; never infer file paths, shell commands, or mutation parameters
-  /// from prose.
+  /// Normalize legacy wire names without manufacturing model arguments.
+  ///
+  /// A missing URL/query is a model-tool contract violation, not a reason to
+  /// scrape values from the user's prose.  Guessing made retries look
+  /// successful while executing a request the model never actually emitted.
+  /// The tool executor returns a structured validation error instead, allowing
+  /// the next model step to repair the call explicitly.
   public static func recoverToolCall(
     _ call: HarnessToolCall,
     request: HarnessConversationRequest
   ) -> HarnessToolCall {
-    let object = jsonObject(call.argumentsJSON)
-    let existingURL = firstNonEmptyString(in: object, keys: ["url", "href", "uri", "link", "target_url"])
-    let existingQuery = firstNonEmptyString(in: object, keys: ["query", "text_query", "q", "keyword", "keywords"])
-    let canonicalName = canonicalWebToolName(call.name)
-    guard canonicalName == "web.fetch" || canonicalName == "web.search" else {
-      return call
-    }
-    let source = request.messages.reversed()
-      .first(where: { $0.role == .user })?
-      .content ?? ""
-    let trimmedSource = source.trimmingCharacters(in: .whitespacesAndNewlines)
-    let recoveredQuery = recoveredSearchQuery(existingQuery: existingQuery, source: source)
-
-    if canonicalName == "web.search" {
-      let query = recoveredQuery ?? trimmedSource
-      guard !query.isEmpty else {
-        return HarnessToolCall(id: call.id, name: "web.search", argumentsJSON: call.argumentsJSON.isEmpty ? "{}" : call.argumentsJSON)
-      }
-      let arguments = jsonString(["query": query]) ?? call.argumentsJSON
-      return HarnessToolCall(id: call.id, name: "web.search", argumentsJSON: arguments)
-    }
-
-    let pattern = #"https?://[^\s\"'<>）。，、]+"#
-    if let expression = try? NSRegularExpression(pattern: pattern),
-       let match = expression.firstMatch(in: source, range: NSRange(source.startIndex..., in: source)),
-       let range = Range(match.range, in: source) {
-      let url = String(source[range]).trimmingCharacters(in: CharacterSet(charactersIn: ".,;:!?，。；：！？、\"'"))
-      if !url.isEmpty {
-        let arguments = jsonString(["url": url]) ?? call.argumentsJSON
-        return HarnessToolCall(id: call.id, name: "web.fetch", argumentsJSON: arguments)
-      }
-    }
-
-    // A FetchURL call without a URL is a model/tool mismatch for questions
-    // such as “明天天气怎么样？”: there is nothing to fetch yet. Convert it
-    // into the read-only search tool instead of retrying the same bad call.
-    if let recoveredQuery, !recoveredQuery.isEmpty {
-      let arguments = jsonString(["query": recoveredQuery]) ?? #"{"query":""}"#
-      return HarnessToolCall(id: call.id, name: "web.search", argumentsJSON: arguments)
-    }
-
-    if let existingURL {
-      let arguments = jsonString(["url": existingURL]) ?? call.argumentsJSON
-      return HarnessToolCall(id: call.id, name: "web.fetch", argumentsJSON: arguments)
-    }
-    return HarnessToolCall(id: call.id, name: "web.fetch", argumentsJSON: call.argumentsJSON.isEmpty ? "{}" : call.argumentsJSON)
-  }
-
-  private static func recoveredSearchQuery(existingQuery: String?, source: String) -> String? {
-    let sourceQuery = extractUserPrompt(from: source) ?? source.trimmingCharacters(in: .whitespacesAndNewlines)
-    let normalizedSourceQuery = compactSearchQuery(sourceQuery)
-    if let existingQuery {
-      let trimmedExisting = existingQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !trimmedExisting.isEmpty,
-         trimmedExisting.count <= 500,
-         !looksLikeComposedTaskPrompt(trimmedExisting) {
-        return trimmedExisting
-      }
-    }
-    return normalizedSourceQuery.isEmpty ? nil : normalizedSourceQuery
-  }
-
-  private static func extractUserPrompt(from source: String) -> String? {
-    for marker in ["用户消息：", "用户任务："] {
-      guard let range = source.range(of: marker, options: [.backwards]) else { continue }
-      let suffix = source[range.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-      guard !suffix.isEmpty else { continue }
-      return suffix
-    }
-    return nil
-  }
-
-  private static func compactSearchQuery(_ value: String) -> String {
-    var query = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    if let firstLine = query.split(whereSeparator: \ .isNewline).first {
-      let line = String(firstLine).trimmingCharacters(in: .whitespacesAndNewlines)
-      if !line.isEmpty { query = line }
-    }
-    if query.count > 500 {
-      query = String(query.prefix(500)).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    return query
-  }
-
-  private static func looksLikeComposedTaskPrompt(_ value: String) -> Bool {
-    value.contains("当前上下文：") ||
-      value.contains("执行边界：") ||
-      value.contains("可用工具：") ||
-      value.contains("用户消息：") ||
-      value.contains("用户任务：")
+    let arguments = call.argumentsJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+    return HarnessToolCall(
+      id: call.id,
+      name: canonicalWebToolName(call.name),
+      argumentsJSON: arguments.isEmpty ? "{}" : arguments
+    )
   }
 
   private static func canonicalWebToolName(_ name: String) -> String {
@@ -258,22 +269,6 @@ public struct HarnessConversationLoop: Sendable {
     default:
       return name
     }
-  }
-
-  private static func firstNonEmptyString(in object: [String: Any]?, keys: [String]) -> String? {
-    guard let object else { return nil }
-    for key in keys {
-      if let value = object[key] as? String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { return trimmed }
-      }
-    }
-    return nil
-  }
-
-  private static func jsonString(_ object: [String: String]) -> String? {
-    guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return nil }
-    return String(data: data, encoding: .utf8)
   }
 
   private static func jsonObject(_ value: String) -> [String: Any]? {
@@ -292,79 +287,144 @@ public struct HarnessConversationLoop: Sendable {
     var toolResults: [HarnessToolResult] = []
     var finalText = ""
     var failedToolAttempts: [String: Int] = [:]
+    let turnID = UUID()
+    await emit(.turnStarted(HarnessTurnRecord(turnID: turnID, modelID: request.modelID)))
 
-    for round in 1...maxRounds {
-      let roundRequest = HarnessConversationRequest(modelID: request.modelID, messages: messages)
-      let stream = try await provider.stream(request: roundRequest, tools: tools, signal: signal)
-      var text = ""
-      var toolOrder: [String] = []
-      var toolNames: [String: String] = [:]
-      var toolArguments: [String: String] = [:]
-
-      for try await event in stream {
-        switch event {
-        case let .text(value):
-          text += value
-        case let .toolCallDelta(id, name, argumentsDelta):
-          if !toolOrder.contains(id) { toolOrder.append(id) }
-          if let name, !name.isEmpty { toolNames[id] = name }
-          toolArguments[id] = Self.appendToolArguments(existing: toolArguments[id] ?? "", delta: argumentsDelta)
-        case .done:
-          break
+    do {
+      for round in 1...maxRounds {
+        let injected = await nextStepInput()
+        if !injected.isEmpty {
+          let text = injected.map(\.text).joined(separator: "\n")
+          messages.append(.user("执行中补充：\n\(text)"))
         }
-      }
+        let roundRequest = HarnessConversationRequest(modelID: request.modelID, messages: messages)
+        let step = HarnessStepRecord(turnID: turnID, step: round)
+        await emit(.stepStarted(step))
+        await emit(.requestHeader(HarnessModelRequestHeader(
+          turnID: turnID,
+          step: round,
+          modelID: roundRequest.modelID,
+          toolIDs: tools.map(\.id),
+          maximumOutputTokens: maximumOutputTokens
+        )))
+        let stream = try await provider.stream(request: roundRequest, tools: tools, signal: signal)
+        var assembler = HarnessModelStreamAssembler()
 
-      let calls = toolOrder.compactMap { id -> HarnessToolCall? in
-        guard let name = toolNames[id], !name.isEmpty else { return nil }
-        return Self.recoverToolCall(
-          HarnessToolCall(id: id, name: name, argumentsJSON: toolArguments[id] ?? "{}"),
-          request: roundRequest
-        )
-      }
-      messages.append(.assistant(text, toolCalls: calls))
-      finalText += text
-
-      guard !calls.isEmpty else {
-        return HarnessConversationResult(text: finalText, messages: messages, toolResults: toolResults, rounds: round)
-      }
-
-      for call in calls {
-        let result: HarnessToolResult
-        do {
-          result = try await executeTool(call, roundRequest)
-        } catch {
-          result = HarnessToolResult(callID: call.id, toolName: call.name, output: error.localizedDescription, isError: true)
+        for try await event in stream {
+          await emit(.modelChunk(Self.modelStreamBlock(from: event, step: round)))
+          assembler.push(event)
         }
-        toolResults.append(result)
-        messages.append(.tool(result))
-        if result.isError {
-          let signature = "\(call.name)|\(call.argumentsJSON)"
-          failedToolAttempts[signature, default: 0] += 1
-          if failedToolAttempts[signature, default: 0] >= 2 {
-            let blockedText = "工具调用连续失败：\(result.output)"
-            return HarnessConversationResult(
-              text: blockedText,
-              messages: messages,
-              toolResults: toolResults,
-              rounds: round,
-              blockedByToolFailure: true
-            )
+
+        let calls = assembler.toolCalls.map {
+          Self.recoverToolCall($0, request: roundRequest)
+        }
+        let assistant = HarnessChatMessage.assistant(assembler.text, toolCalls: calls)
+        messages.append(assistant)
+        finalText += assembler.text
+        await emit(.assistantMessage(HarnessAssistantMessageRecord(turnID: turnID, step: round, message: assistant)))
+        for call in calls {
+          await emit(.toolCallDeclared(HarnessToolCallRecord(turnID: turnID, step: round, call: call)))
+        }
+
+        guard !calls.isEmpty else {
+          await emit(.stepEnded(HarnessStepRecord(turnID: turnID, step: round, status: .completed)))
+          await emit(.turnEnded(HarnessTurnRecord(turnID: turnID, modelID: request.modelID, status: .completed)))
+          return HarnessConversationResult(
+            text: finalText,
+            reasoning: assembler.reasoning,
+            messages: messages,
+            toolResults: toolResults,
+            rounds: round,
+            usage: assembler.usage,
+            finish: assembler.finish
+          )
+        }
+
+        let roundResults: [HarnessToolResult]
+        if let executeBatch {
+          roundResults = await executeBatch(calls, roundRequest)
+        } else {
+          var values: [HarnessToolResult] = []
+          for call in calls {
+            do {
+              values.append(try await executeTool(call, roundRequest))
+            } catch {
+              values.append(HarnessToolResult(callID: call.id, toolName: call.name, output: error.localizedDescription, isError: true))
+            }
+          }
+          roundResults = values
+        }
+
+        for (index, call) in calls.enumerated() {
+          let result = index < roundResults.count
+            ? roundResults[index]
+            : HarnessToolResult(callID: call.id, toolName: call.name, output: "工具调度器没有返回结果。", isError: true)
+          toolResults.append(result)
+          messages.append(.tool(result))
+          await emit(.toolResultRecorded(HarnessToolResultRecord(turnID: turnID, step: round, result: result)))
+          if result.isError {
+            let signature = "\(call.name)|\(call.argumentsJSON)"
+            failedToolAttempts[signature, default: 0] += 1
+            if failedToolAttempts[signature, default: 0] >= 2 {
+              let blockedText = "工具调用连续失败：\(result.output)"
+              await emit(.stepEnded(HarnessStepRecord(turnID: turnID, step: round, status: .failed)))
+              await emit(.turnEnded(HarnessTurnRecord(turnID: turnID, modelID: request.modelID, status: .failed)))
+              return HarnessConversationResult(
+                text: blockedText,
+                reasoning: assembler.reasoning,
+                messages: messages,
+                toolResults: toolResults,
+                rounds: round,
+                blockedByToolFailure: true,
+                usage: assembler.usage,
+                finish: assembler.finish
+              )
+            }
           }
         }
+        await emit(.stepEnded(HarnessStepRecord(turnID: turnID, step: round, status: .toolCalls)))
       }
-    }
 
-    throw NSError(
-      domain: "HarnessConversationLoop",
-      code: 1,
-      userInfo: [NSLocalizedDescriptionKey: "模型工具循环超过最大轮数（\(maxRounds)）。"]
-    )
+      throw NSError(
+        domain: "HarnessConversationLoop",
+        code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "模型工具循环超过最大轮数（\(maxRounds)）。"]
+      )
+    } catch is CancellationError {
+      await emit(.turnEnded(HarnessTurnRecord(turnID: turnID, modelID: request.modelID, status: .cancelled)))
+      throw CancellationError()
+    } catch {
+      await emit(.turnEnded(HarnessTurnRecord(turnID: turnID, modelID: request.modelID, status: .failed)))
+      throw error
+    }
+  }
+
+  private func emit(_ event: HarnessDriverEvent) async {
+    await eventSink?(event)
+  }
+
+  private static func modelStreamBlock(from event: HarnessConversationEvent, step: Int) -> ModelStreamBlock {
+    switch event {
+    case let .text(text):
+      return ModelStreamBlock(step: step, kind: .text, text: text)
+    case let .reasoning(text):
+      return ModelStreamBlock(step: step, kind: .reasoning, text: text)
+    case let .toolCallDelta(id, name, argumentsDelta):
+      return ModelStreamBlock(step: step, kind: .toolCall, toolCallID: id, toolName: name, argumentsDelta: argumentsDelta)
+    case let .usage(usage):
+      return ModelStreamBlock(step: step, kind: .usage, usage: usage)
+    case let .finish(finish):
+      return ModelStreamBlock(step: step, kind: .finish, finish: finish)
+    case .done:
+      return ModelStreamBlock(step: step, kind: .done)
+    }
   }
 }
 
 public actor ScriptedHarnessConversationProvider: HarnessConversationProvider {
   private let turns: [[HarnessConversationEvent]]
   private var index = 0
+  private var receivedRequests: [HarnessConversationRequest] = []
 
   public init(turns: [[HarnessConversationEvent]]) {
     self.turns = turns
@@ -375,6 +435,7 @@ public actor ScriptedHarnessConversationProvider: HarnessConversationProvider {
     tools: [ToolDefinition],
     signal: AsyncStream<Void>?
   ) async throws -> AsyncThrowingStream<HarnessConversationEvent, Error> {
+    receivedRequests.append(request)
     let turn = index < turns.count ? turns[index] : [.done]
     index += 1
     return AsyncThrowingStream { continuation in
@@ -382,6 +443,8 @@ public actor ScriptedHarnessConversationProvider: HarnessConversationProvider {
       continuation.finish()
     }
   }
+
+  public func requests() -> [HarnessConversationRequest] { receivedRequests }
 }
 
 public extension HarnessConversationEvent {

@@ -29,7 +29,7 @@ function swiftTripleArch(arch) {
 }
 
 export function nativeRuntimeResourceNames() {
-  return ['kimi.mjs', 'package.json', 'agent-host.cjs', 'web-research-bridge.cjs'];
+  return ['kimi.mjs', 'package.json', 'agent-host.cjs'];
 }
 
 export function nativeNodeDistribution(nodeVersion, arch = defaultArch) {
@@ -182,18 +182,6 @@ async function buildNativeAgentHost(rootDir, resourcesDirectory) {
   });
 }
 
-async function buildWebResearchBridge(rootDir, resourcesDirectory) {
-  await build({
-    entryPoints: [path.join(rootDir, 'src', 'runtime', 'webResearchBridge.ts')],
-    outfile: path.join(resourcesDirectory, 'web-research-bridge.cjs'),
-    bundle: true,
-    platform: 'node',
-    format: 'cjs',
-    target: 'node22',
-    legalComments: 'none'
-  });
-}
-
 async function provisionNode(rootDir, nodeVersion, arch = defaultArch) {
   const distribution = nativeNodeDistribution(nodeVersion, arch);
   const nodeArch = arch === 'x86_64' ? 'x64' : arch;
@@ -320,16 +308,6 @@ export async function packageNativeMacOS(rootDir = path.resolve(path.dirname(fil
   await cp(runtimeSource, path.join(resourcesDirectory, 'kimi.mjs'), { force: true });
   await cp(runtimePackageSource, path.join(resourcesDirectory, 'package.json'), { force: true });
 
-  // 复制我们的 TypeScript 编译产物
-  const distDirectory = path.join(rootDir, 'dist');
-  const distTarget = path.join(resourcesDirectory, 'dist');
-  await cp(distDirectory, distTarget, { recursive: true, force: true });
-
-  // 复制打包后的 CLI（包含所有依赖）
-  const bundledCLI = path.join(rootDir, 'dist', 'dynamicPlanningCLI.bundle.cjs');
-  const bundledCLITarget = path.join(resourcesDirectory, 'dynamicPlanningCLI.bundle.cjs');
-  await cp(bundledCLI, bundledCLITarget, { force: true });
-
   // 创建 kimi 可执行文件的符号链接（SDK 会查找名为 'kimi' 的命令）
   const kimiSymlink = path.join(resourcesDirectory, 'kimi');
   const kimiMjs = path.join(resourcesDirectory, 'kimi.mjs');
@@ -340,7 +318,6 @@ export async function packageNativeMacOS(rootDir = path.resolve(path.dirname(fil
   await chmod(kimiSymlink, 0o755);
 
   await buildNativeAgentHost(rootDir, resourcesDirectory);
-  await buildWebResearchBridge(rootDir, resourcesDirectory);
   await run('swift', swiftBuildArgs(arch), macosDirectory);
 
   await rm(artifacts.application, { recursive: true, force: true });
@@ -349,6 +326,22 @@ export async function packageNativeMacOS(rootDir = path.resolve(path.dirname(fil
   await cp(executable, path.join(appContents, 'MacOS', productName), { force: true });
   await chmod(path.join(appContents, 'MacOS', productName), 0o755);
   await cp(resourceBundle, path.join(appResources, path.basename(resourceBundle)), { recursive: true, force: true });
+  // Swift WebRuntime is the default Search/Fetch path. Do not ship the
+  // deprecated Node bridge merely because an older source bundle still has a
+  // compatibility resource checked in.
+  const copiedBundle = path.join(appResources, path.basename(resourceBundle));
+  await rm(path.join(copiedBundle, 'Resources', 'web-research-bridge.cjs'), { force: true });
+  await rm(path.join(copiedBundle, 'Contents', 'Resources', 'Resources', 'web-research-bridge.cjs'), { force: true });
+  // `dist/` bundled the retired Node network gateway and dynamic-planning
+  // entrypoint. Swift no longer loads those files in the default app path.
+  for (const resourceRoot of [
+    path.join(copiedBundle, 'Resources'),
+    path.join(copiedBundle, 'Contents', 'Resources', 'Resources')
+  ]) {
+    await rm(path.join(resourceRoot, 'dist'), { recursive: true, force: true });
+    await rm(path.join(resourceRoot, 'dynamicPlanningCLI.bundle.cjs'), { force: true });
+    await rm(path.join(resourceRoot, 'dynamicPlanningCLI.bundle.js'), { force: true });
+  }
   await copyBundledNode(rootDir, appResources, nodeVersion, arch);
   await writeFile(path.join(appContents, 'Info.plist'), infoPlist(version), 'utf8');
   await maybeCodesignApp(rootDir, artifacts.application);

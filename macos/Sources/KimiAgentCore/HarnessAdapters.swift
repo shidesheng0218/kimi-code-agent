@@ -217,6 +217,7 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
           for try await event in conversationStream {
             switch event {
             case let .text(text): continuation.yield(.text(text))
+            case let .reasoning(text): continuation.yield(HarnessModelEvent(kind: .thinking, text: text))
             case let .toolCallDelta(id, name, argumentsDelta):
               continuation.yield(HarnessModelEvent(
                 kind: .toolCall,
@@ -224,6 +225,7 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
                 toolName: name,
                 arguments: ["raw": argumentsDelta]
               ))
+            case .usage, .finish: break
             case .done: continuation.yield(HarnessModelEvent(kind: .done))
             }
           }
@@ -253,7 +255,7 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
     let session = self.session
     let preparedRequest = request
     return AsyncThrowingStream { continuation in
-      Task {
+      let producer = Task {
         do {
           // OpenAI-compatible streams commonly include an `id` only in the
           // first tool-call delta. Later argument deltas identify the call by
@@ -283,6 +285,9 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
             if let text = delta["content"] as? String, !text.isEmpty {
               continuation.yield(.text(text))
             }
+            if let reasoning = delta["reasoning_content"] as? String, !reasoning.isEmpty {
+              continuation.yield(.reasoning(reasoning))
+            }
             if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
               for (position, call) in toolCalls.enumerated() {
                 let function = call["function"] as? [String: Any]
@@ -301,11 +306,36 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
                 continuation.yield(.toolCallDelta(id: id, name: name, argumentsDelta: arguments))
               }
             }
+            if let usage = object["usage"] as? [String: Any] {
+              let promptDetails = usage["prompt_tokens_details"] as? [String: Any]
+              let completionDetails = usage["completion_tokens_details"] as? [String: Any]
+              continuation.yield(.usage(HarnessModelUsage(
+                inputTokens: usage["prompt_tokens"] as? Int ?? 0,
+                outputTokens: usage["completion_tokens"] as? Int ?? 0,
+                reasoningTokens: completionDetails?["reasoning_tokens"] as? Int ?? 0,
+                cachedTokens: promptDetails?["cached_tokens"] as? Int ?? 0
+              )))
+            }
+            if let reason = choices.first?["finish_reason"] as? String {
+              let mapped: HarnessConversationFinishReason
+              switch reason {
+              case "tool_calls": mapped = .toolCalls
+              case "length": mapped = .maxTokens
+              case "stop": mapped = .stop
+              default: mapped = .error
+              }
+              continuation.yield(.finish(mapped))
+            }
           }
+          continuation.finish()
+        } catch is CancellationError {
           continuation.finish()
         } catch {
           continuation.finish(throwing: error)
         }
+      }
+      continuation.onTermination = { _ in
+        producer.cancel()
       }
     }
   }

@@ -16,6 +16,7 @@
     "native:check": "cd macos && swift run KimiAgentCoreChecks",
     "native:build": "node scripts/package-native-macos.mjs",
     "native:package": "npm run build:full && node scripts/package-native-macos.mjs",
+    "update": "bash scripts/auto-update-app.sh",
     "verify": "npm run check && npm test && npm run native:check"
   },
   "dependencies": {

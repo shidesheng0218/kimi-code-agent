@@ -4433,6 +4433,9 @@ __export(webResearchBridge_exports, {
 module.exports = __toCommonJS(webResearchBridge_exports);
 var import_node_http = require("node:http");
 
+// src/runtime/networkGateway.ts
+var import_promises = require("node:dns/promises");
+
 // node_modules/@moonshot-ai/kimi-agent-sdk/dist/index.mjs
 var crypto = __toESM(require("crypto"), 1);
 
@@ -19493,6 +19496,14 @@ var ConfigSchema = external_exports.object({
 });
 
 // src/runtime/networkGateway.ts
+var defaultHostResolver = async (hostname3) => {
+  try {
+    const records = await (0, import_promises.lookup)(hostname3, { all: true, verbatim: true });
+    return records.map((record2) => record2.address);
+  } catch {
+    return [];
+  }
+};
 var WebResearchError = class extends Error {
   constructor(code, message) {
     super(message);
@@ -19536,9 +19547,7 @@ var NetworkGateway = class {
           body: input.body,
           signal: controller.signal
         });
-        const payload = Buffer.from(await response.arrayBuffer());
-        const truncated = payload.length > maxResponseBytes;
-        const bodyText = payload.subarray(0, maxResponseBytes).toString("utf8");
+        const { bodyText, truncated, bytesRead } = await readBodyWithLimit(response, maxResponseBytes, controller);
         if (shouldRetryStatus(response.status) && attempt < attempts) {
           lastError = new Error(`HTTP ${response.status}`);
           continue;
@@ -19550,7 +19559,7 @@ var NetworkGateway = class {
           redirected: response.redirected,
           headers: headersToRecord(response.headers),
           bodyText,
-          bytesRead: payload.length,
+          bytesRead,
           truncated,
           attempts: attempt,
           elapsedMs: Date.now() - startedAt
@@ -19584,6 +19593,7 @@ var NetworkGateway = class {
 var WebResearchClient = class {
   allowedDomains;
   fetchImplementation;
+  resolveHost;
   provider;
   providerAPIKey;
   providerEndpoint;
@@ -19604,7 +19614,14 @@ var WebResearchClient = class {
   constructor(options = {}) {
     this.allowedDomains = normalizeAllowedDomains(options.allowedDomains ?? readAllowedDomainsFromEnvironment());
     this.fetchImplementation = options.fetchImplementation ?? fetch;
+    this.resolveHost = options.resolveHost ?? defaultHostResolver;
     this.provider = normalizeSearchProvider(options.provider ?? process.env.KIMI_AGENT_WEB_SEARCH_PROVIDER ?? process.env.KIMI_WEB_SEARCH_PROVIDER);
+    if (this.provider === "kimi_official") {
+      throw new WebResearchError(
+        "invalid_configuration",
+        "kimi_official \u7531 Web Research Bridge \u63D0\u4F9B\uFF0C\u8BF7\u901A\u8FC7 KIMI_AGENT_WEB_SEARCH_PROVIDER=kimi_official \u7684\u6865\u63A5\u670D\u52A1\u4F7F\u7528\u3002"
+      );
+    }
     this.providerAPIKey = normalizedString(options.providerAPIKey ?? process.env.KIMI_AGENT_WEB_SEARCH_API_KEY ?? process.env.KIMI_WEB_SEARCH_API_KEY);
     this.providerEndpoint = normalizedString(options.providerEndpoint ?? process.env.KIMI_AGENT_WEB_SEARCH_ENDPOINT ?? process.env.KIMI_WEB_SEARCH_ENDPOINT) ?? defaultSearchEndpoint(this.provider);
     this.timeoutMs = boundedInteger(options.timeoutMs, 15e3, 1, 12e4);
@@ -19657,6 +19674,7 @@ var WebResearchClient = class {
   }
   async fetch(input) {
     const url2 = parseSafeWebFetchURL(input.url);
+    await assertPublicWebFetchTarget(url2.hostname, this.resolveHost);
     const maxChars = boundedInteger(input.maxChars, 12e3, 1e3, 64e3);
     const trustedSource = this.resolveTrustedSource(input.sourceID, url2);
     const cacheKey = JSON.stringify({ url: url2.toString(), sourceID: trustedSource?.id ?? "", maxChars });
@@ -19861,20 +19879,115 @@ function parseHTTPURL(value, errorMessage) {
 }
 function parseSafeWebFetchURL(value) {
   const url2 = parseHTTPURL(value, "Web Fetch \u53EA\u652F\u6301\u5408\u6CD5\u7684 HTTP(S) URL\u3002");
-  if (isPrivateWebTarget(url2.hostname)) {
+  if (isUnsafeWebTargetHostname(url2.hostname)) {
     throw new WebResearchError("unsafe_target", "Web Fetch \u4E0D\u5141\u8BB8\u6293\u53D6\u672C\u673A\u6216\u79C1\u6709\u7F51\u7EDC\u5730\u5740\uFF1B\u672C\u5730\u5F00\u53D1\u670D\u52A1\u8BF7\u4F7F\u7528 network.fetch\u3002");
   }
   return url2;
 }
-function isPrivateWebTarget(hostname3) {
-  const host = hostname3.trim().toLowerCase();
-  if (host === "localhost" || host === "::1" || host === "0.0.0.0") return true;
-  const parts = host.split(".").map((part) => Number(part));
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+function isUnsafeWebTargetHostname(hostname3) {
+  const host = stripIPBrackets(hostname3.trim().toLowerCase());
+  if (host === "localhost" || host === "ip6-localhost" || host === "0.0.0.0" || host.endsWith(".localhost")) {
+    return true;
+  }
+  if (host.includes(":")) return isUnsafeIPv6Literal(host);
+  return isIPv4Literal(host) && isUnsafeIPv4(host);
+}
+async function assertPublicWebFetchTarget(hostname3, resolveHost = defaultHostResolver) {
+  const host = stripIPBrackets(hostname3.trim().toLowerCase());
+  if (host === "localhost" || host === "ip6-localhost" || host === "0.0.0.0" || host.endsWith(".localhost")) {
+    throw new WebResearchError("unsafe_target", "Web Fetch \u4E0D\u5141\u8BB8\u6293\u53D6\u672C\u673A\u6216\u79C1\u6709\u7F51\u7EDC\u5730\u5740\u3002");
+  }
+  if (host.includes(":")) {
+    if (isUnsafeIPv6Literal(host)) {
+      throw new WebResearchError("unsafe_target", "Web Fetch \u4E0D\u5141\u8BB8\u6293\u53D6\u672C\u673A\u6216\u79C1\u6709\u7F51\u7EDC\u5730\u5740\u3002");
+    }
+    return;
+  }
+  if (isIPv4Literal(host)) {
+    if (isUnsafeIPv4(host)) {
+      throw new WebResearchError("unsafe_target", "Web Fetch \u4E0D\u5141\u8BB8\u6293\u53D6\u672C\u673A\u6216\u79C1\u6709\u7F51\u7EDC\u5730\u5740\u3002");
+    }
+    return;
+  }
+  const addresses = await resolveHost(host);
+  if (addresses.length === 0 || addresses.some(isUnsafeResolvedAddress)) {
+    throw new WebResearchError(
+      "unsafe_target",
+      "Web Fetch \u7684\u76EE\u6807\u57DF\u540D\u89E3\u6790\u5230\u672C\u673A\u3001\u79C1\u6709\u7F51\u7EDC\u6216\u4E0D\u53EF\u7528\u5730\u5740\uFF0C\u5DF2\u62D2\u7EDD\u8BBF\u95EE\u3002"
+    );
+  }
+}
+function isUnsafeResolvedAddress(address) {
+  const host = stripIPBrackets(address.trim().toLowerCase());
+  if (host.includes(":")) return isUnsafeIPv6Literal(host);
+  return isUnsafeIPv4(host);
+}
+function stripIPBrackets(hostname3) {
+  return hostname3.startsWith("[") && hostname3.endsWith("]") ? hostname3.slice(1, -1) : hostname3;
+}
+function isIPv4Literal(host) {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
+}
+function isUnsafeIPv4(address) {
+  const parts = address.split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255)) {
     return false;
   }
-  const [first, second] = parts;
-  return first === 10 || first === 127 || first === 0 || first === 169 && second === 254 || first === 172 && second >= 16 && second <= 31 || first === 192 && second === 168;
+  const [first, second] = parts.map((part) => Number(part));
+  return first === 0 || first === 10 || first === 127 || first === 100 && second >= 64 && second <= 127 || first === 169 && second === 254 || first === 172 && second >= 16 && second <= 31 || first === 192 && second === 168 || first === 192 && second === 0 && thirdIn(parts, 2) || first === 198 && second === 51 && thirdIn(parts, 100) || first === 203 && second === 0 && thirdIn(parts, 113);
+}
+function thirdIn(parts, value) {
+  return Number(parts[2]) === value;
+}
+function parseIPv6Groups(host) {
+  const lower = host.toLowerCase();
+  if (!lower.includes(":")) return void 0;
+  const parseGroups = (part) => {
+    const groups = [];
+    for (const raw of part.split(":").filter(Boolean)) {
+      if (raw.includes(".")) {
+        const octets = raw.split(".");
+        if (octets.length !== 4 || octets.some((octet) => !/^\d{1,3}$/.test(octet) || Number(octet) > 255)) {
+          return void 0;
+        }
+        const [a, b, c, d] = octets.map((octet) => Number(octet));
+        groups.push(a << 8 | b, c << 8 | d);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(raw)) return void 0;
+        groups.push(Number.parseInt(raw, 16));
+      }
+    }
+    return groups;
+  };
+  const pieces = lower.split("::");
+  if (pieces.length === 1) {
+    const groups = parseGroups(pieces[0]);
+    return groups && groups.length === 8 ? groups : void 0;
+  }
+  if (pieces.length !== 2) return void 0;
+  const head = pieces[0] ? parseGroups(pieces[0]) : [];
+  const tail = pieces[1] ? parseGroups(pieces[1]) : [];
+  if (head === void 0 || tail === void 0) return void 0;
+  const missing = 8 - head.length - tail.length;
+  if (missing < 1) return void 0;
+  return [...head, ...Array(missing).fill(0), ...tail];
+}
+function isUnsafeIPv6Literal(host) {
+  const groups = parseIPv6Groups(host);
+  if (!groups || groups.length !== 8) return true;
+  if (groups.every((group) => group === 0)) return true;
+  if (groups.slice(0, 7).every((group) => group === 0) && groups[7] === 1) return true;
+  const v4Mapped = groups.slice(0, 5).every((group) => group === 0) && groups[5] === 65535;
+  const v4Compatible = groups.slice(0, 6).every((group) => group === 0);
+  if (v4Mapped || v4Compatible) {
+    const hi = groups[6];
+    const lo = groups[7];
+    return isUnsafeIPv4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  if ((groups[0] & 65472) === 65152) return true;
+  if ((groups[0] & 65024) === 64512) return true;
+  if ((groups[0] & 65280) === 65280) return true;
+  return false;
 }
 function braveFreshnessValue(freshness) {
   switch (freshness) {
@@ -20022,6 +20135,39 @@ function headersToRecord(headers) {
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+async function readBodyWithLimit(response, maxResponseBytes, controller) {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    const payload = Buffer.from(await response.arrayBuffer());
+    return {
+      bodyText: payload.subarray(0, maxResponseBytes).toString("utf8"),
+      truncated: payload.length > maxResponseBytes,
+      bytesRead: payload.length
+    };
+  }
+  const chunks = [];
+  let bytesRead = 0;
+  let truncated = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = maxResponseBytes - bytesRead;
+      if (remaining <= 0) {
+        truncated = true;
+        await reader.cancel().catch(() => void 0);
+        controller.abort();
+        break;
+      }
+      chunks.push(Buffer.from(value).subarray(0, remaining));
+      bytesRead += Math.min(value.length, remaining);
+      if (value.length > remaining) truncated = true;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return { bodyText: Buffer.concat(chunks).toString("utf8"), truncated, bytesRead };
+}
 function mergeDomains(required2, additional) {
   return Array.from(new Set([...required2, ...additional ?? []].map((domain2) => domain2.trim()).filter(Boolean)));
 }
@@ -20033,6 +20179,7 @@ var KimiOfficialResearchClient = class {
   baseURL;
   model;
   fetchImplementation;
+  resolveHost;
   cacheTTLms;
   maxResults;
   maxFetchChars;
@@ -20048,6 +20195,7 @@ var KimiOfficialResearchClient = class {
     this.baseURL = (options.baseURL ?? "https://api.moonshot.cn/v1").replace(/\/$/, "");
     this.model = options.model?.trim() || "kimi-k3";
     this.fetchImplementation = options.fetchImplementation ?? fetch;
+    this.resolveHost = options.resolveHost ?? defaultHostResolver;
     this.cacheTTLms = Math.max(1e3, options.cacheTTLms ?? 10 * 6e4);
     this.maxResults = Math.max(1, Math.min(options.maxResults ?? 5, 10));
     this.maxFetchChars = Math.max(200, Math.min(options.maxFetchChars ?? 25e3, 5e4));
@@ -20131,6 +20279,7 @@ var KimiOfficialResearchClient = class {
   }
   async fetch(request) {
     const url2 = normalizePublicURL(request.url);
+    await assertPublicWebFetchTarget(new URL(url2).hostname, this.resolveHost);
     if (request.sourceID && this.sourceRegistry.get(request.sourceID) !== url2) {
       throw new Error("Web Fetch \u7684 sourceID \u4E0E URL \u4E0D\u5339\u914D\u3002");
     }
@@ -20292,8 +20441,7 @@ function decodeHTMLEntities2(value) {
 function normalizePublicURL(value) {
   const parsed = new URL(value.trim());
   if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Web Fetch \u53EA\u5141\u8BB8 HTTP(S) \u5730\u5740\u3002");
-  const hostname3 = parsed.hostname.toLowerCase();
-  if (hostname3 === "localhost" || hostname3 === "ip6-localhost" || hostname3.endsWith(".localhost") || hostname3 === "::1" || /^127\./.test(hostname3) || /^10\./.test(hostname3) || /^192\.168\./.test(hostname3) || /^169\.254\./.test(hostname3) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname3)) {
+  if (isUnsafeWebTargetHostname(parsed.hostname)) {
     throw new Error("Web Fetch \u4E0D\u5141\u8BB8\u8BBF\u95EE\u672C\u673A\u6216\u79C1\u6709\u7F51\u7EDC\u5730\u5740\u3002");
   }
   return parsed.toString();
@@ -20428,6 +20576,10 @@ function createWebResearchBridgeServer(client = createConfiguredResearchClient()
     }
     if (request.method !== "POST") {
       writeJSON(response, 405, { error: "method_not_allowed" });
+      return;
+    }
+    if (request.headers.origin) {
+      writeJSON(response, 403, { error: "origin_not_allowed" });
       return;
     }
     try {

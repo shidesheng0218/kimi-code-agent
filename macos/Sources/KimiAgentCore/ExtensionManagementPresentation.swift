@@ -69,7 +69,7 @@ public struct ExtensionManagementPresentation: Codable, Equatable, Sendable {
       ExtensionManagementSection(
         id: "plugins",
         title: "Plugins",
-        summary: plugins.isEmpty ? "未发现 Plugins" : "(plugins.count) 个已发现",
+        summary: plugins.isEmpty ? "未发现 Plugins" : "\(plugins.count) 个已发现",
         rows: Self.makePluginRows(plugins: plugins)
       ),
       ExtensionManagementSection(

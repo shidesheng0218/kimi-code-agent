@@ -4610,7 +4610,9 @@ private struct WebResearchSettingsForm: View {
         .workbenchSurface(color: WorkbenchTheme.accentSurface, radius: WorkbenchTheme.smallRadius)
 
         HStack(spacing: 10) {
-          Button("测试官方联网", action: model.testWebResearchConnection)
+          Button("测试官方联网") {
+            model.testWebResearchConnection()
+          }
             .buttonStyle(.borderedProminent)
             .tint(WorkbenchTheme.accent)
           Button("高级：自定义搜索服务") {
@@ -4721,7 +4723,9 @@ private struct WebResearchSettingsForm: View {
         .tint(WorkbenchTheme.accent)
 
         if showAdvanced {
-          Button("测试自定义服务", action: model.testWebResearchConnection)
+          Button("测试自定义服务") {
+            model.testWebResearchConnection()
+          }
           .buttonStyle(.plain)
           .font(.caption.weight(.medium))
           .workbenchHoverFeedback(radius: WorkbenchTheme.smallRadius)

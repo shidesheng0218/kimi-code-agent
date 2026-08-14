@@ -536,11 +536,12 @@ final class DesktopAppModel: ObservableObject {
       .appendingPathComponent("browser-artifacts", isDirectory: true)
       .appendingPathComponent(session.id.uuidString, isDirectory: true)
     let allowedDomains = activeNetworkDomains
-    let webSearchEndpoint: URL?
-    if agentDefinition.kind == .webResearch {
-      webSearchEndpoint = try startNativeWebResearchBridge(modelID: session.modelID ?? parent.modelID ?? kimiRuntimeIdentity.modelID)
+    let modelID = session.modelID ?? parent.modelID ?? kimiRuntimeIdentity.modelID
+    let webToolExecutor: WebRuntimeToolExecutor?
+    if tools.contains(where: { $0.id == "web.search" || $0.id == "web.fetch" }) {
+      webToolExecutor = WebRuntimeToolExecutor(runtime: try await makeNativeWebRuntime(modelID: modelID, baseURL: baseURL, apiKey: apiKey))
     } else {
-      webSearchEndpoint = nativeWebSearchURL()
+      webToolExecutor = nil
     }
     let promptURL = BrowserHarnessRequestDecoder.firstHTTPURL(in: prompt)
     let browserHandler: NativeHarnessToolRuntime.SpecializedToolHandler = { request in
@@ -581,11 +582,8 @@ final class DesktopAppModel: ObservableObject {
     )
     let registry = ToolRegistry(definitions: tools)
     for definition in tools {
-      if definition.id == "web.search", let endpoint = webSearchEndpoint {
-        await registry.register(definition, executor: ClosureToolExecutor { [weak self] request in
-          guard let self else { throw CancellationError() }
-          return try await self.executeNativeWebSearch(request, endpoint: endpoint)
-        })
+      if (definition.id == "web.search" || definition.id == "web.fetch"), let webToolExecutor {
+        await registry.register(definition, executor: webToolExecutor)
       } else if definition.id.hasPrefix("mcp."), let mcpExecutor {
         await registry.register(definition, executor: mcpExecutor)
       } else {
@@ -605,7 +603,6 @@ final class DesktopAppModel: ObservableObject {
       },
       journal: journal
     )
-    let modelID = session.modelID ?? parent.modelID ?? kimiRuntimeIdentity.modelID
     let provider = KimiHTTPModelProvider(baseURL: baseURL, apiKey: apiKey, modelID: modelID, maximumOutputTokens: TaskBudget.standard.maxOutputTokens)
     let evidenceStore = ChildToolEvidenceStore()
     let loop = HarnessConversationLoop(provider: provider, maxRounds: 8) { call, _ in
@@ -615,7 +612,7 @@ final class DesktopAppModel: ObservableObject {
         operationID: session.id,
         agentID: session.agentID,
         toolID: call.name,
-        input: Self.nativeToolInput(from: call.argumentsJSON),
+        inputJSON: Self.nativeToolInputJSON(from: call.argumentsJSON),
         resource: Self.nativeToolResource(from: call.argumentsJSON),
         command: Self.nativeToolCommand(from: call.argumentsJSON)
       )
@@ -761,9 +758,6 @@ final class DesktopAppModel: ObservableObject {
     let decision = TaskIntentRouter.decide(for: prompt)
     let contract = TaskContract.make(prompt: prompt, decision: decision, mode: selectedMode)
 
-    // Check if dynamic planning is enabled (env var or config)
-    let useDynamicPlanning = ProcessInfo.processInfo.environment["KIMI_DYNAMIC_PLANNING"] == "1"
-
     let taskEvents = [
       AgentEvent(sessionID: sessionID, taskID: taskID, turnID: turn.id, sequence: 1, actor: "desktop", kind: .sessionCreated, payload: ["mode": selectedMode.rawValue]),
       AgentEvent(sessionID: sessionID, taskID: taskID, turnID: turn.id, sequence: 2, actor: "desktop", kind: .taskPlanned, payload: ["title": prompt])
@@ -797,74 +791,23 @@ final class DesktopAppModel: ObservableObject {
     draftPrompt = ""
     schedulePersistence()
 
-    if useDynamicPlanning {
-      appendEvent("正在使用 AI 生成动态执行计划…", kind: .toolProgress, for: task.id, turnID: turn.id)
-      let capturedMode = selectedMode
-      let capturedVault = credentialVault
-      Task { [weak self] in
-        do {
-          let agentPlan = try await AgentOrchestrator.makeDynamicPlan(
-            taskID: taskID,
-            mode: capturedMode,
-            sessionID: sessionID,
-            prompt: prompt,
-            workspacePath: resolvedWorkspacePath,
-            model: modelID,
-            vault: capturedVault
-          )
-          await MainActor.run {
-            self?.updateTask(taskID) { current in
-              current.agentRuns = agentPlan.runs
-              current.status = agentPlan.runs.isEmpty ? .draft : .planning
-            }
-            self?.appendEvent("动态计划已生成，共 \(agentPlan.runs.count) 个子任务。", kind: .taskPlanned, for: taskID, turnID: turn.id)
-            if capturedMode.isReadOnly {
-              self?.appendEvent("正在准备回复…", kind: .toolProgress, for: taskID, turnID: turn.id)
-            } else {
-              self?.appendEvent("等待自动执行确认…", kind: .permissionRequested, for: taskID, payload: ["action": "自动执行"], requiresApproval: true, turnID: turn.id)
-            }
-            self?.runSelectedTask()
-          }
-        } catch {
-          await MainActor.run {
-            self?.appendEvent("动态规划失败，使用默认计划：\(error.localizedDescription)", kind: .error, for: taskID, turnID: turn.id)
-            let fallbackPlan = TaskGraphCompiler.plan(from: TaskGraphCompiler.compile(
-              taskID: taskID,
-              sessionID: sessionID,
-              contract: contract,
-              model: modelID
-            ))
-            self?.updateTask(taskID) { current in
-              current.agentRuns = fallbackPlan.runs
-              current.status = fallbackPlan.runs.isEmpty ? .draft : .planning
-            }
-            if capturedMode.isReadOnly {
-              self?.appendEvent("正在准备回复…", kind: .toolProgress, for: taskID, turnID: turn.id)
-            } else {
-              self?.appendEvent("等待自动执行确认…", kind: .permissionRequested, for: taskID, payload: ["action": "自动执行"], requiresApproval: true, turnID: turn.id)
-            }
-            self?.runSelectedTask()
-          }
-        }
-      }
-    } else {
-      let agentPlan = TaskGraphCompiler.plan(from: TaskGraphCompiler.compile(
-        taskID: taskID,
-        sessionID: sessionID,
-        contract: contract,
-        model: modelID
-      ))
-      updateTask(taskID) { current in
-        current.agentRuns = agentPlan.runs
-        current.status = agentPlan.runs.isEmpty ? .draft : .planning
-      }
-      if selectedMode.isReadOnly {
-        appendEvent("正在准备回复…", kind: .toolProgress, for: task.id, turnID: turn.id)
-      } else {
-        appendEvent("等待自动执行确认…", kind: .permissionRequested, for: task.id, payload: ["action": "自动执行"], requiresApproval: true, turnID: turn.id)
-      }
-      runSelectedTask()
+    // 使用默认的任务编排（Kimi 会通过 system prompt 自己处理任务分解）
+    let agentPlan = TaskGraphCompiler.plan(from: TaskGraphCompiler.compile(
+      taskID: taskID,
+      sessionID: sessionID,
+      contract: contract,
+      model: modelID
+    ))
+    updateTask(taskID) { current in
+      current.agentRuns = agentPlan.runs
+      current.status = agentPlan.runs.isEmpty ? .draft : .planning
     }
+    if selectedMode.isReadOnly {
+      appendEvent("正在准备回复…", kind: .toolProgress, for: task.id, turnID: turn.id)
+    } else {
+      appendEvent("等待自动执行确认…", kind: .permissionRequested, for: task.id, payload: ["action": "自动执行"], requiresApproval: true, turnID: turn.id)
+    }
+    runSelectedTask()
   }
 
   func submitComposerPrompt() {
@@ -1658,10 +1601,11 @@ final class DesktopAppModel: ObservableObject {
     let configuredDomain = WebToolApprovalPolicy.host(in: request.input)
     let configuredWebDomain = configuredDomain.map { WebToolApprovalPolicy.matchesConfiguredDomain(host: $0, domains: activeNetworkDomains) } ?? false
     let providerSearchIsReady = definition.id.lowercased() == "web.search" && webResearchSettings.isReady
+    let automaticPublicWebRead = WebToolApprovalPolicy.canAutoApprovePublicRead(toolID: definition.id, input: request.input)
     let approvalFingerprint = webApprovalKey ?? evaluation.fingerprint
     let remembered = approvalMemory.contains(taskID: request.taskID, fingerprint: approvalFingerprint)
-    if evaluation.decision == .allow || remembered || configuredWebDomain || providerSearchIsReady {
-      if webApprovalKey != nil || evaluation.remember == .task || configuredWebDomain || providerSearchIsReady {
+    if evaluation.decision == .allow || remembered || configuredWebDomain || providerSearchIsReady || automaticPublicWebRead {
+      if webApprovalKey != nil || evaluation.remember == .task || configuredWebDomain || providerSearchIsReady || automaticPublicWebRead {
         approvalMemory.remember(taskID: request.taskID, fingerprint: approvalFingerprint)
       }
       return .allow
@@ -1927,56 +1871,28 @@ final class DesktopAppModel: ObservableObject {
       return
     }
     webResearchCapability = .checking
-    do {
-      let environment = try runtimeEnvironmentForCurrentIdentity()
-      guard let nodePath = NativeRuntimeLocator.nodePath(),
-            let bridgeURL = try startWebResearchBridgeIfNeeded(nodePath: nodePath, environment: environment) else {
-        notice = Notice(kind: .error, text: "官方联网 Bridge 尚未准备好。")
-        return
-      }
-      let endpoint = bridgeURL
-      Task { [weak self] in
-        do {
-          var request = URLRequest(url: URL(string: endpoint)!)
-          request.httpMethod = "POST"
-          request.timeoutInterval = 12
-          request.setValue("application/json", forHTTPHeaderField: "content-type")
-          request.httpBody = try JSONSerialization.data(withJSONObject: ["text_query": "Kimi 官方联网连接测试"])
-          let (data, response) = try await URLSession.shared.data(for: request)
-          guard let http = response as? HTTPURLResponse else {
-            throw NSError(domain: "WebResearch", code: 4, userInfo: [NSLocalizedDescriptionKey: "官方联网返回了无效响应。"])
-          }
-          guard (200..<300).contains(http.statusCode) else {
-            throw NSError(
-              domain: "WebResearch",
-              code: 4,
-              userInfo: [
-                NSLocalizedDescriptionKey: WebResearchConnectionPresentation.bridgeFailureMessage(
-                  statusCode: http.statusCode,
-                  body: String(data: data, encoding: .utf8) ?? ""
-                )
-              ]
-            )
-          }
-          let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-          let count = (object?["search_results"] as? [[String: Any]])?.count ?? 0
-          guard count > 0 else {
-            throw NSError(domain: "WebResearch", code: 5, userInfo: [NSLocalizedDescriptionKey: "官方联网已连接，但没有返回来源。"])
-          }
-          await MainActor.run {
-            let providerTitle = self?.webResearchSettings.provider.title ?? "联网服务"
-            self?.webResearchCapability = .available
-            self?.notice = Notice(kind: .success, text: "\(providerTitle)测试通过，返回 \(count) 个来源。")
-          }
-        } catch {
-          await MainActor.run {
-            self?.webResearchCapability = .unavailable(error.localizedDescription)
-            self?.notice = Notice(kind: .error, text: "联网测试失败：\(error.localizedDescription)")
-          }
+    guard let apiKey = try? kimiRuntimeIdentityStore.apiKey(), !apiKey.isEmpty,
+          let baseURL = URL(string: kimiRuntimeIdentity.baseURL) else {
+      webResearchCapability = .unavailable("Kimi API Key 或 Base URL 未配置。")
+      notice = Notice(kind: .error, text: "请先保存 Kimi API Key 和 Base URL。")
+      return
+    }
+    let modelID = KimiRuntimeIdentityStore.resolvedModelID(taskModelID: nil, fallbackModelID: kimiRuntimeIdentity.modelID)
+    Task { [weak self] in
+      do {
+        guard let self else { return }
+        let runtime = try await self.makeNativeWebRuntime(modelID: modelID, baseURL: baseURL, apiKey: apiKey)
+        let result = try await runtime.search(WebSearchRequest(query: "Kimi 官方联网连接测试", maxResults: 1))
+        guard !result.sources.isEmpty else {
+          throw WebRuntimeError.providerFailure("联网服务已连接，但没有返回可验证来源。")
         }
+        self.webResearchCapability = .available
+        self.notice = Notice(kind: .success, text: "\(self.webResearchSettings.provider.title)测试通过，返回 \(result.sources.count) 个来源。")
+      } catch {
+        guard let self else { return }
+        self.webResearchCapability = .unavailable(error.localizedDescription)
+        self.notice = Notice(kind: .error, text: "联网测试失败：\(error.localizedDescription)")
       }
-    } catch {
-      notice = Notice(kind: .error, text: "无法启动官方联网：\(error.localizedDescription)")
     }
   }
 
@@ -2407,7 +2323,7 @@ final class DesktopAppModel: ObservableObject {
     let probe = Process()
     let output = Pipe()
     probe.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-    probe.arguments = ["-f", "(scriptURL.path) --port 0"]
+    probe.arguments = ["-f", "\(scriptURL.path) --port 0"]
     probe.standardOutput = output
     probe.standardError = Pipe()
     do {
@@ -3588,7 +3504,22 @@ final class DesktopAppModel: ObservableObject {
           "error": receipt.errorMessage ?? ""
         ]
       )
-    case .entryAppended, .queueEnqueued, .snapshotPublished:
+    // Model stream blocks and canonical intermediate messages are durable
+    // replay facts, not chat transcript rows.  User-facing activity remains
+    // driven by the corresponding Intent/Permission/Receipt events below so
+    // reasoning text and raw tool JSON can never leak into the main chat.
+    case .turnStarted,
+         .stepStarted,
+         .requestHeader,
+         .modelChunk,
+         .assistantMessage,
+         .toolCallDeclared,
+         .toolResultRecorded,
+         .stepEnded,
+         .turnEnded,
+         .entryAppended,
+         .queueEnqueued,
+         .snapshotPublished:
       break
     }
   }
@@ -3686,22 +3617,21 @@ final class DesktopAppModel: ObservableObject {
 
     let modelID = KimiRuntimeIdentityStore.resolvedModelID(taskModelID: task.modelID, fallbackModelID: kimiRuntimeIdentity.modelID)
     let intentDecision = TaskIntentRouter.decide(for: context.prompt.text)
-    var webSearchEndpoint: URL?
-    if intentDecision.intent == .webResearch {
-      webSearchEndpoint = try startNativeWebResearchBridge(modelID: modelID)
-      appendEvent("联网研究已就绪：将自动搜索并读取公开来源。", kind: .toolProgress, for: taskID, payload: ["provider": webResearchSettings.provider.runtimeIdentifier])
-    } else {
-      webSearchEndpoint = nativeWebSearchURL()
-      // Keep web.search available to the main Harness even when intent
-      // classification missed a fresh-information question.  This prevents
-      // a recovered FetchURL -> web.search call from becoming an
-      // "unregistered tool" failure.  Startup is best-effort for ordinary
-      // coding prompts; explicit research prompts still fail loudly above.
-      if webSearchEndpoint == nil,
-         webResearchSettings.isEnabled,
-         usesNativeHarnessProvider() {
-        webSearchEndpoint = try? startNativeWebResearchBridge(modelID: modelID)
+    let webToolExecutor: WebRuntimeToolExecutor?
+    if webResearchSettings.isEnabled {
+      do {
+        webToolExecutor = WebRuntimeToolExecutor(runtime: try await makeNativeWebRuntime(modelID: modelID, baseURL: baseURL, apiKey: apiKey))
+        appendEvent("联网研究已就绪：Swift 原生 Search / Fetch 将自动读取公开来源。", kind: .toolProgress, for: taskID, payload: ["provider": webResearchSettings.provider.runtimeIdentifier, "runtime": "swift"])
+      } catch {
+        if intentDecision.intent == .webResearch { throw error }
+        webToolExecutor = nil
+        appendEvent("Swift 原生 Web Runtime 未启用：\(error.localizedDescription)", kind: .toolProgress, for: taskID, payload: ["runtime": "swift", "available": "false"])
       }
+    } else {
+      if intentDecision.intent == .webResearch {
+        throw NSError(domain: "WebResearch", code: 20, userInfo: [NSLocalizedDescriptionKey: "联网研究已关闭。请在设置中启用 Web Search。"])
+      }
+      webToolExecutor = nil
     }
     let taskContract = TaskContract.make(prompt: context.prompt.text, decision: intentDecision, mode: task.mode)
     let taskBudget = TaskBudget.standard
@@ -3800,10 +3730,13 @@ final class DesktopAppModel: ObservableObject {
       mcpHandler: mcpHandler
     )
     var nativeToolIDs: Set<String> = [
-      "read", "search", "write", "shell", "web.search", "web.fetch", "browser",
+      "read", "search", "write", "shell", "browser",
       "computer_use.inspect", "computer_use.screenshot", "computer_use.click",
       "computer_use.click_element", "computer_use.type_text", "computer_use.press_key"
     ]
+    if webToolExecutor != nil {
+      nativeToolIDs.formUnion(["web.search", "web.fetch"])
+    }
     if mcpExecutor != nil {
       nativeToolIDs.insert("mcp")
     }
@@ -3811,6 +3744,13 @@ final class DesktopAppModel: ObservableObject {
     let registry = ToolRegistry(definitions: definitions)
     for definition in definitions {
       await registry.register(definition, executor: runtime)
+    }
+    if let webToolExecutor {
+      for id in ["web.search", "web.fetch"] {
+        if let definition = definitions.first(where: { $0.id == id }) {
+          await registry.register(definition, executor: webToolExecutor)
+        }
+      }
     }
 
     if let mcpExecutor, let mcpDefinitions = try? mcpExecutor.discoverDefinitions() {
@@ -3832,24 +3772,6 @@ final class DesktopAppModel: ObservableObject {
         appendEvent("MCP Tool Search 已选择 \(definitionsToRegister.count) 个相关工具。", kind: .toolProgress, for: taskID, payload: ["authority": HarnessExecutionAuthority.harnessNative.rawValue, "toolSearch": "true"])
       }
     }
-
-    // Register Web Search even when the bridge was not ready during task
-    // bootstrap. The previous conditional registration made a recovered
-    // FetchURL -> web.search call visible to the model but executable by
-    // nobody, producing "未注册工具: web.search". Resolve the bridge lazily
-    // at the first actual call so startup timing cannot break the tool chain.
-    let searchDefinition = ToolCatalog.defaultDefinitions.first(where: { $0.id == "web.search" })!
-    let initialWebSearchEndpoint = webSearchEndpoint
-    await registry.register(searchDefinition, executor: ClosureToolExecutor { [weak self] request in
-      guard let self else { throw CancellationError() }
-      let endpoint: URL
-      if let initialWebSearchEndpoint {
-        endpoint = initialWebSearchEndpoint
-      } else {
-        endpoint = try await self.startNativeWebResearchBridge(modelID: modelID)
-      }
-      return try await self.executeNativeWebSearch(request, endpoint: endpoint)
-    })
 
     let toolWorkspacePath = workingDirectory.path
     let journal = ToolEffectJournal(
@@ -3879,27 +3801,63 @@ final class DesktopAppModel: ObservableObject {
       maximumOutputTokens: modelRoute.maximumOutputTokens
     )
     let providerStartedAt = Date()
-    let loop = HarnessConversationLoop(provider: provider, maxRounds: 8) { call, _ in
-      let request = ToolExecutionRequest(
-        taskID: taskID,
-        sessionID: context.sessionID,
-        operationID: context.operationID,
-        agentID: "main",
-        toolID: call.name,
-        input: Self.nativeToolInput(from: call.argumentsJSON),
-        resource: Self.nativeToolResource(from: call.argumentsJSON),
-        command: Self.nativeToolCommand(from: call.argumentsJSON)
-      )
-      await emit(.artifact("tool=\(call.name) requested"))
-      do {
-        let result = try await coordinator.execute(request)
-        await emit(.artifact("tool=\(call.name) settled"))
-        return HarnessToolResult(callID: call.id, toolName: call.name, output: result.output, isError: result.exitCode.map { $0 != 0 } ?? false)
-      } catch {
-        await emit(.artifact("tool=\(call.name) failed"))
-        return HarnessToolResult(callID: call.id, toolName: call.name, output: error.localizedDescription, isError: true)
-      }
-    }
+    let loop = HarnessConversationLoop(
+      provider: provider,
+      maxRounds: 8,
+      executeTool: { call, _ in
+        let request = ToolExecutionRequest(
+          taskID: taskID,
+          sessionID: context.sessionID,
+          operationID: context.operationID,
+          agentID: "main",
+          toolID: call.name,
+          inputJSON: Self.nativeToolInputJSON(from: call.argumentsJSON),
+          resource: Self.nativeToolResource(from: call.argumentsJSON),
+          command: Self.nativeToolCommand(from: call.argumentsJSON)
+        )
+        await emit(.artifact("tool=\(call.name) requested"))
+        do {
+          let result = try await coordinator.execute(request)
+          await emit(.artifact("tool=\(call.name) settled"))
+          return HarnessToolResult(callID: call.id, toolName: call.name, output: result.output, isError: result.exitCode.map { $0 != 0 } ?? false)
+        } catch {
+          await emit(.artifact("tool=\(call.name) failed"))
+          return HarnessToolResult(callID: call.id, toolName: call.name, output: error.localizedDescription, isError: true)
+        }
+      },
+      executeBatch: { calls, _ in
+        let requests = calls.map { call in
+          ToolExecutionRequest(
+            taskID: taskID,
+            sessionID: context.sessionID,
+            operationID: context.operationID,
+            agentID: "main",
+            toolID: call.name,
+            inputJSON: Self.nativeToolInputJSON(from: call.argumentsJSON),
+            resource: Self.nativeToolResource(from: call.argumentsJSON),
+            command: Self.nativeToolCommand(from: call.argumentsJSON)
+          )
+        }
+        let outcomes = await coordinator.executeBatch(requests)
+        var results: [HarnessToolResult] = []
+        results.reserveCapacity(calls.count)
+        for index in calls.indices {
+          let call = calls[index]
+          switch outcomes[index] {
+          case let .success(result):
+            await emit(.artifact("tool=\(call.name) settled"))
+            results.append(HarnessToolResult(callID: call.id, toolName: call.name, output: result.output, isError: result.exitCode.map { $0 != 0 } ?? false))
+          case let .failure(error):
+            await emit(.artifact("tool=\(call.name) failed"))
+            results.append(HarnessToolResult(callID: call.id, toolName: call.name, output: error.localizedDescription, isError: true))
+          }
+        }
+        return results
+      },
+      maximumOutputTokens: modelRoute.maximumOutputTokens,
+      eventSink: { event in await emit(event) },
+      nextStepInput: context.takeSteering
+    )
 
     do {
       let result = try await loop.run(
@@ -4014,6 +3972,52 @@ final class DesktopAppModel: ObservableObject {
     return url
   }
 
+  /// Builds the only Web capability used by the native Harness.  The legacy
+  /// Node bridge remains available solely for ACP/CLI compatibility and the
+  /// settings connection diagnostic; native Kimi API sessions never depend on
+  /// a localhost bridge process for Search or Fetch.
+  private func makeNativeWebRuntime(modelID: String, baseURL: URL, apiKey: String) async throws -> WebRuntime {
+    guard webResearchSettings.isEnabled else {
+      throw NSError(domain: "WebResearch", code: 20, userInfo: [NSLocalizedDescriptionKey: "联网研究已关闭。"])
+    }
+    let selectedID = webResearchSettings.provider.runtimeIdentifier
+    var priority = [selectedID]
+    if selectedID != "kimi_official", !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      priority.append("kimi_official")
+    }
+    let runtime = WebRuntime(searchPriority: priority, fetchPriority: ["http"])
+    try await runtime.register(fetch: HTTPWebFetchProvider())
+
+    switch webResearchSettings.provider {
+    case .kimiOfficial:
+      guard !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        throw NSError(domain: "WebResearch", code: 21, userInfo: [NSLocalizedDescriptionKey: "Kimi 官方联网需要已保存的 Kimi API Key。"])
+      }
+      let configuredFormulaModel = ProcessInfo.processInfo.environment["KIMI_AGENT_OFFICIAL_TOOLS_MODEL"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let formulaModel = configuredFormulaModel.isEmpty ? modelID : configuredFormulaModel
+      try await runtime.register(search: KimiOfficialWebProvider(apiKey: apiKey, baseURL: baseURL, modelID: formulaModel))
+    case .brave:
+      guard let searchKey = try webResearchSettingsStore.apiKey(), !searchKey.isEmpty,
+            let endpoint = URL(string: webResearchSettings.endpoint) else {
+        throw NSError(domain: "WebResearch", code: 24, userInfo: [NSLocalizedDescriptionKey: "Brave Search 需要有效的 API Key 和服务地址。"])
+      }
+      try await runtime.register(search: BraveWebSearchProvider(apiKey: searchKey, endpoint: endpoint))
+      if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        try await runtime.register(search: KimiOfficialWebProvider(apiKey: apiKey, baseURL: baseURL, modelID: modelID))
+      }
+    case .searxng:
+      guard let endpoint = URL(string: webResearchSettings.endpoint) else {
+        throw NSError(domain: "WebResearch", code: 25, userInfo: [NSLocalizedDescriptionKey: "SearxNG 服务地址无效。"])
+      }
+      try await runtime.register(search: SearxNGWebSearchProvider(endpoint: endpoint))
+      if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        try await runtime.register(search: KimiOfficialWebProvider(apiKey: apiKey, baseURL: baseURL, modelID: modelID))
+      }
+    }
+    return runtime
+  }
+
   /// Starts the local Web Research bridge before the model receives its tool
   /// schema. Previously the native API path only registered `web.search` if a
   /// bridge happened to have been started elsewhere, so the model frequently
@@ -4095,49 +4099,31 @@ final class DesktopAppModel: ObservableObject {
     kimiRuntimeIdentity.mode == .apiKey && kimiRuntimeIdentity.isAPIConfigured
   }
 
-  private nonisolated static func nativeToolInput(from argumentsJSON: String) -> [String: String] {
+  private nonisolated static func nativeToolInputJSON(from argumentsJSON: String) -> HarnessJSONValue {
     guard let data = argumentsJSON.data(using: .utf8),
-          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-      return [:]
+          case let .object(decoded) = try? JSONDecoder().decode(HarnessJSONValue.self, from: data) else {
+      return .object([:])
     }
-    var values: [String: String] = object.reduce(into: [String: String]()) { values, element in
+    // Some Kimi-compatible tool streams wrap their argument object. Unwrap
+    // only that top-level envelope; nested values remain JSON-native instead
+    // of being flattened into lossy strings.
+    var values = decoded.reduce(into: [String: HarnessJSONValue]()) { result, element in
       let key = element.key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-      switch element.value {
-      case let string as String: values[key] = string
-      case let number as NSNumber: values[key] = number.stringValue
-      case let nested as [String: Any]:
-        for (nestedKey, nestedValue) in nested {
-          let normalizedNestedKey = nestedKey.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-          switch nestedValue {
-          case let string as String: values[normalizedNestedKey] = string
-          case let number as NSNumber: values[normalizedNestedKey] = number.stringValue
-          default:
-            values[normalizedNestedKey] = String(data: (try? JSONSerialization.data(withJSONObject: nestedValue)) ?? Data(), encoding: .utf8) ?? ""
-          }
-        }
-      default:
-        values[key] = String(data: (try? JSONSerialization.data(withJSONObject: element.value)) ?? Data(), encoding: .utf8) ?? ""
-      }
+      result[key] = element.value
     }
-    // A few Kimi-compatible tool-call payloads wrap the actual arguments in
-    // `arguments`, `input`, or `parameters`. Flatten the wrapper while
-    // preserving top-level fields. This prevents a valid search query from
-    // reaching the runtime as an empty input.
     for wrapper in ["arguments", "input", "parameters"] {
-      guard let nested = object[wrapper] as? [String: Any] else { continue }
+      guard case let .object(nested)? = values.removeValue(forKey: wrapper) else { continue }
       for (key, value) in nested {
-        let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        switch value {
-        case let string as String: values[normalizedKey] = string
-        case let number as NSNumber: values[normalizedKey] = number.stringValue
-        default:
-          values[normalizedKey] = String(data: (try? JSONSerialization.data(withJSONObject: value)) ?? Data(), encoding: .utf8) ?? ""
-        }
+        values[key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] = value
       }
     }
     if values["query"] == nil, let text = values["text_query"] { values["query"] = text }
     if values["url"] == nil, let target = values["target_url"] { values["url"] = target }
-    return values
+    return .object(values)
+  }
+
+  private nonisolated static func nativeToolInput(from argumentsJSON: String) -> [String: String] {
+    nativeToolInputJSON(from: argumentsJSON).compatibilityObject()
   }
 
   private nonisolated static func nativeToolResource(from argumentsJSON: String) -> String? {
@@ -4191,21 +4177,22 @@ final class DesktopAppModel: ObservableObject {
       return
     }
 
-    do {
-      if let override = ProcessInfo.processInfo.environment["KIMI_AGENT_OFFICIAL_TOOLS_MODEL"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-         !override.isEmpty {
-        runtimeEnvironment["KIMI_AGENT_OFFICIAL_TOOLS_MODEL"] = override
-      } else {
-        runtimeEnvironment.removeValue(forKey: "KIMI_AGENT_OFFICIAL_TOOLS_MODEL")
-      }
-      if let bridgeURL = try startWebResearchBridgeIfNeeded(nodePath: nodePath, environment: runtimeEnvironment) {
-        runtimeEnvironment["KIMI_WEB_SEARCH_BASE_URL"] = bridgeURL
-        runtimeEnvironment["KIMI_WEB_SEARCH_API_KEY"] = "kimi-agent-local-web-bridge"
-        appendEvent("Web Search 已启用：搜索结果会通过本地桥接服务返回，并可继续用 FetchURL 读取正文。", kind: .toolProgress, for: task.id)
-      }
-    } catch {
-      appendEvent("Web Search Bridge 未启动：\(error.localizedDescription)。本次任务仍可使用 Kimi Runtime 已提供的 FetchURL。", kind: .toolProgress, for: task.id)
+    // Compatibility ACP/CLI may provide model text only. It must never gain a
+    // second, Node-owned web execution path that bypasses Swift Harness
+    // permission, Intent/Receipt, source registration, or private-network
+    // blocking. Native Kimi API sessions use WebRuntime above instead.
+    for key in [
+      "KIMI_WEB_SEARCH_BASE_URL",
+      "KIMI_WEB_SEARCH_API_KEY",
+      "KIMI_AGENT_WEB_SEARCH_PROVIDER",
+      "KIMI_AGENT_WEB_SEARCH_API_KEY",
+      "KIMI_AGENT_WEB_SEARCH_ENDPOINT",
+      "KIMI_AGENT_OFFICIAL_TOOLS_BASE_URL",
+      "KIMI_AGENT_OFFICIAL_TOOLS_MODEL"
+    ] {
+      runtimeEnvironment.removeValue(forKey: key)
     }
+    appendEvent("兼容执行器已禁用 Node Web Bridge；联网工具仅由 Swift Harness 执行。", kind: .toolProgress, for: task.id)
 
     var workingDirectory = workspaceURL
     var baseCommit: String?
@@ -4696,7 +4683,6 @@ enum NativeRuntimeLocator {
       return (false, "已找到 Kimi Runtime，但没有找到 Node。请设置 KIMI_NODE_PATH。")
     }
     let host = agentHostURL() == nil ? "Native Agent Host：CLI 回退模式" : "Native Agent Host：已就绪"
-    let webBridge = webResearchBridgeURL() == nil ? "Web Search Bridge：未打包" : "Web Search Bridge：已就绪"
-    return (true, "Kimi Runtime 已就绪\n\(resource.path)\nNode：\(node)\n\(host)\n\(webBridge)")
+    return (true, "Kimi Runtime 已就绪\n\(resource.path)\nNode：\(node)\n\(host)\nWeb Search / Fetch：Swift 原生 Harness")
   }
 }

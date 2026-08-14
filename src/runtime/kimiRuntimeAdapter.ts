@@ -221,5 +221,6 @@ export function createKimiRuntimeSession(options: SessionOptions): KimiRuntimeSe
     ...(process.platform === 'darwin' ? buildMacComputerUseTools() : []),
     ...buildNetworkTools()
   ];
+
   return new KimiRuntimeSession(createSession({ ...options, externalTools }));
 }

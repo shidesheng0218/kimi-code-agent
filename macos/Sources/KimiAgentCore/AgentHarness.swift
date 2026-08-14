@@ -80,6 +80,16 @@ public enum HarnessQueueKind: String, Codable, CaseIterable, Sendable {
   case nextRun
 }
 
+public struct HarnessQueueRecord: Codable, Equatable, Sendable {
+  public let kind: HarnessQueueKind
+  public let input: PromptInput
+
+  public init(kind: HarnessQueueKind, input: PromptInput) {
+    self.kind = kind
+    self.input = input
+  }
+}
+
 public enum HarnessEffectKind: String, Codable, CaseIterable, Sendable {
   case provider
   case tool
@@ -275,10 +285,153 @@ public struct HarnessSessionEntry: Codable, Equatable, Identifiable, Sendable {
   }
 }
 
+/// Durable conversation facts are separate from the user-facing session tree.
+/// We keep raw stream blocks for replay/diagnosis while the canonical
+/// assistant message remains the only source for later model context.
+public enum HarnessTurnStatus: String, Codable, Equatable, Sendable {
+  case running
+  case completed
+  case failed
+  case cancelled
+}
+
+public enum HarnessStepStatus: String, Codable, Equatable, Sendable {
+  case running
+  case toolCalls
+  case completed
+  case failed
+  case cancelled
+}
+
+public struct HarnessTurnRecord: Codable, Equatable, Sendable {
+  public let turnID: UUID
+  public let modelID: String
+  public let status: HarnessTurnStatus
+
+  public init(turnID: UUID, modelID: String, status: HarnessTurnStatus = .running) {
+    self.turnID = turnID
+    self.modelID = modelID
+    self.status = status
+  }
+}
+
+public struct HarnessStepRecord: Codable, Equatable, Sendable {
+  public let turnID: UUID
+  public let step: Int
+  public let status: HarnessStepStatus
+
+  public init(turnID: UUID, step: Int, status: HarnessStepStatus = .running) {
+    self.turnID = turnID
+    self.step = max(1, step)
+    self.status = status
+  }
+}
+
+public struct HarnessModelRequestHeader: Codable, Equatable, Sendable {
+  public let turnID: UUID
+  public let step: Int
+  public let modelID: String
+  public let toolIDs: [String]
+  public let maximumOutputTokens: Int
+
+  public init(turnID: UUID, step: Int, modelID: String, toolIDs: [String], maximumOutputTokens: Int) {
+    self.turnID = turnID
+    self.step = max(1, step)
+    self.modelID = modelID
+    self.toolIDs = toolIDs
+    self.maximumOutputTokens = max(0, maximumOutputTokens)
+  }
+}
+
+public enum ModelStreamBlockKind: String, Codable, Equatable, Sendable {
+  case text
+  case reasoning
+  case toolCall
+  case usage
+  case finish
+  case done
+}
+
+public struct ModelStreamBlock: Codable, Equatable, Sendable {
+  public let step: Int
+  public let kind: ModelStreamBlockKind
+  public let text: String?
+  public let toolCallID: String?
+  public let toolName: String?
+  public let argumentsDelta: String?
+  public let usage: HarnessModelUsage?
+  public let finish: HarnessConversationFinishReason?
+
+  public init(
+    step: Int,
+    kind: ModelStreamBlockKind,
+    text: String? = nil,
+    toolCallID: String? = nil,
+    toolName: String? = nil,
+    argumentsDelta: String? = nil,
+    usage: HarnessModelUsage? = nil,
+    finish: HarnessConversationFinishReason? = nil
+  ) {
+    self.step = max(1, step)
+    self.kind = kind
+    self.text = text
+    self.toolCallID = toolCallID
+    self.toolName = toolName
+    self.argumentsDelta = argumentsDelta
+    self.usage = usage
+    self.finish = finish
+  }
+}
+
+public struct HarnessAssistantMessageRecord: Codable, Equatable, Sendable {
+  public let turnID: UUID
+  public let step: Int
+  public let message: HarnessChatMessage
+
+  public init(turnID: UUID, step: Int, message: HarnessChatMessage) {
+    self.turnID = turnID
+    self.step = max(1, step)
+    self.message = message
+  }
+}
+
+public struct HarnessToolCallRecord: Codable, Equatable, Sendable {
+  public let turnID: UUID
+  public let step: Int
+  public let call: HarnessToolCall
+
+  public init(turnID: UUID, step: Int, call: HarnessToolCall) {
+    self.turnID = turnID
+    self.step = max(1, step)
+    self.call = call
+  }
+}
+
+public struct HarnessToolResultRecord: Codable, Equatable, Sendable {
+  public let turnID: UUID
+  public let step: Int
+  public let result: HarnessToolResult
+
+  public init(turnID: UUID, step: Int, result: HarnessToolResult) {
+    self.turnID = turnID
+    self.step = max(1, step)
+    self.result = result
+  }
+}
+
 public enum HarnessEventKind: String, Codable, CaseIterable, Sendable {
   case operationAccepted
   case operationStateChanged
   case queueEnqueued
+  case turnStarted
+  case stepStarted
+  case requestHeader
+  case modelChunk
+  case assistantMessage
+  case toolCallDeclared
+  case toolResultRecorded
+  case stepEnded
+  case turnEnded
   case effectIntentWritten
   case permissionSettled
   case effectStarted
@@ -408,16 +561,35 @@ public struct HarnessOperationContext: Sendable {
   public let operationID: OperationID
   public let lane: LaneID
   public let prompt: PromptInput
+  /// Delivers steering collected while this operation is running. A driver
+  /// drains it at a model-step boundary; it never mutates lane state directly.
+  public let takeSteering: @Sendable () async -> [PromptInput]
 
-  public init(sessionID: UUID, operationID: OperationID, lane: LaneID, prompt: PromptInput) {
+  public init(
+    sessionID: UUID,
+    operationID: OperationID,
+    lane: LaneID,
+    prompt: PromptInput,
+    takeSteering: @escaping @Sendable () async -> [PromptInput] = { [] }
+  ) {
     self.sessionID = sessionID
     self.operationID = operationID
     self.lane = lane
     self.prompt = prompt
+    self.takeSteering = takeSteering
   }
 }
 
 public enum HarnessDriverEvent: Sendable {
+  case turnStarted(HarnessTurnRecord)
+  case stepStarted(HarnessStepRecord)
+  case requestHeader(HarnessModelRequestHeader)
+  case modelChunk(ModelStreamBlock)
+  case assistantMessage(HarnessAssistantMessageRecord)
+  case toolCallDeclared(HarnessToolCallRecord)
+  case toolResultRecorded(HarnessToolResultRecord)
+  case stepEnded(HarnessStepRecord)
+  case turnEnded(HarnessTurnRecord)
   case effectIntentWritten(HarnessEffectIntent)
   case permissionSettled(HarnessPermissionReceipt)
   case effectStarted(HarnessEffectIntent)
@@ -526,14 +698,27 @@ public actor AgentHarness {
       throw HarnessError.laneBusy(lane, active)
     }
 
-    let entry = HarnessSessionEntry(parentID: laneState.leafEntryID, lane: lane, kind: .user, text: input.text)
+    let queuedNextRun = laneState.queuedNextRuns
+    laneState.queuedNextRuns.removeAll()
+    let effectiveInput: PromptInput
+    if queuedNextRun.isEmpty {
+      effectiveInput = input
+    } else {
+      let injected = queuedNextRun.map(\.text).joined(separator: "\n")
+      effectiveInput = PromptInput(
+        text: "\(input.text)\n\n下次执行补充：\n\(injected)",
+        attachments: input.attachments
+      )
+    }
+
+    let entry = HarnessSessionEntry(parentID: laneState.leafEntryID, lane: lane, kind: .user, text: effectiveInput.text)
     snapshotValue.entries.append(entry)
     laneState.leafEntryID = entry.id
     let operation = HarnessOperation(
       sessionID: snapshotValue.sessionID,
       lane: lane,
       kind: .prompt,
-      prompt: input,
+      prompt: effectiveInput,
       sourceEntryID: entry.id
     )
     laneState.activeOperation = operation.id
@@ -563,11 +748,13 @@ public actor AgentHarness {
     operation.updatedAt = .now
     snapshotValue.operations[operationID] = operation
     try? await publish(.operationStateChanged, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(operation))
-    runningTasks[operationID]?.cancel()
     operation.state = .aborted
     operation.updatedAt = .now
     snapshotValue.operations[operationID] = operation
-    releaseLane(operation)
+    runningTasks[operationID]?.cancel()
+    // The lane stays reserved until the driver task actually stops (run()
+    // releases it in its completion paths), so a new prompt on this lane can
+    // never race a still-executing tool effect from the aborted operation.
     try? await publish(.operationStateChanged, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(operation))
   }
 
@@ -659,7 +846,51 @@ public actor AgentHarness {
         guard let payload = event.payload,
               let receipt = try? JSONDecoder().decode(HarnessEffectReceipt.self, from: payload) else { continue }
         restored.receipts[receipt.effectID] = receipt
-      case .effectStarted, .queueEnqueued, .snapshotPublished:
+      case .turnStarted,
+           .stepStarted,
+           .requestHeader,
+           .modelChunk,
+           .assistantMessage,
+           .toolCallDeclared,
+           .toolResultRecorded,
+           .stepEnded,
+           .turnEnded,
+           .effectStarted,
+           .snapshotPublished:
+        continue
+      case .queueEnqueued:
+        var lane = restored.lanes[event.lane] ?? HarnessLaneState(id: event.lane)
+        if let payload = event.payload,
+           let record = try? JSONDecoder().decode(HarnessQueueRecord.self, from: payload) {
+          switch record.kind {
+          case .steer: lane.queuedSteering.append(record.input)
+          case .followUp: lane.queuedFollowUps.append(record.input)
+          case .nextRun: lane.queuedNextRuns.append(record.input)
+          }
+        } else if let payload = event.payload,
+                  let legacyInput = try? JSONDecoder().decode(PromptInput.self, from: payload) {
+          // Legacy queue records predate an explicit kind. Treating them as a
+          // next-run supplement is conservative: it never restarts an effect.
+          lane.queuedNextRuns.append(legacyInput)
+        }
+        restored.lanes[event.lane] = lane
+      }
+    }
+    var unresolvedCalls: [OperationID: [String: HarnessToolCallRecord]] = [:]
+    var recordedCalls: Set<String> = []
+    for event in events {
+      switch event.kind {
+      case .toolCallDeclared:
+        guard let payload = event.payload,
+              let call = try? JSONDecoder().decode(HarnessToolCallRecord.self, from: payload),
+              let operationID = event.operationID else { continue }
+        unresolvedCalls[operationID, default: [:]][call.call.id] = call
+      case .toolResultRecorded:
+        guard let payload = event.payload,
+              let result = try? JSONDecoder().decode(HarnessToolResultRecord.self, from: payload),
+              let operationID = event.operationID else { continue }
+        recordedCalls.insert("\(operationID.uuidString)|\(result.result.callID)")
+      default:
         continue
       }
     }
@@ -671,6 +902,25 @@ public actor AgentHarness {
       restored.lanes[operation.lane]?.activeOperation = operation.id
     }
     snapshotValue = restored
+    // A model must never wait forever for a tool result after a process loss.
+    // This synthetic *model* result is intentionally not an Effect receipt:
+    // it records uncertainty and requires explicit user resume rather than
+    // inventing that a side effect succeeded or replaying it automatically.
+    for (operationID, calls) in unresolvedCalls where restored.operations[operationID]?.state == .suspended {
+      for call in calls.values where !recordedCalls.contains("\(operationID.uuidString)|\(call.call.id)") {
+        let synthetic = HarnessToolResultRecord(
+          turnID: call.turnID,
+          step: call.step,
+          result: HarnessToolResult(
+            callID: call.call.id,
+            toolName: call.call.name,
+            output: "工具调用在应用退出或暂停时中断；没有可确认的执行回执。请在继续前重新确认。",
+            isError: true
+          )
+        )
+        try? await publish(.toolResultRecorded, operationID: operationID, lane: restored.operations[operationID]?.lane ?? .main, payload: try? JSONEncoder().encode(synthetic))
+      }
+    }
   }
 
   public func events() -> AsyncStream<HarnessEvent> {
@@ -707,7 +957,7 @@ public actor AgentHarness {
       laneState.queuedNextRuns.append(input)
     }
     snapshotValue.lanes[lane] = laneState
-    try await publish(.queueEnqueued, operationID: laneState.activeOperation, lane: lane, payload: try? JSONEncoder().encode(input))
+    try await publish(.queueEnqueued, operationID: laneState.activeOperation, lane: lane, payload: try? JSONEncoder().encode(HarnessQueueRecord(kind: kind, input: input)))
   }
 
   private func schedule(_ operation: HarnessOperation) {
@@ -720,24 +970,47 @@ public actor AgentHarness {
   private func run(_ operationID: OperationID, driver: @escaping OperationDriver) async {
     guard var operation = snapshotValue.operations[operationID],
           let prompt = operation.prompt else { return }
-    if operation.state == .aborted { return }
+    if operation.state == .aborted {
+      releaseLane(operation)
+      return
+    }
     operation.state = .running
     operation.updatedAt = .now
     snapshotValue.operations[operationID] = operation
     try? await publish(.operationStateChanged, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(operation))
-    let context = HarnessOperationContext(sessionID: snapshotValue.sessionID, operationID: operationID, lane: operation.lane, prompt: prompt)
+    let context = HarnessOperationContext(
+      sessionID: snapshotValue.sessionID,
+      operationID: operationID,
+      lane: operation.lane,
+      prompt: prompt,
+      takeSteering: { [weak self] in
+        guard let self else { return [] }
+        return await self.consumeSteering(operationID: operationID)
+      }
+    )
+    var shouldStartFollowUp = false
     do {
       try await driver(context) { [weak self] event in
         await self?.receive(event, operationID: operationID)
       }
-      guard var settled = snapshotValue.operations[operationID], settled.state != .aborted else { return }
+      guard var settled = snapshotValue.operations[operationID], settled.state != .aborted else {
+        if let aborted = snapshotValue.operations[operationID], aborted.state == .aborted {
+          releaseLane(aborted)
+        }
+        return
+      }
       settled.state = .completed
       settled.updatedAt = .now
       snapshotValue.operations[operationID] = settled
       releaseLane(settled)
       try? await publish(.operationStateChanged, operationID: operationID, lane: settled.lane, payload: try? JSONEncoder().encode(settled))
+      shouldStartFollowUp = true
     } catch is CancellationError {
-      // abort() already persisted the terminal state before cancelling the task.
+      // abort() already persisted the terminal state; release the lane now
+      // that the driver has truly stopped.
+      if let aborted = snapshotValue.operations[operationID], aborted.state == .aborted {
+        releaseLane(aborted)
+      }
     } catch {
       guard var failed = snapshotValue.operations[operationID], failed.state != .aborted else { return }
       failed.state = .failed
@@ -746,13 +1019,53 @@ public actor AgentHarness {
       snapshotValue.operations[operationID] = failed
       releaseLane(failed)
       try? await publish(.operationStateChanged, operationID: operationID, lane: failed.lane, payload: try? JSONEncoder().encode(failed))
+      shouldStartFollowUp = true
     }
     runningTasks.removeValue(forKey: operationID)
+    if shouldStartFollowUp {
+      await startQueuedFollowUpIfNeeded(lane: operation.lane)
+    }
+  }
+
+  private func consumeSteering(operationID: OperationID) -> [PromptInput] {
+    guard let operation = snapshotValue.operations[operationID],
+          var lane = snapshotValue.lanes[operation.lane],
+          lane.activeOperation == operationID else { return [] }
+    let values = lane.queuedSteering
+    lane.queuedSteering.removeAll()
+    snapshotValue.lanes[operation.lane] = lane
+    return values
+  }
+
+  private func startQueuedFollowUpIfNeeded(lane: LaneID) async {
+    guard var state = snapshotValue.lanes[lane], state.activeOperation == nil,
+          !state.queuedFollowUps.isEmpty else { return }
+    let input = state.queuedFollowUps.removeFirst()
+    snapshotValue.lanes[lane] = state
+    _ = try? await prompt(input, lane: lane)
   }
 
   private func receive(_ event: HarnessDriverEvent, operationID: OperationID) async {
     guard let operation = snapshotValue.operations[operationID], operation.state != .aborted else { return }
     switch event {
+    case let .turnStarted(record):
+      try? await publish(.turnStarted, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(record))
+    case let .stepStarted(record):
+      try? await publish(.stepStarted, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(record))
+    case let .requestHeader(header):
+      try? await publish(.requestHeader, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(header))
+    case let .modelChunk(block):
+      try? await publish(.modelChunk, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(block))
+    case let .assistantMessage(message):
+      try? await publish(.assistantMessage, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(message))
+    case let .toolCallDeclared(call):
+      try? await publish(.toolCallDeclared, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(call))
+    case let .toolResultRecorded(result):
+      try? await publish(.toolResultRecorded, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(result))
+    case let .stepEnded(record):
+      try? await publish(.stepEnded, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(record))
+    case let .turnEnded(record):
+      try? await publish(.turnEnded, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(record))
     case let .effectIntentWritten(intent):
       guard intent.operationID == operationID else { return }
       snapshotValue.intents[intent.effectID] = intent

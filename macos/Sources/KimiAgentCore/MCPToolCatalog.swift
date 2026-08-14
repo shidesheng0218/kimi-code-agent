@@ -32,6 +32,11 @@ public final class MCPToolCatalog: @unchecked Sendable {
   public func register(serverID: String, status: MCPWorkerState, tools discovered: [MCPTool]) {
     lock.lock()
     statuses[serverID] = status
+    // Re-registration replaces the server's tool set: tools that the server
+    // no longer advertises must not stay discoverable or callable.
+    for (key, item) in tools where item.serverID == serverID {
+      tools.removeValue(forKey: key)
+    }
     for tool in discovered {
       tools["\(serverID):\(tool.name)"] = MCPDiscoveredTool(serverID: serverID, tool: tool)
     }

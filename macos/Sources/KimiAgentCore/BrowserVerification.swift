@@ -70,7 +70,10 @@ public struct BrowserVerificationPlan: Codable, Equatable, Identifiable, Sendabl
 
   public func requiresApproval(for url: URL) -> Bool {
     guard let host = url.host(percentEncoded: false)?.lowercased() else {
-      return url.scheme != "file"
+      // File URLs carry no host and can render local documents (bank
+      // statements, notes, downloaded pages) whose content the model could
+      // read back through inspect/screenshot; never auto-approve them.
+      return true
     }
     if BrowserDomainPolicy.isLocal(host: host) {
       return false

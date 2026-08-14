@@ -11,12 +11,22 @@ public final class MCPHttpClient: @unchecked Sendable {
   public init(
     endpoint: URL,
     allowedDomains: [String] = [],
-    session: URLSession = .shared,
+    session: URLSession? = nil,
     timeoutSeconds: TimeInterval = 15
   ) throws {
     try Self.validate(endpoint: endpoint, allowedDomains: allowedDomains)
     self.endpoint = endpoint
-    self.session = session
+    if let session {
+      self.session = session
+    } else {
+      let configuration = URLSessionConfiguration.ephemeral
+      configuration.timeoutIntervalForRequest = timeoutSeconds
+      self.session = URLSession(
+        configuration: configuration,
+        delegate: RedirectValidator(allowedDomains: allowedDomains),
+        delegateQueue: nil
+      )
+    }
     self.timeoutSeconds = timeoutSeconds
   }
 
@@ -137,11 +147,11 @@ public final class MCPHttpClient: @unchecked Sendable {
     throw MCPClientError.endpointNotAllowed(host)
   }
 
-  private static func isLocalhost(_ host: String) -> Bool {
-    host == "localhost" || host == "127.0.0.1" || host == "::1"
+  static func isLocalhost(_ host: String) -> Bool {
+    host == "localhost" || host == "::1" || host.hasPrefix("127.") || host.hasSuffix(".localhost")
   }
 
-  private static func matches(host: String, domain: String) -> Bool {
+  static func matches(host: String, domain: String) -> Bool {
     if domain.hasPrefix("*.") {
       let suffix = String(domain.dropFirst())
       return host == String(domain.dropFirst(2)) || host.hasSuffix(suffix)
@@ -162,4 +172,33 @@ private final class ResponseCapture: @unchecked Sendable {
   var data: Data?
   var error: Error?
   var statusCode: Int?
+}
+
+/// Re-validates every redirect destination against the same endpoint
+/// allowlist used at construction, so a configured remote server cannot
+/// bounce the client to loopback or other internal addresses.
+private final class RedirectValidator: NSObject, URLSessionTaskDelegate {
+  private let allowedDomains: [String]
+
+  init(allowedDomains: [String]) {
+    self.allowedDomains = allowedDomains
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    if let url = request.url,
+       let host = url.host?.lowercased(),
+       !host.isEmpty,
+       MCPHttpClient.isLocalhost(host)
+        || allowedDomains.contains(where: { MCPHttpClient.matches(host: host, domain: $0) }) {
+      completionHandler(request)
+      return
+    }
+    completionHandler(nil)
+  }
 }

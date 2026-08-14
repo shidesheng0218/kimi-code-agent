@@ -21,4 +21,12 @@ describe('native macOS package signing', () => {
 
     expect(module.releaseVersion({ KIMI_VERSION: 'v1.4.0' })).toBe('1.4.0');
   });
+
+  it('does not ship the deprecated Node web bridge in the default native runtime', async () => {
+    const module = await import('../../scripts/package-native-macos.mjs') as unknown as {
+      nativeRuntimeResourceNames: () => string[];
+    };
+
+    expect(module.nativeRuntimeResourceNames()).not.toContain('web-research-bridge.cjs');
+  });
 });

@@ -86,9 +86,6 @@ public enum ToolCatalog {
     ToolDefinition(id: "shell", title: "运行命令", description: "执行受策略约束的 Shell 命令。", permissionScopes: [.executeCommand], risk: .high, inputSchemaJSON: #"{"type":"object","properties":{"command":{"type":"string"},"cwd":{"type":"string"}},"required":["command"],"additionalProperties":false}"#),
     ToolDefinition(id: "web.search", title: "Web Search", description: "搜索已授权网络来源。", permissionScopes: [.network], supportsBackground: true, inputSchemaJSON: #"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"#),
     ToolDefinition(id: "web.fetch", title: "Web Fetch", description: "抓取已授权网页正文。", permissionScopes: [.network], inputSchemaJSON: #"{"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":false}"#),
-    ToolDefinition(id: "WebSearch", title: "Kimi WebSearch", description: "调用 Kimi Runtime 原生搜索工具。", permissionScopes: [.network]),
-    ToolDefinition(id: "FetchURL", title: "Kimi FetchURL", description: "调用 Kimi Runtime 原生抓取工具。", permissionScopes: [.network]),
-    ToolDefinition(id: "network.fetch", title: "Network Fetch", description: "通过受控网络网关抓取内容。", permissionScopes: [.network]),
     ToolDefinition(id: "browser", title: "浏览器验证", description: "打开并验证本地网页，支持计划、定位、点击、输入和截图。", permissionScopes: [.browser], risk: .medium, executionMode: .sessionSerial, supportsBackground: true, inputSchemaJSON: #"{"type":"object","properties":{"plan":{"type":"string"},"action":{"type":"string","enum":["open","navigate","inspect","click","typeText","pressKey","scroll","screenshot","collectConsole","collectNetwork"]},"url":{"type":"string"},"selector":{"type":"string"},"text":{"type":"string"},"key":{"type":"string"}},"additionalProperties":true}"#),
     ToolDefinition(id: "computer_use.inspect", title: "Computer Use Inspect", description: "读取当前屏幕和窗口状态。", permissionScopes: [.systemComputerUse], risk: .medium),
     ToolDefinition(id: "computer_use.screenshot", title: "Computer Use Screenshot", description: "保存当前屏幕截图作为可审阅产物。", permissionScopes: [.systemComputerUse], risk: .medium),
@@ -149,6 +146,116 @@ public actor ToolRegistry {
   }
 }
 
+/// JSON-native tool input.  The legacy string dictionary remains available as
+/// a projection on `ToolExecutionRequest`, but it must no longer be the
+/// transport format because model tools legitimately carry nested objects and
+/// arrays.
+public enum HarnessJSONValue: Codable, Equatable, Sendable {
+  case null
+  case bool(Bool)
+  case number(Double)
+  case string(String)
+  case array([HarnessJSONValue])
+  case object([String: HarnessJSONValue])
+
+  private struct DynamicKey: CodingKey {
+    let stringValue: String
+    let intValue: Int?
+
+    init?(stringValue: String) { self.stringValue = stringValue; self.intValue = nil }
+    init?(intValue: Int) { self.stringValue = String(intValue); self.intValue = intValue }
+  }
+
+  public init(from decoder: Decoder) throws {
+    let single = try decoder.singleValueContainer()
+    if single.decodeNil() { self = .null; return }
+    if let value = try? single.decode(Bool.self) { self = .bool(value); return }
+    if let value = try? single.decode(Double.self) { self = .number(value); return }
+    if let value = try? single.decode(String.self) { self = .string(value); return }
+
+    if var array = try? decoder.unkeyedContainer() {
+      var values: [HarnessJSONValue] = []
+      while !array.isAtEnd { values.append(try array.decode(HarnessJSONValue.self)) }
+      self = .array(values)
+      return
+    }
+
+    let object = try decoder.container(keyedBy: DynamicKey.self)
+    var values: [String: HarnessJSONValue] = [:]
+    for key in object.allKeys { values[key.stringValue] = try object.decode(HarnessJSONValue.self, forKey: key) }
+    self = .object(values)
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    switch self {
+    case .null:
+      var container = encoder.singleValueContainer()
+      try container.encodeNil()
+    case let .bool(value):
+      var container = encoder.singleValueContainer()
+      try container.encode(value)
+    case let .number(value):
+      var container = encoder.singleValueContainer()
+      try container.encode(value)
+    case let .string(value):
+      var container = encoder.singleValueContainer()
+      try container.encode(value)
+    case let .array(values):
+      var container = encoder.unkeyedContainer()
+      for value in values { try container.encode(value) }
+    case let .object(values):
+      var container = encoder.container(keyedBy: DynamicKey.self)
+      for (key, value) in values {
+        guard let codingKey = DynamicKey(stringValue: key) else { continue }
+        try container.encode(value, forKey: codingKey)
+      }
+    }
+  }
+
+  public var objectValue: [String: HarnessJSONValue]? {
+    guard case let .object(value) = self else { return nil }
+    return value
+  }
+
+  public var arrayValue: [HarnessJSONValue]? {
+    guard case let .array(value) = self else { return nil }
+    return value
+  }
+
+  public var stringValue: String? {
+    guard case let .string(value) = self else { return nil }
+    return value
+  }
+
+  public var integerValue: Int? {
+    guard case let .number(value) = self, value.rounded() == value else { return nil }
+    return Int(exactly: value)
+  }
+
+  public func compatibilityString() -> String? {
+    switch self {
+    case let .string(value): return value
+    case let .bool(value): return value ? "true" : "false"
+    case let .number(value): return value.rounded() == value ? String(Int(value)) : String(value)
+    case .null: return nil
+    case .array, .object:
+      guard let data = try? JSONEncoder().encode(self) else { return nil }
+      return String(data: data, encoding: .utf8)
+    }
+  }
+
+  public static func stringObject(_ values: [String: String]) -> HarnessJSONValue {
+    .object(values.mapValues(HarnessJSONValue.string))
+  }
+
+  public func compatibilityObject() -> [String: String] {
+    guard case let .object(values) = self else { return [:] }
+    return values.reduce(into: [:]) { result, pair in
+      if let value = pair.value.compatibilityString() { result[pair.key] = value }
+    }
+  }
+}
+
 public struct ToolExecutionRequest: Codable, Equatable, Identifiable, Sendable {
   public let id: UUID
   public let taskID: UUID
@@ -156,9 +263,16 @@ public struct ToolExecutionRequest: Codable, Equatable, Identifiable, Sendable {
   public let operationID: UUID?
   public let agentID: String
   public let toolID: String
-  public let input: [String: String]
+  public let inputJSON: HarnessJSONValue
+  /// Compatibility projection for existing executors. New runtimes must read
+  /// `inputJSON` so nested parameters are not lost.
+  public var input: [String: String] { inputJSON.compatibilityObject() }
   public let resource: String?
   public let command: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case id, taskID, sessionID, operationID, agentID, toolID, input, inputJSON, resource, command
+  }
 
   public init(
     id: UUID = UUID(),
@@ -168,6 +282,7 @@ public struct ToolExecutionRequest: Codable, Equatable, Identifiable, Sendable {
     agentID: String,
     toolID: String,
     input: [String: String] = [:],
+    inputJSON: HarnessJSONValue? = nil,
     resource: String? = nil,
     command: String? = nil
   ) {
@@ -177,9 +292,39 @@ public struct ToolExecutionRequest: Codable, Equatable, Identifiable, Sendable {
     self.operationID = operationID
     self.agentID = agentID
     self.toolID = toolID
-    self.input = input
+    self.inputJSON = inputJSON ?? HarnessJSONValue.stringObject(input)
     self.resource = resource
     self.command = command
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    id = try container.decode(UUID.self, forKey: .id)
+    taskID = try container.decode(UUID.self, forKey: .taskID)
+    sessionID = try container.decode(UUID.self, forKey: .sessionID)
+    operationID = try container.decodeIfPresent(UUID.self, forKey: .operationID)
+    agentID = try container.decode(String.self, forKey: .agentID)
+    toolID = try container.decode(String.self, forKey: .toolID)
+    let legacyInput = try container.decodeIfPresent([String: String].self, forKey: .input) ?? [:]
+    inputJSON = try container.decodeIfPresent(HarnessJSONValue.self, forKey: .inputJSON) ?? HarnessJSONValue.stringObject(legacyInput)
+    resource = try container.decodeIfPresent(String.self, forKey: .resource)
+    command = try container.decodeIfPresent(String.self, forKey: .command)
+  }
+
+  public func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(id, forKey: .id)
+    try container.encode(taskID, forKey: .taskID)
+    try container.encode(sessionID, forKey: .sessionID)
+    try container.encodeIfPresent(operationID, forKey: .operationID)
+    try container.encode(agentID, forKey: .agentID)
+    try container.encode(toolID, forKey: .toolID)
+    // Keep the projection while old durable records and compatibility workers
+    // are still readable; authoritative new input is `inputJSON`.
+    try container.encode(input, forKey: .input)
+    try container.encode(inputJSON, forKey: .inputJSON)
+    try container.encodeIfPresent(resource, forKey: .resource)
+    try container.encodeIfPresent(command, forKey: .command)
   }
 }
 
@@ -471,7 +616,18 @@ public struct ChildAgentToolPermissionResolver: ToolPermissionResolver, Sendable
         if tool.id == "browser" {
           let action = (request.input["action"] ?? "inspect").lowercased()
           let safeActions: Set<String> = ["open", "navigate", "inspect", "screenshot", "collectconsole", "collectnetwork"]
-          return safeActions.contains(action) ? .allow : fallbackDecision
+          guard safeActions.contains(action) else { return fallbackDecision }
+          // Navigation to loopback/private targets must not auto-approve,
+          // even though the adapter policy also filters the final URL.
+          if action == "open" || action == "navigate" {
+            if let rawURL = request.input["url"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let url = URL(string: rawURL),
+               let host = url.host?.lowercased(),
+               WebToolApprovalPolicy.isPrivateTargetHost(host) {
+              return fallbackDecision
+            }
+          }
+          return .allow
         }
       }
       return fallbackDecision
@@ -491,7 +647,12 @@ public struct ChildAgentToolPermissionResolver: ToolPermissionResolver, Sendable
               guard let scheme = URL(string: raw)?.scheme?.lowercased() else { return false }
               return scheme == "http" || scheme == "https"
             }
-          return rawURL == nil ? fallbackDecision : .allow
+          guard let rawURL, let url = URL(string: rawURL), let host = url.host?.lowercased() else {
+            return fallbackDecision
+          }
+          // Auto-approval is read-only web research; loopback/private hosts
+          // (dev servers, router admin, cloud metadata) stay on the prompt path.
+          return WebToolApprovalPolicy.isPrivateTargetHost(host) ? fallbackDecision : .allow
         }
       }
       // Browser/Computer Use read operations are safe even when the agent may
@@ -503,7 +664,16 @@ public struct ChildAgentToolPermissionResolver: ToolPermissionResolver, Sendable
         if tool.id == "browser" {
           let action = (request.input["action"] ?? "inspect").lowercased()
           let safeActions: Set<String> = ["open", "navigate", "inspect", "screenshot", "collectconsole", "collectnetwork"]
-          return safeActions.contains(action) ? .allow : fallbackDecision
+          guard safeActions.contains(action) else { return fallbackDecision }
+          if action == "open" || action == "navigate" {
+            if let rawURL = request.input["url"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let url = URL(string: rawURL),
+               let host = url.host?.lowercased(),
+               WebToolApprovalPolicy.isPrivateTargetHost(host) {
+              return fallbackDecision
+            }
+          }
+          return .allow
         }
       }
       return fallbackDecision
@@ -660,33 +830,49 @@ public actor ToolExecutionCoordinator {
     }
   }
 
-  /// Executes a model tool batch while preserving source order. Purely
-  /// parallel tools may overlap; any serial tool makes the batch conservative
-  /// and sequential so writes, terminals, and browser actions cannot race.
+  /// Executes a model tool batch while preserving source order. Parallel calls
+  /// overlap until an exclusive/session/worktree call forms a barrier; calls
+  /// after that barrier cannot race ahead of it, but unrelated read-only calls
+  /// do not lose concurrency merely because another call in the batch writes.
   public func executeBatch(_ requests: [ToolExecutionRequest]) async -> [Result<ToolExecutionResult, Error>] {
     guard !requests.isEmpty else { return [] }
-    let canParallel = await requests.asyncAllSatisfy { request in
-      guard let definition = await self.registry.definition(id: request.toolID) else { return false }
-      return definition.executionMode == .parallel
-    }
-    if !canParallel {
-      var results: [Result<ToolExecutionResult, Error>] = []
-      for request in requests {
-        do { results.append(.success(try await execute(request))) }
-        catch { results.append(.failure(error)) }
+    var collected = Array(repeating: Result<ToolExecutionResult, Error>.failure(ToolExecutionError.denied("未执行")), count: requests.count)
+    var pending: [Task<(Int, Result<ToolExecutionResult, Error>), Never>] = []
+
+    // This helper deliberately owns neither `pending` nor `collected`.  An
+    // async local function that captures those mutable actor-isolated values
+    // is rejected by Swift 6's strict sending checks and, more importantly,
+    // obscures which task owns each mutation.
+    func settle(_ running: [Task<(Int, Result<ToolExecutionResult, Error>), Never>]) async -> [(Int, Result<ToolExecutionResult, Error>)] {
+      var settled: [(Int, Result<ToolExecutionResult, Error>)] = []
+      settled.reserveCapacity(running.count)
+      for task in running {
+        settled.append(await task.value)
       }
-      return results
+      return settled
     }
-    return await withTaskGroup(of: (Int, Result<ToolExecutionResult, Error>).self, returning: [Result<ToolExecutionResult, Error>].self) { group in
-      for (index, request) in requests.enumerated() {
-        group.addTask {
+
+    for (index, request) in requests.enumerated() {
+      let mode = await registry.definition(id: request.toolID)?.executionMode ?? .sessionSerial
+      if mode == .parallel {
+        pending.append(Task {
           do { return (index, .success(try await self.execute(request))) }
           catch { return (index, .failure(error)) }
-        }
+        })
+        continue
       }
-      var collected = Array(repeating: Result<ToolExecutionResult, Error>.failure(ToolExecutionError.denied("未执行")), count: requests.count)
-      for await (index, result) in group { collected[index] = result }
-      return collected
+      let settled = await settle(pending)
+      pending.removeAll()
+      for (settledIndex, result) in settled {
+        collected[settledIndex] = result
+      }
+      do { collected[index] = .success(try await execute(request)) }
+      catch { collected[index] = .failure(error) }
     }
+    let settled = await settle(pending)
+    for (settledIndex, result) in settled {
+      collected[settledIndex] = result
+    }
+    return collected
   }
 }
