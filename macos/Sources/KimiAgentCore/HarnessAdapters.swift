@@ -374,10 +374,11 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
 
   /// Kimi/OpenAI-compatible providers normally stream function arguments as a
   /// JSON string, but some responses return an already-decoded JSON object.
-  /// Preserve both forms so a valid `{ "url": "…" }` never becomes `{}`.
+  /// A name/index-only delta has no argument content and must remain empty:
+  /// inserting `{}` would corrupt the JSON fragments that follow it.
   public static func normalizedToolArguments(_ value: Any?) -> String {
     if let string = value as? String {
-      return string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "{}" : string
+      return string
     }
     if let dictionary = value as? [String: String],
        let data = try? JSONSerialization.data(withJSONObject: dictionary, options: [.sortedKeys]),
@@ -392,7 +393,7 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
     if let data = value as? Data, let string = String(data: data, encoding: .utf8) {
       return string
     }
-    return "{}"
+    return ""
   }
 
   private static func encodeMessage(_ message: HarnessChatMessage) -> [String: Any] {

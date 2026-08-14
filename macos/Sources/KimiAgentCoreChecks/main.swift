@@ -1409,6 +1409,41 @@ expect(fragmentedToolCalls.count == 1, "流式 Tool Call 的后续参数分片�
 expect(fragmentedToolCalls.first?.name == "web.fetch", "流式 Tool Call 必须保留映射后的 Runtime 工具名")
 expect(fragmentedToolCalls.first?.argumentsJSON == #"{"url":"https://www.apple.com/"}"#, "流式 Tool Call 必须保留完整 url 参数")
 
+MockURLProtocol.requestHandler = { request in
+  let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "text/event-stream"])!
+  let stream = """
+  data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"sparse-1","function":{"name":"shell"}}]}}]}
+
+  data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"command\\":\\"ls"}}]}}]}
+
+  data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{}}]}}]}
+
+  data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":" -la\\"}"}}]}}]}
+
+  data: [DONE]
+
+  """
+  return (response, Data(stream.utf8))
+}
+let sparseToolProvider = KimiHTTPModelProvider(
+  baseURL: URL(string: "https://api.moonshot.cn/v1")!,
+  apiKey: "sk-test-sparse-tool-delta",
+  modelID: "kimi-k2.7-code",
+  session: mockModelsSession
+)
+let sparseToolCalls = try awaitValue { () async throws -> [HarnessToolCall] in
+  let stream = try await sparseToolProvider.stream(
+    request: HarnessConversationRequest(modelID: "kimi-k2.7-code", messages: [.user("列出文件")]),
+    tools: ToolCatalog.defaultDefinitions,
+    signal: nil
+  )
+  var assembler = HarnessModelStreamAssembler()
+  for try await event in stream { assembler.push(event) }
+  return assembler.toolCalls
+}
+expect(sparseToolCalls.first?.argumentsJSON == #"{"command":"ls -la"}"#, "没有 arguments 的流式占位帧不得污染后续 Tool JSON")
+MockURLProtocol.requestHandler = nil
+
 let wiredWebSearchName = HarnessToolNameCodec.wireName(for: "web.search")
 let wiredGitHubName = HarnessToolNameCodec.wireName(for: "github.pull_request.create")
 let wiredMCPName = HarnessToolNameCodec.wireName(for: "mcp.123e4567-e89b-12d3-a456-426614174000.search_docs")
