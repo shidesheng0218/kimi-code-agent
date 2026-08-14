@@ -68,6 +68,30 @@ final class ThreadSafePromptQueue: @unchecked Sendable {
   }
 }
 
+actor OneShotAsyncGate {
+  private var isOpen = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  func wait() async {
+    guard !isOpen else { return }
+    await withCheckedContinuation { continuation in
+      if isOpen {
+        continuation.resume()
+      } else {
+        waiters.append(continuation)
+      }
+    }
+  }
+
+  func open() {
+    guard !isOpen else { return }
+    isOpen = true
+    let pending = waiters
+    waiters.removeAll()
+    pending.forEach { $0.resume() }
+  }
+}
+
 func awaitValue<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) throws -> T {
   let semaphore = DispatchSemaphore(value: 0)
   let box = ResultBox<T>()
@@ -3440,14 +3464,18 @@ expect(transcriptEvents.contains { $0.kind == .toolResultRecorded }, "Harness �
 expect(transcriptEvents.contains { $0.kind == .turnEnded }, "Harness 必须持久化 turnEnded")
 
 let steeringTrace = ThreadSafeStringTrace()
+let steeringDriverReady = OneShotAsyncGate()
+let steeringMayRead = OneShotAsyncGate()
 let steeringHarness = AgentHarness { context, _ in
-  try await Task.sleep(nanoseconds: 80_000_000)
+  await steeringDriverReady.open()
+  await steeringMayRead.wait()
   let steering = await context.takeSteering()
   steeringTrace.append(steering.map(\.text).joined(separator: "|"))
 }
 let steeringOperation = try awaitValue { try await steeringHarness.prompt(PromptInput(text: "先开始")) }
-try? await Task.sleep(nanoseconds: 20_000_000)
+_ = try awaitValue { await steeringDriverReady.wait(); return true }
 _ = try awaitValue { try await steeringHarness.steer(PromptInput(text: "改为只读"), lane: .main); return true }
+_ = try awaitValue { await steeringMayRead.open(); return true }
 _ = try awaitValue { try await steeringHarness.wait(for: steeringOperation, timeout: 1); return true }
 expect(steeringTrace.snapshot == ["改为只读"], "next-step steering 必须在当前 Operation 的下一模型步骤读取")
 
