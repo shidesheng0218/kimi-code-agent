@@ -182,21 +182,21 @@ final class BrowserVerificationController: NSObject, WKNavigationDelegate, WKScr
   }
 
   private func captureScreenshot(name: String, directory: URL) async throws -> BrowserArtifact {
-    let image: NSImage = try await withCheckedThrowingContinuation(isolation: MainActor.shared) { (continuation: CheckedContinuation<NSImage, Error>) in
+    // WKWebView's completion handler is concurrency-checked by Swift 6.
+    // Convert the main-actor AppKit object before resuming so an NSImage never
+    // crosses the continuation's sending boundary.
+    let data: Data = try await withCheckedThrowingContinuation(isolation: MainActor.shared) { (continuation: CheckedContinuation<Data, Error>) in
       webView.takeSnapshot(with: nil) { image, error in
         if let error {
           continuation.resume(throwing: error)
-        } else if let image {
-          continuation.resume(returning: image)
+        } else if let data = image?.pngData {
+          continuation.resume(returning: data)
         } else {
           continuation.resume(throwing: BrowserVerificationError.screenshotFailed)
         }
       }
     }
     let path = directory.appendingPathComponent("\(name)-\(UUID().uuidString.prefix(8)).png")
-    guard let data = image.pngData else {
-      throw BrowserVerificationError.screenshotFailed
-    }
     try data.write(to: path, options: Data.WritingOptions.atomic)
     return BrowserArtifact(kind: .screenshot, name: name, path: path.path)
   }
