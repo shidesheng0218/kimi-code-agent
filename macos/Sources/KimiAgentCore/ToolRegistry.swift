@@ -254,6 +254,18 @@ public enum HarnessJSONValue: Codable, Equatable, Sendable {
       if let value = pair.value.compatibilityString() { result[pair.key] = value }
     }
   }
+
+  /// Applies a legacy hook's top-level string edits without flattening or
+  /// discarding nested JSON values owned by the provider.
+  public func overlaying(stringValues: [String: String]) -> HarnessJSONValue {
+    guard case var .object(values) = self else {
+      return .stringObject(stringValues)
+    }
+    for (key, value) in stringValues {
+      values[key] = .string(value)
+    }
+    return .object(values)
+  }
 }
 
 public struct ToolExecutionRequest: Codable, Equatable, Identifiable, Sendable {
@@ -406,7 +418,8 @@ public actor ToolEffectJournal {
       kind: .tool,
       subject: request.toolID,
       risk: definition.risk,
-      idempotencyKey: request.id.uuidString
+      idempotencyKey: request.id.uuidString,
+      inputDigest: HarnessDigest.sha256(request.inputJSON)
     )
     if let eventSink {
       // AgentHarness is the single durable writer in native mode. Publishing
@@ -733,6 +746,10 @@ public actor ToolExecutionCoordinator {
     guard let definition = await registry.definition(id: request.toolID) else {
       throw ToolExecutionError.unknownTool(request.toolID)
     }
+    // Contract validation is deliberately before executor lookup, hooks,
+    // capability evaluation, and approval. A malformed model call is a model
+    // error, not a user permission request.
+    try ToolSchemaValidator.validate(request.inputJSON, definition: definition)
     guard let executor = await registry.executor(id: request.toolID) else {
       throw ToolExecutionError.missingExecutor(request.toolID)
     }
@@ -750,10 +767,13 @@ public actor ToolExecutionCoordinator {
         operationID: request.operationID,
         agentID: request.agentID,
         toolID: request.toolID,
-        input: resolution.arguments,
+        inputJSON: request.inputJSON.overlaying(stringValues: resolution.arguments),
         resource: resolution.arguments["path"] ?? resolution.arguments["url"] ?? request.resource,
         command: resolution.arguments["command"] ?? request.command
       )
+      // Hook modifications are another model-controlled boundary and must be
+      // validated before they can reach permission or an executor.
+      try ToolSchemaValidator.validate(effectiveRequest.inputJSON, definition: definition)
     }
 
     if let receipt = await journal?.successfulReceipt(for: effectiveRequest) {
@@ -788,7 +808,7 @@ public actor ToolExecutionCoordinator {
     try await faultInjector?.hit(.afterStarted)
     var didSettle = false
     do {
-      let result = try await executor.execute(effectiveRequest)
+      var result = try await executor.execute(effectiveRequest)
       try await faultInjector?.hit(.beforeSettled)
       if let exitCode = result.exitCode, exitCode != 0 {
         if let intent {
@@ -797,7 +817,8 @@ public actor ToolExecutionCoordinator {
             effectID: intent.effectID,
             outcome: .failure,
             output: result.output,
-            errorMessage: "exit \(exitCode)"
+            errorMessage: "exit \(exitCode)",
+            retryable: false
           ))
           didSettle = true
         }
@@ -810,6 +831,10 @@ public actor ToolExecutionCoordinator {
           outcome: .success,
           output: result.output
         ))
+        var metadata = result.metadata
+        metadata["effectID"] = intent.effectID.uuidString
+        metadata["receipt"] = "success"
+        result = ToolExecutionResult(output: result.output, metadata: metadata, exitCode: result.exitCode)
         didSettle = true
       }
       return result
@@ -823,7 +848,8 @@ public actor ToolExecutionCoordinator {
           operationID: intent.operationID,
           effectID: intent.effectID,
           outcome: error is CancellationError ? .cancelled : .failure,
-          errorMessage: error.localizedDescription
+          errorMessage: error.localizedDescription,
+          retryable: error is CancellationError ? true : definition.risk == .low
         ))
       }
       throw error

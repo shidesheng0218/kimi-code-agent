@@ -47,10 +47,10 @@ public enum TaskIntentRouter {
       return IntentDecision(intent: .conversation, confidence: 0.98, requiresPlanning: false, requiresApproval: false, recommendedAgents: [])
     }
     if requiresFreshWebEvidence(prompt) {
-      return IntentDecision(intent: .webResearch, confidence: 0.9, requiresPlanning: false, requiresApproval: true, recommendedAgents: [.webResearch])
+      return IntentDecision(intent: .webResearch, confidence: 0.9, requiresPlanning: false, requiresApproval: false, recommendedAgents: [.webResearch])
     }
     if contains(prompt, ["搜索", "检索", "查一下", "查找资料", "web search", "fetchurl", "网页"]) {
-      return IntentDecision(intent: .webResearch, confidence: 0.86, requiresPlanning: false, requiresApproval: true, recommendedAgents: [.webResearch])
+      return IntentDecision(intent: .webResearch, confidence: 0.86, requiresPlanning: false, requiresApproval: false, recommendedAgents: [.webResearch])
     }
     if contains(prompt, ["浏览器", "点击网页", "截图", "页面验证", "browser"]) {
       return IntentDecision(intent: .browserVerification, confidence: 0.88, requiresPlanning: false, requiresApproval: true, recommendedAgents: [.browserVerification])
@@ -140,16 +140,51 @@ public struct ProjectedContext: Equatable, Sendable {
   public let summary: String
   public let recentTurns: [ConversationTurn]
   public let tokenBudget: Int
+  public let rules: [String]
+  public let verifiedResults: [String]
+  public let unresolved: [String]
 
   public var promptText: String {
-    [contract.promptText, summary.isEmpty ? nil : "历史摘要：\(summary)", recentTurns.isEmpty ? nil : "最近对话：\n" + recentTurns.map { "用户：\($0.userMessage)\n助手：\($0.assistantMessage)" }.joined(separator: "\n\n")]
+    [
+      contract.promptText,
+      rules.isEmpty ? nil : "生效规则：\n" + rules.joined(separator: "\n"),
+      verifiedResults.isEmpty ? nil : "已验证证据：\n" + verifiedResults.joined(separator: "\n"),
+      unresolved.isEmpty ? nil : "未解决问题：\n" + unresolved.joined(separator: "\n"),
+      summary.isEmpty ? nil : "历史摘要：\(summary)",
+      recentTurns.isEmpty ? nil : "最近对话：\n" + recentTurns.map { "用户：\($0.userMessage)\n助手：\($0.assistantMessage)" }.joined(separator: "\n\n")
+    ]
       .compactMap { $0 }
       .joined(separator: "\n\n")
+  }
+
+  public init(
+    contract: TaskContract,
+    summary: String,
+    recentTurns: [ConversationTurn],
+    tokenBudget: Int,
+    rules: [String] = [],
+    verifiedResults: [String] = [],
+    unresolved: [String] = []
+  ) {
+    self.contract = contract
+    self.summary = summary
+    self.recentTurns = recentTurns
+    self.tokenBudget = tokenBudget
+    self.rules = rules
+    self.verifiedResults = verifiedResults
+    self.unresolved = unresolved
   }
 }
 
 public enum ContextProjector {
-  public static func project(turns: [ConversationTurn], contract: TaskContract, tokenBudget: Int = 6_000) -> ProjectedContext {
+  public static func project(
+    turns: [ConversationTurn],
+    contract: TaskContract,
+    rules: [String] = [],
+    verifiedResults: [String] = [],
+    unresolved: [String] = [],
+    tokenBudget: Int = 6_000
+  ) -> ProjectedContext {
     let budget = max(400, tokenBudget)
     let ordered = turns.sorted { $0.sequence < $1.sequence }
     let estimatedContractTokens = max(120, contract.promptText.count / 3)
@@ -170,7 +205,15 @@ public enum ContextProjector {
       let assistant = clipped(turn.assistantMessage, limit: 220)
       return assistant.isEmpty ? "用户：\(user)" : "用户：\(user)；结论：\(assistant)"
     }.joined(separator: "\n")
-    return ProjectedContext(contract: contract, summary: clipped(rawSummary, limit: summaryBudget * 3), recentTurns: recent, tokenBudget: budget)
+    return ProjectedContext(
+      contract: contract,
+      summary: clipped(rawSummary, limit: summaryBudget * 3),
+      recentTurns: recent,
+      tokenBudget: budget,
+      rules: rules.map { clipped($0, limit: 600) }.filter { !$0.isEmpty },
+      verifiedResults: verifiedResults.map { clipped($0, limit: 800) }.filter { !$0.isEmpty },
+      unresolved: unresolved.map { clipped($0, limit: 600) }.filter { !$0.isEmpty }
+    )
   }
 
   private static func clipped(_ text: String, limit: Int) -> String {

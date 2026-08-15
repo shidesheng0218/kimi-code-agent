@@ -185,19 +185,22 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
   public let modelID: String
   public let maximumOutputTokens: Int?
   private let session: URLSession
+  private let traceRecorder: ProviderTraceRecorder?
 
   public init(
     baseURL: URL,
     apiKey: String,
     modelID: String,
     maximumOutputTokens: Int? = nil,
-    session: URLSession = .shared
+    session: URLSession = .shared,
+    traceRecorder: ProviderTraceRecorder? = nil
   ) {
     self.baseURL = baseURL
     self.apiKey = apiKey
     self.modelID = modelID
     self.maximumOutputTokens = maximumOutputTokens.map { max(1, $0) }
     self.session = session
+    self.traceRecorder = traceRecorder
   }
 
   public func stream(
@@ -254,6 +257,8 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
 
     let session = self.session
     let preparedRequest = request
+    let recorder = traceRecorder
+    let traceID = await recorder?.start(request: conversationRequest, tools: tools)
     return AsyncThrowingStream { continuation in
       let producer = Task {
         do {
@@ -275,7 +280,12 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
             if Task.isCancelled { break }
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
-            if payload == "[DONE]" { continuation.yield(.done); break }
+            if payload == "[DONE]" {
+              let event = HarnessConversationEvent.done
+              continuation.yield(event)
+              await recorder?.append(event, traceID: traceID)
+              break
+            }
             guard let data = payload.data(using: .utf8),
                   let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let choices = object["choices"] as? [[String: Any]],
@@ -283,10 +293,14 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
               throw KimiHTTPProviderError.invalidEvent(String(payload))
             }
             if let text = delta["content"] as? String, !text.isEmpty {
-              continuation.yield(.text(text))
+              let event = HarnessConversationEvent.text(text)
+              continuation.yield(event)
+              await recorder?.append(event, traceID: traceID)
             }
             if let reasoning = delta["reasoning_content"] as? String, !reasoning.isEmpty {
-              continuation.yield(.reasoning(reasoning))
+              let event = HarnessConversationEvent.reasoning(reasoning)
+              continuation.yield(event)
+              await recorder?.append(event, traceID: traceID)
             }
             if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
               for (position, call) in toolCalls.enumerated() {
@@ -303,18 +317,22 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
                   id = toolCallIDsByIndex[index] ?? "call-index-\(index)"
                   toolCallIDsByIndex[index] = id
                 }
-                continuation.yield(.toolCallDelta(id: id, name: name, argumentsDelta: arguments))
+                let event = HarnessConversationEvent.toolCallDelta(id: id, name: name, argumentsDelta: arguments)
+                continuation.yield(event)
+                await recorder?.append(event, traceID: traceID)
               }
             }
             if let usage = object["usage"] as? [String: Any] {
               let promptDetails = usage["prompt_tokens_details"] as? [String: Any]
               let completionDetails = usage["completion_tokens_details"] as? [String: Any]
-              continuation.yield(.usage(HarnessModelUsage(
+              let event = HarnessConversationEvent.usage(HarnessModelUsage(
                 inputTokens: usage["prompt_tokens"] as? Int ?? 0,
                 outputTokens: usage["completion_tokens"] as? Int ?? 0,
                 reasoningTokens: completionDetails?["reasoning_tokens"] as? Int ?? 0,
                 cachedTokens: promptDetails?["cached_tokens"] as? Int ?? 0
-              )))
+              ))
+              continuation.yield(event)
+              await recorder?.append(event, traceID: traceID)
             }
             if let reason = choices.first?["finish_reason"] as? String {
               let mapped: HarnessConversationFinishReason
@@ -324,13 +342,18 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
               case "stop": mapped = .stop
               default: mapped = .error
               }
-              continuation.yield(.finish(mapped))
+              let event = HarnessConversationEvent.finish(mapped)
+              continuation.yield(event)
+              await recorder?.append(event, traceID: traceID)
             }
           }
+          await recorder?.complete(traceID: traceID)
           continuation.finish()
         } catch is CancellationError {
+          await recorder?.fail(CancellationError(), traceID: traceID)
           continuation.finish()
         } catch {
+          await recorder?.fail(error, traceID: traceID)
           continuation.finish(throwing: error)
         }
       }

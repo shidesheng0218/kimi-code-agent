@@ -25,6 +25,8 @@ public struct MemoryRecord: Codable, Equatable, Sendable, Identifiable {
   /// Project and task memories are isolated by this stable local key. User
   /// memories deliberately leave it nil and can be projected everywhere.
   public let scopeKey: String?
+  /// Stable semantic subject used for scope precedence and conflict audits.
+  public let key: String?
   public let kind: MemoryKind
   public var content: String
   public let provenance: MemoryProvenance
@@ -36,11 +38,12 @@ public struct MemoryRecord: Codable, Equatable, Sendable, Identifiable {
   public init(
     id: UUID = UUID(), scope: MemoryScope, scopeKey: String? = nil, kind: MemoryKind, content: String,
     provenance: MemoryProvenance, createdAt: Date = .now, updatedAt: Date = .now,
-    expiresAt: Date? = nil, isEnabled: Bool = true
+    expiresAt: Date? = nil, isEnabled: Bool = true, key: String? = nil
   ) {
     self.id = id
     self.scope = scope
     self.scopeKey = scopeKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    self.key = key?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     self.kind = kind
     self.content = content.trimmingCharacters(in: .whitespacesAndNewlines)
     self.provenance = provenance
@@ -51,7 +54,7 @@ public struct MemoryRecord: Codable, Equatable, Sendable, Identifiable {
   }
 
   private enum CodingKeys: String, CodingKey {
-    case id, scope, scopeKey, kind, content, provenance, createdAt, updatedAt, expiresAt, isEnabled
+    case id, scope, scopeKey, key, kind, content, provenance, createdAt, updatedAt, expiresAt, isEnabled
   }
 
   public init(from decoder: Decoder) throws {
@@ -66,8 +69,21 @@ public struct MemoryRecord: Codable, Equatable, Sendable, Identifiable {
       createdAt: try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now,
       updatedAt: try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? .now,
       expiresAt: try container.decodeIfPresent(Date.self, forKey: .expiresAt),
-      isEnabled: try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+      isEnabled: try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true,
+      key: try container.decodeIfPresent(String.self, forKey: .key)
     )
+  }
+}
+
+public struct MemoryConflict: Equatable, Sendable, Identifiable {
+  public let key: String
+  public let records: [MemoryRecord]
+
+  public var id: String { key }
+
+  public init(key: String, records: [MemoryRecord]) {
+    self.key = key
+    self.records = records
   }
 }
 
@@ -106,6 +122,39 @@ public final class MemoryStore: @unchecked Sendable {
     }.sorted { $0.updatedAt > $1.updatedAt }
   }
 
+  /// Projects a scoped, conflict-aware memory view for model context. The
+  /// most specific scope wins for a shared key, while unkeyed records remain
+  /// visible. Derived memory is never converted into an authorization rule.
+  public func effectiveRecords(projectKey: String? = nil, taskKey: String? = nil, at date: Date = .now) -> [MemoryRecord] {
+    let candidates = matchingRecords(projectKey: projectKey, taskKey: taskKey, at: date)
+      .sorted { lhs, rhs in
+        let lhsScope = scopePriority(lhs.scope)
+        let rhsScope = scopePriority(rhs.scope)
+        if lhsScope != rhsScope { return lhsScope > rhsScope }
+        let lhsProvenance = provenancePriority(lhs.provenance)
+        let rhsProvenance = provenancePriority(rhs.provenance)
+        if lhsProvenance != rhsProvenance { return lhsProvenance > rhsProvenance }
+        return lhs.updatedAt > rhs.updatedAt
+      }
+    var seenKeys = Set<String>()
+    return candidates.filter { record in
+      guard let key = record.key?.lowercased(), !key.isEmpty else { return true }
+      return seenKeys.insert(key).inserted
+    }
+  }
+
+  public func conflicts(projectKey: String? = nil, taskKey: String? = nil, at date: Date = .now) -> [MemoryConflict] {
+    let grouped = Dictionary(grouping: matchingRecords(projectKey: projectKey, taskKey: taskKey, at: date).compactMap { record -> (String, MemoryRecord)? in
+      guard let key = record.key?.lowercased(), !key.isEmpty else { return nil }
+      return (key, record)
+    }, by: \.0)
+    return grouped.compactMap { key, values in
+      let records = values.map(\.1).sorted { scopePriority($0.scope) > scopePriority($1.scope) }
+      let contents = Set(records.map { $0.content.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) })
+      return contents.count > 1 ? MemoryConflict(key: key, records: records) : nil
+    }.sorted { $0.key < $1.key }
+  }
+
   public func setEnabled(id: UUID, enabled: Bool) throws {
     lock.lock()
     guard let index = values.firstIndex(where: { $0.id == id }) else { lock.unlock(); return }
@@ -127,6 +176,40 @@ public final class MemoryStore: @unchecked Sendable {
   private func persist(_ snapshot: [MemoryRecord]) throws {
     try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
     try JSONEncoder().encode(snapshot).write(to: fileURL, options: .atomic)
+  }
+
+  private func matchingRecords(projectKey: String?, taskKey: String?, at date: Date) -> [MemoryRecord] {
+    let project = projectKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    let task = taskKey?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    lock.lock()
+    defer { lock.unlock() }
+    return values.filter { record in
+      guard record.isEnabled, (record.expiresAt == nil || record.expiresAt! > date) else { return false }
+      switch record.scope {
+      case .user:
+        return true
+      case .project:
+        return project != nil && record.scopeKey == project
+      case .task:
+        return task != nil && record.scopeKey == task
+      }
+    }
+  }
+
+  private func scopePriority(_ scope: MemoryScope) -> Int {
+    switch scope {
+    case .user: 1
+    case .project: 2
+    case .task: 3
+    }
+  }
+
+  private func provenancePriority(_ provenance: MemoryProvenance) -> Int {
+    switch provenance {
+    case .sessionDerived: 1
+    case .projectRule: 2
+    case .userConfirmed: 3
+    }
   }
 }
 

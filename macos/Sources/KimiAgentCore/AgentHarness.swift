@@ -114,6 +114,7 @@ public struct HarnessEffectIntent: Codable, Equatable, Identifiable, Sendable {
   public let subject: String
   public let risk: ToolRisk
   public let idempotencyKey: String
+  public let inputDigest: String?
   public let createdAt: Date
 
   public var id: UUID { effectID }
@@ -125,6 +126,7 @@ public struct HarnessEffectIntent: Codable, Equatable, Identifiable, Sendable {
     subject: String,
     risk: ToolRisk,
     idempotencyKey: String? = nil,
+    inputDigest: String? = nil,
     createdAt: Date = .now
   ) {
     self.operationID = operationID
@@ -133,7 +135,26 @@ public struct HarnessEffectIntent: Codable, Equatable, Identifiable, Sendable {
     self.subject = subject
     self.risk = risk
     self.idempotencyKey = idempotencyKey ?? effectID.uuidString
+    self.inputDigest = inputDigest
     self.createdAt = createdAt
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case operationID, effectID, kind, subject, risk, idempotencyKey, inputDigest, createdAt
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      operationID: try container.decode(OperationID.self, forKey: .operationID),
+      effectID: try container.decode(UUID.self, forKey: .effectID),
+      kind: try container.decode(HarnessEffectKind.self, forKey: .kind),
+      subject: try container.decode(String.self, forKey: .subject),
+      risk: try container.decode(ToolRisk.self, forKey: .risk),
+      idempotencyKey: try container.decodeIfPresent(String.self, forKey: .idempotencyKey),
+      inputDigest: try container.decodeIfPresent(String.self, forKey: .inputDigest),
+      createdAt: try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
+    )
   }
 }
 
@@ -143,6 +164,9 @@ public struct HarnessEffectReceipt: Codable, Equatable, Identifiable, Sendable {
   public let outcome: HarnessEffectOutcome
   public let output: String?
   public let errorMessage: String?
+  public let outputDigest: String?
+  public let artifactIDs: [UUID]
+  public let retryable: Bool
   public let settledAt: Date
 
   public var id: UUID { effectID }
@@ -153,6 +177,9 @@ public struct HarnessEffectReceipt: Codable, Equatable, Identifiable, Sendable {
     outcome: HarnessEffectOutcome,
     output: String? = nil,
     errorMessage: String? = nil,
+    outputDigest: String? = nil,
+    artifactIDs: [UUID] = [],
+    retryable: Bool = false,
     settledAt: Date = .now
   ) {
     self.operationID = operationID
@@ -160,7 +187,29 @@ public struct HarnessEffectReceipt: Codable, Equatable, Identifiable, Sendable {
     self.outcome = outcome
     self.output = output
     self.errorMessage = errorMessage
+    self.outputDigest = outputDigest ?? output.map(HarnessDigest.sha256)
+    self.artifactIDs = artifactIDs
+    self.retryable = retryable
     self.settledAt = settledAt
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case operationID, effectID, outcome, output, errorMessage, outputDigest, artifactIDs, retryable, settledAt
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      operationID: try container.decode(OperationID.self, forKey: .operationID),
+      effectID: try container.decode(UUID.self, forKey: .effectID),
+      outcome: try container.decode(HarnessEffectOutcome.self, forKey: .outcome),
+      output: try container.decodeIfPresent(String.self, forKey: .output),
+      errorMessage: try container.decodeIfPresent(String.self, forKey: .errorMessage),
+      outputDigest: try container.decodeIfPresent(String.self, forKey: .outputDigest),
+      artifactIDs: try container.decodeIfPresent([UUID].self, forKey: .artifactIDs) ?? [],
+      retryable: try container.decodeIfPresent(Bool.self, forKey: .retryable) ?? false,
+      settledAt: try container.decodeIfPresent(Date.self, forKey: .settledAt) ?? .now
+    )
   }
 }
 

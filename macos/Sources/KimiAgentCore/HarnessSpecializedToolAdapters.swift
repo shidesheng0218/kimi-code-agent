@@ -104,26 +104,47 @@ public enum BrowserHarnessAdapterError: LocalizedError, Equatable {
 
 public final class MCPHarnessToolExecutor: ToolExecutor, @unchecked Sendable {
   private let runtime: ProjectExtensionRuntime
+  private let workerSupervisor: MCPWorkerSupervisor?
 
-  public init(runtime: ProjectExtensionRuntime) {
+  public init(runtime: ProjectExtensionRuntime, workerSupervisor: MCPWorkerSupervisor? = nil) {
     self.runtime = runtime
+    self.workerSupervisor = workerSupervisor
   }
 
   public func execute(_ request: ToolExecutionRequest) async throws -> ToolExecutionResult {
     let target = try resolveTarget(for: request)
     // ProjectExtensionRuntime owns synchronous MCP clients. Isolating the
     // blocking call keeps the Harness actor and SwiftUI main actor responsive.
-    let result = try await Task.detached(priority: .userInitiated) { [runtime] in
-      try runtime.callMCPTool(serverID: target.serverID, name: target.toolName, arguments: target.arguments)
-    }.value
-    return ToolExecutionResult(
-      output: result.standardOutput,
-      metadata: [
-        "server_id": target.serverID.uuidString,
-        "tool": target.toolName,
-        "raw_json": result.rawJSON
-      ]
-    )
+    do {
+      let result = try await Task.detached(priority: .userInitiated) { [runtime] in
+        try runtime.callMCPTool(serverID: target.serverID, name: target.toolName, arguments: target.arguments)
+      }.value
+      await workerSupervisor?.markHealthy(serverID: target.serverID.uuidString)
+      return ToolExecutionResult(
+        output: result.standardOutput,
+        metadata: [
+          "server_id": target.serverID.uuidString,
+          "tool": target.toolName,
+          "raw_json": result.rawJSON,
+          "worker_state": MCPWorkerState.healthy.rawValue
+        ]
+      )
+    } catch {
+      // A failed call is never replayed here: the ToolExecutionCoordinator
+      // owns the current Intent/Receipt boundary. We only mark the Worker
+      // degraded and perform a bounded reconnect so the next explicit model
+      // call can recover without duplicating an unknown MCP side effect.
+      if let workerSupervisor,
+         await workerSupervisor.markFailure(serverID: target.serverID.uuidString, message: error.localizedDescription) {
+        let statuses = (try? await Task.detached(priority: .utility) { [runtime] in
+          try runtime.refreshMCPStatuses()
+        }.value) ?? []
+        if statuses.first(where: { $0.id == target.serverID })?.state == .running {
+          await workerSupervisor.markHealthy(serverID: target.serverID.uuidString)
+        }
+      }
+      throw error
+    }
   }
 
   public func discoverDefinitions() throws -> [ToolDefinition] {

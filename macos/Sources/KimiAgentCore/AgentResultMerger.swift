@@ -119,6 +119,7 @@ public enum AgentResultMerger {
 
   private static func specializedStageHasReceipt(_ run: AgentRun) -> Bool {
     guard let result = run.result else { return false }
+    if !result.receiptIDs.isEmpty { return true }
     let receiptEvidence = result.evidence.contains { evidence in
       evidence.source?.localizedCaseInsensitiveContains("receipt") == true
     }

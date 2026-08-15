@@ -440,6 +440,21 @@ let catalog = MCPToolCatalog()
 catalog.register(serverID: "docs", status: .healthy, tools: [MCPTool(name: "search", description: "Search docs", inputSchemaJSON: "{}")])
 expect(catalog.search(query: "search").count == 1, "MCP Tool Search 必须返回已发现工具")
 expect(catalog.status(serverID: "docs") == .healthy, "MCP Server 状态必须可查询")
+let mcpWorkerSupervisor = MCPWorkerSupervisor(maxRestarts: 1)
+await mcpWorkerSupervisor.markHealthy(serverID: "docs")
+let initiallyHealthyWorker = await mcpWorkerSupervisor.health(serverID: "docs")
+expect(initiallyHealthyWorker?.status == .healthy, "MCP Worker 成功后必须记录 healthy 状态")
+let firstMCPFailureCanReconnect = await mcpWorkerSupervisor.markFailure(serverID: "docs", message: "worker exited")
+expect(firstMCPFailureCanReconnect, "MCP Worker 首次崩溃必须进入 reconnecting")
+let reconnectingWorker = await mcpWorkerSupervisor.health(serverID: "docs")
+expect(reconnectingWorker?.status == .reconnecting, "MCP Worker 崩溃期间必须显示 reconnecting，而不是伪造成功")
+await mcpWorkerSupervisor.markHealthy(serverID: "docs")
+let reconnectedWorker = await mcpWorkerSupervisor.health(serverID: "docs")
+expect(reconnectedWorker?.status == .healthy, "MCP Worker 重连成功后必须恢复 healthy")
+let repeatedMCPFailureCanReconnect = await mcpWorkerSupervisor.markFailure(serverID: "docs", message: "worker exited again")
+expect(!repeatedMCPFailureCanReconnect, "MCP Worker 恢复后也必须保留生命周期重启预算，达到上限后不可无限重连")
+let unavailableWorker = await mcpWorkerSupervisor.health(serverID: "docs")
+expect(unavailableWorker?.status == .unavailable, "MCP Worker 达到上限后不得继续伪造可用")
 let pluginRoot = temporaryDirectory.appendingPathComponent("plugin", isDirectory: true)
 try FileManager.default.createDirectory(at: pluginRoot.appendingPathComponent(".kimi-plugin", isDirectory: true), withIntermediateDirectories: true)
 let plugin = KimiPluginDescriptor(
@@ -516,11 +531,29 @@ expect(
 )
 let route = ModelRouter.route(intent: .conversation, promptLength: 12, budget: TaskBudget(maxCost: 1, maxInputTokens: 4_000, maxOutputTokens: 800, maxWallTimeSeconds: 30, maxRepairRounds: 3))
 expect(route.tier == .fast, "普通对话必须优先路由到低延迟模型")
+let routedModel = ModelRouteResolver.resolve(
+  preferredModelID: "kimi-k2.7-code",
+  route: route,
+  environment: ["KIMI_AGENT_MODEL_FAST": "kimi-fast"]
+)
+expect(routedModel.modelID == "kimi-fast" && routedModel.source == .tierOverride, "模型路由必须真正选择配置的 tier 模型，而不是只记录 modelTier")
+let preferredModel = ModelRouteResolver.resolve(
+  preferredModelID: "kimi-k2.7-code",
+  route: route,
+  environment: [:]
+)
+expect(preferredModel.modelID == "kimi-k2.7-code" && preferredModel.source == .preferred, "未配置 tier 模型时必须保留用户选择的 Kimi 模型")
 let usageLedger = UsageLedger()
 let usageEntry = UsageLedgerEntry(operationID: UUID(), stage: .explore, provider: "kimi", model: "kimi-fast", inputTokens: 100, outputTokens: 40, cachedTokens: 50, latencyMS: 120, estimatedCost: 0.1, qualityScore: nil)
 try usageLedger.append(usageEntry)
 expect(usageLedger.snapshot().count == 1 && usageLedger.totalCost() == 0.1, "模型调用必须记录 Token、延迟和成本")
 expect(usageLedger.contains(operationID: usageEntry.operationID), "用量账本必须能防止同一 Operation 重复记账")
+let priceCard = ModelPriceCard(inputPerMillion: 1, outputPerMillion: 2, cachedInputPerMillion: 0.25)
+expect(priceCard.estimate(inputTokens: 1_000, outputTokens: 500, cachedTokens: 200) == Decimal(string: "0.00185")!, "模型价格卡必须按输入、输出和缓存 Token 计算成本")
+let unpricedEntry = UsageLedgerEntry(operationID: UUID(), stage: .explore, provider: "kimi", model: "unknown", inputTokens: 10, outputTokens: 10, latencyMS: 1, estimatedCost: 0, qualityScore: nil, pricingStatus: .unconfigured)
+expect(unpricedEntry.pricingStatus == .unconfigured, "未知模型价格必须标记为未配置，不能把 0 当成真实成本")
+expect(CostBudgetGate.decision(spent: 0.81, budget: 1) == .warning, "成本达到 80% 时必须进入预警")
+expect(CostBudgetGate.decision(spent: 1.01, budget: 1) == .exceeded, "超过任务预算必须阻止继续调用")
 let memoryURL = temporaryDirectory.appendingPathComponent("memory.json")
 let memoryStore = MemoryStore(fileURL: memoryURL)
 try memoryStore.upsert(MemoryRecord(scope: .project, kind: .fact, content: "测试命令是 swift test", provenance: .userConfirmed))
@@ -529,6 +562,11 @@ expect(MemoryStore(fileURL: memoryURL).records(scope: .project).count == 1, "重
 try memoryStore.upsert(MemoryRecord(scope: .project, scopeKey: "/tmp/project-a", kind: .fact, content: "项目 A 使用 pnpm", provenance: .userConfirmed))
 expect(memoryStore.records(scope: .project, scopeKey: "/tmp/project-a").contains(where: { $0.content.contains("pnpm") }), "项目记忆必须按项目范围隔离")
 expect(!memoryStore.records(scope: .project, scopeKey: "/tmp/project-b").contains(where: { $0.content.contains("pnpm") }), "项目记忆不能泄漏到其他项目")
+try memoryStore.upsert(MemoryRecord(scope: .user, kind: .preference, content: "使用 Swift", provenance: .userConfirmed, key: "language"))
+try memoryStore.upsert(MemoryRecord(scope: .project, scopeKey: "/tmp/project-a", kind: .preference, content: "使用 TypeScript", provenance: .projectRule, key: "language"))
+let effectiveMemories = memoryStore.effectiveRecords(projectKey: "/tmp/project-a")
+expect(effectiveMemories.first(where: { $0.key == "language" })?.content == "使用 TypeScript", "更具体的项目记忆必须覆盖同键用户级偏好")
+expect(memoryStore.conflicts(projectKey: "/tmp/project-a").contains(where: { $0.key == "language" }), "冲突记忆必须可审计")
 let hookEngine = HarnessHookEngine(hooks: [
   HarnessHookDefinition(event: .beforeTool, priority: 10) { _ in .modify(arguments: ["path": "Sources/Safe.swift"]) },
   HarnessHookDefinition(event: .beforeTool, priority: 5) { _ in .injectContext(["只允许 Worktree 内写入"]) }
@@ -546,6 +584,47 @@ let hookSkip = HarnessHookEngine(hooks: [
 ])
 let skipResolution = try awaitValue { await hookSkip.evaluate(HarnessHookRequest(event: .beforeTool, toolID: "read")) }
 expect(skipResolution.action == .skip && skipResolution.isAllowed, "Hook skip 必须可安全跳过当前工具")
+let nestedHookRegistry = ToolRegistry(definitions: [
+  ToolDefinition(
+    id: "nested",
+    title: "Nested",
+    description: "保留嵌套参数",
+    permissionScopes: [],
+    inputSchemaJSON: #"{"type":"object","properties":{"path":{"type":"string"},"options":{"type":"object"}},"required":["path","options"],"additionalProperties":false}"#
+  )
+])
+await nestedHookRegistry.register(
+  ToolDefinition(
+    id: "nested",
+    title: "Nested",
+    description: "保留嵌套参数",
+    permissionScopes: [],
+    inputSchemaJSON: #"{"type":"object","properties":{"path":{"type":"string"},"options":{"type":"object"}},"required":["path","options"],"additionalProperties":false}"#
+  ),
+  executor: ClosureToolExecutor { request in
+    ToolExecutionResult(output: request.inputJSON.objectValue?["options"]?.objectValue?["mode"]?.stringValue ?? "missing")
+  }
+)
+let nestedHookCoordinator = ToolExecutionCoordinator(
+  registry: nestedHookRegistry,
+  permissionResolver: StaticToolPermissionResolver(decision: .allow),
+  hookResolver: { _ in
+    HarnessHookResolution(isAllowed: true, arguments: ["path": "rewritten.txt"], context: [], auditHookIDs: [])
+  }
+)
+let nestedHookResult = try awaitValue {
+  try await nestedHookCoordinator.execute(ToolExecutionRequest(
+    taskID: UUID(),
+    sessionID: UUID(),
+    agentID: "test",
+    toolID: "nested",
+    inputJSON: .object([
+      "path": .string("original.txt"),
+      "options": .object(["mode": .string("preserved")])
+    ])
+  ))
+}
+expect(nestedHookResult.output == "preserved", "Hook 修改顶层参数时不得丢失嵌套 JSON 参数")
 let hookRegistry = ToolRegistry(definitions: [ToolDefinition(id: "hooked", title: "Hooked", description: "hook test", permissionScopes: [])])
 await hookRegistry.register(
   ToolDefinition(id: "hooked", title: "Hooked", description: "hook test", permissionScopes: []),
@@ -907,6 +986,16 @@ let mergedBrowser = AgentResultMerger.merge(
 expect(mergedBrowser.outcome == .completed, "Browser 成功 Receipt 对应的阶段结果必须保持 completed")
 expect(mergedBrowser.finalAnswer.contains("已打开 https://example.com"), "最终答案必须保留 Browser 的真实结果")
 expect(!mergedBrowser.finalAnswer.contains("请提供 diff"), "最终答案不得混入 Review Agent 的无关自述")
+let directReceiptBrowser = AgentRun(
+  parentSessionID: UUID(), taskID: UUID(),
+  definition: AgentOrchestrator.builtInDefinition(for: .browserVerification),
+  state: .completed,
+  result: AgentResult(summary: "已完成截图。", receiptIDs: [UUID()])
+)
+expect(
+  AgentResultMerger.merge(runs: [directReceiptBrowser], contract: browserContract, requestedLanguage: .chinese).outcome == .completed,
+  "结构化 Receipt ID 必须可以直接证明专用阶段完成"
+)
 let browserWithoutReceipt = AgentRun(
   parentSessionID: UUID(), taskID: UUID(),
   definition: AgentOrchestrator.builtInDefinition(for: .browserVerification),
@@ -2949,6 +3038,121 @@ expect(
   AgentOrchestrator.readyRuns(in: completedRuns).map(\.definition.kind) == [.plan],
   "Explore 完成后应调度 Plan"
 )
+let schedulerSession = UUID()
+let schedulerTask = UUID()
+let sameWorktreeRuns = [
+  AgentRun(
+    parentSessionID: schedulerSession,
+    taskID: schedulerTask,
+    definition: AgentOrchestrator.builtInDefinition(for: .implement),
+    worktreePath: "/tmp/shared-worktree"
+  ),
+  AgentRun(
+    parentSessionID: schedulerSession,
+    taskID: schedulerTask,
+    definition: AgentOrchestrator.builtInDefinition(for: .debug),
+    worktreePath: "/tmp/shared-worktree"
+  )
+]
+let conflictScheduler = AgentRunScheduler(runs: sameWorktreeRuns, maxConcurrent: 8)
+let conflictReady = try awaitValue { await conflictScheduler.scheduleReady() }
+expect(conflictReady.count == 1, "同一 Worktree 的写入 Agent 必须串行调度")
+let schedulerSnapshot = try awaitValue { await conflictScheduler.snapshotRecord() }
+let restoredScheduler = AgentRunScheduler(snapshot: schedulerSnapshot)
+let restoredSchedulerRuns = try awaitValue { await restoredScheduler.snapshot() }
+expect(restoredSchedulerRuns.count == sameWorktreeRuns.count && restoredSchedulerRuns.contains(where: { $0.state == .interrupted }), "Scheduler 快照恢复必须把未结算节点标为 interrupted，等待用户继续")
+
+let supervisedTaskID = UUID()
+let supervisedParent = SessionRecord(taskID: supervisedTaskID, agentID: "supervisor", modelID: "kimi-k2.7-code")
+let supervisedExplore = AgentRun(
+  parentSessionID: supervisedParent.id,
+  taskID: supervisedTaskID,
+  definition: AgentOrchestrator.builtInDefinition(for: .explore)
+)
+let supervisedPlan = AgentRun(
+  parentSessionID: supervisedParent.id,
+  taskID: supervisedTaskID,
+  definition: AgentOrchestrator.builtInDefinition(for: .plan),
+  dependencies: [supervisedExplore.id]
+)
+let supervisorRunTrace = ThreadSafeStringTrace()
+let supervisorSnapshots = InvocationCounter()
+let graphSupervisor = AgentGraphSupervisor(
+  parent: supervisedParent,
+  runs: [supervisedExplore, supervisedPlan],
+  maxConcurrent: 2,
+  prompt: { run in "执行 \(run.definition.kind.title) 阶段" },
+  onEvent: { event in
+    if case .schedulerSnapshot = event { supervisorSnapshots.increment() }
+  },
+  executor: { run, session, prompt, tools in
+    supervisorRunTrace.append("\(run.definition.kind.rawValue):\(session.parentID == supervisedParent.id):\(prompt):\(tools.isEmpty)")
+    return AgentResult(summary: "\(run.definition.kind.title) 完成")
+  }
+)
+let supervisedRuns = try awaitValue { try await graphSupervisor.run() }
+expect(supervisedRuns.allSatisfy { $0.state == .completed }, "Graph Supervisor 必须驱动所有可依赖 Child Session 到完成")
+expect(supervisedRuns.allSatisfy { $0.childSessionID != nil }, "Graph Supervisor 必须将真实 Child Session ID 回写到 Scheduler")
+expect(supervisorRunTrace.snapshot.map { $0.split(separator: ":").first.map(String.init) ?? "" } == ["explore", "plan"], "Graph Supervisor 必须按 DAG 依赖顺序执行 Child Session")
+expect(supervisorRunTrace.snapshot.allSatisfy { $0.contains(":true:") && $0.hasSuffix(":false") }, "Child Session 必须继承父 Session、阶段 Prompt 与过滤后的工具集")
+expect(supervisorSnapshots.count >= 3, "Graph Supervisor 必须在调度和结算时发布可投影快照，UI 不得轮询 Scheduler")
+
+var interruptedGraphRun = AgentRun(
+  parentSessionID: supervisedParent.id,
+  taskID: supervisedTaskID,
+  definition: AgentOrchestrator.builtInDefinition(for: .explore)
+)
+interruptedGraphRun.state = .running
+let restoredGraphSupervisor = AgentGraphSupervisor(
+  parent: supervisedParent,
+  snapshot: AgentRunSchedulerSnapshot(runs: [interruptedGraphRun], maxConcurrent: 1),
+  prompt: { _ in "重启后继续" },
+  executor: { run, _, _, _ in AgentResult(summary: "\(run.definition.kind.title) 已恢复") }
+)
+let restoredGraphSnapshot = await restoredGraphSupervisor.snapshot()
+expect(restoredGraphSnapshot.runs.first?.state == .interrupted, "重启恢复必须将未结算 Child Session 标为 interrupted，禁止静默重放")
+await restoredGraphSupervisor.continueRun(interruptedGraphRun.id)
+let resumedGraphSnapshot = await restoredGraphSupervisor.snapshot()
+expect(resumedGraphSnapshot.runs.first?.state == .queued, "重启恢复必须将 interrupted Child Session 显式转回 queued，禁止静默重放")
+let restoredGraphRuns = try await restoredGraphSupervisor.run()
+expect(restoredGraphRuns.first?.state == .completed, "用户明确继续后 Graph Supervisor 必须从 durable snapshot 恢复执行")
+
+let childCancellationTaskID = UUID()
+let childCancellationParent = SessionRecord(taskID: childCancellationTaskID, agentID: "supervisor")
+let childStarted = OneShotAsyncGate()
+let childCancellationCallbacks = InvocationCounter()
+let cancellableChildCoordinator = ChildSessionCoordinator(
+  onCancel: { _ in childCancellationCallbacks.increment() },
+  executor: { _, _, _ in
+    await childStarted.open()
+    try await Task.sleep(for: .seconds(2))
+    return AgentResult(summary: "不应等待到这里")
+  }
+)
+let cancellationProbeChild = try awaitValue {
+  await cancellableChildCoordinator.createChild(
+    parent: childCancellationParent,
+    taskID: childCancellationTaskID,
+    definition: AgentOrchestrator.builtInDefinition(for: .explore),
+    prompt: "可取消 Child Session"
+  )
+}
+let cancellableChildRun = Task.detached { () -> Result<AgentResult, Error> in
+  do {
+    return .success(try await cancellableChildCoordinator.run(cancellationProbeChild.id))
+  } catch {
+    return .failure(error)
+  }
+}
+_ = try awaitValue { await childStarted.wait(); return true }
+let childCancellationStartedAt = Date()
+_ = try awaitValue { await cancellableChildCoordinator.cancel(cancellationProbeChild.id); return true }
+let cancellableChildOutcome = try awaitValue { await cancellableChildRun.value }
+expect(Date().timeIntervalSince(childCancellationStartedAt) < 0.5, "取消 Child Session 必须中断正在执行的 Task，不能等待模型或工具自然返回")
+if case .success = cancellableChildOutcome {
+  expect(false, "取消中的 Child Session 必须以取消错误结算")
+}
+expect(childCancellationCallbacks.count == 1, "取消 Child Session 必须只触发一次底层取消回调")
 
 let workspaceLayout = WorkspaceLayout.defaultLayout()
 expect(workspaceLayout.visiblePaneKinds.contains(.chat), "默认工作区必须包含主对话 Pane")
@@ -2959,9 +3163,20 @@ expect(splitLayout.root.contains(.terminal), "拆分后的布局树必须保留�
 
 let greetingStrategy = TaskIntentRouter.decide(for: "你好")
 expect(greetingStrategy.intent == .conversation && !greetingStrategy.requiresPlanning, "简单问候必须直接进入自然对话策略")
+let webStrategy = TaskIntentRouter.decide(for: "搜索今天的新闻")
+expect(webStrategy.intent == .webResearch && !webStrategy.requiresApproval, "公网只读 Web Research 默认不应触发重复审批")
 let implementationStrategy = TaskIntentRouter.decide(for: "修复登录失败并运行测试")
 expect(implementationStrategy.intent == .debug, "明确修复与测试请求必须进入调试策略")
 expect(implementationStrategy.recommendedAgents.contains(.explore) && implementationStrategy.recommendedAgents.contains(.test), "调试策略必须包含探索和验证 Agent")
+let legacyRecoveryRuns = AgentOrchestrator.makePlan(taskID: UUID(), mode: .agent).runs
+expect(
+  !AgentGraphRecoveryPolicy.shouldRestoreGraph(decision: greetingStrategy, runs: legacyRecoveryRuns),
+  "历史普通对话即使带有迁移 AgentRun 记录，也不得在重启后恢复为规划图"
+)
+expect(
+  AgentGraphRecoveryPolicy.shouldRestoreGraph(decision: implementationStrategy, runs: legacyRecoveryRuns),
+  "真正的编程任务在存在未结算节点时必须恢复 Supervisor"
+)
 let strategyContract = TaskContract.make(
   prompt: "修复登录失败并运行测试",
   decision: implementationStrategy,
@@ -2975,6 +3190,14 @@ let projectedContext = ContextProjector.project(
 )
 expect(projectedContext.promptText.contains("任务契约"), "上下文投影必须优先包含任务契约")
 expect(projectedContext.recentTurns.count < 8, "Token 预算不足时上下文投影必须压缩较早对话")
+let richProjection = ContextProjector.project(
+  turns: [],
+  contract: strategyContract,
+  rules: ["只在 Worktree 内写入"],
+  verifiedResults: ["swift test 通过"],
+  unresolved: ["Browser 尚未执行"]
+)
+expect(richProjection.promptText.contains("只在 Worktree 内写入") && richProjection.promptText.contains("swift test 通过"), "模型上下文必须携带规则、验证证据和未解决项")
 let strategicPrompt = TaskPromptComposer.compose(
   prompt: "修复登录失败并运行测试",
   mode: .agent,
@@ -3000,6 +3223,15 @@ let failedFinalAnswer = FinalAnswerComposer.compose(
   risks: ["缺少依赖"]
 )
 expect(failedFinalAnswer.contains("未完成") && !failedFinalAnswer.contains("已完成\n"), "失败答复不得伪装成成功")
+let missingReceiptGate = ResponseQualityGate.validate(
+  "已完成 Web Search 和 Browser 验证。",
+  outcome: .completed,
+  requiredEvidence: [
+    FinalAnswerEvidence(subject: "web.search", receiptID: nil, succeeded: false),
+    FinalAnswerEvidence(subject: "browser", receiptID: nil, succeeded: false)
+  ]
+)
+expect(missingReceiptGate.hasBlockingIssues, "没有成功 Receipt 时最终答案不得宣称专用工具已完成")
 
 let pluginManifest = KimiPluginManifest(
   id: "com.kimi.review",
@@ -4255,6 +4487,95 @@ expect(
   ConversationExecutionOutcome.resolve(exitCode: 0, events: [thinkingOnlyEvent, finalReplyEvent], turnID: firstTurn.id) == .completed,
   "待刷新的助手事件也必须能够完成任务"
 )
+
+// Harness v2 contract: malformed model tool calls must fail schema validation
+// before permission evaluation or approval UI. This is intentionally placed in
+// CoreChecks first so the implementation is driven by a regression contract.
+let schemaProbe = InvocationCounter()
+let schemaRegistry = ToolRegistry(definitions: [
+  ToolDefinition(
+    id: "write",
+    title: "写入文件",
+    description: "测试 Schema 顺序",
+    permissionScopes: [.writeWorkspace],
+    risk: .medium,
+    inputSchemaJSON: #"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}"#
+  )
+])
+let schemaCoordinator = ToolExecutionCoordinator(
+  registry: schemaRegistry,
+  permissionResolver: StaticToolPermissionResolver(decision: .ask),
+  approvalHandler: { _, _ in
+    schemaProbe.increment()
+    return .allow
+  },
+  journal: nil
+)
+let malformedRequest = ToolExecutionRequest(
+  taskID: UUID(),
+  sessionID: UUID(),
+  operationID: UUID(),
+  agentID: "test",
+  toolID: "write",
+  inputJSON: .object(["content": .string("missing path")])
+)
+let malformedResult = try awaitValue {
+  do {
+    _ = try await schemaCoordinator.execute(malformedRequest)
+    return false
+  } catch is ToolSchemaValidationError {
+    return true
+  } catch {
+    return false
+  }
+}
+expect(malformedResult, "无效 Tool Call 必须返回结构化 Schema 错误")
+expect(schemaProbe.count == 0, "Schema 校验失败时不得进入权限审批")
+
+let envelope = ToolCallEnvelope(
+  id: "call-1",
+  toolID: "write",
+  arguments: .object(["path": .string("a.txt"), "content": .string("ok")]),
+  schemaVersion: 1
+)
+expect(envelope.idempotencyKey == "call-1", "ToolCallEnvelope 必须提供稳定幂等键")
+
+let traceRecorder = ProviderTraceRecorder()
+let traceID = try awaitValue {
+  await traceRecorder.start(
+    request: HarnessConversationRequest(modelID: "kimi-k2", messages: [.user("搜索 Swift 6")]),
+    tools: [ToolCatalog.defaultDefinitions.first { $0.id == "web.search" }!]
+  )
+}
+try awaitValue {
+  await traceRecorder.append(.toolCallDelta(id: "call-web", name: "web.search", argumentsDelta: ""))
+  await traceRecorder.append(.toolCallDelta(id: "call-web", name: nil, argumentsDelta: #"{\"query\":\"Swift "#))
+  await traceRecorder.append(.toolCallDelta(id: "call-web", name: nil, argumentsDelta: #"6\"}"#))
+  await traceRecorder.finish(.toolCalls)
+  return ()
+}
+let providerTrace = try awaitValue { await traceRecorder.record(id: traceID) }
+expect(providerTrace?.blocks.count == 4, "Provider Trace 必须保留所有原始流式块")
+let replayedEvents = ProviderReplayRunner.events(from: providerTrace!)
+var replayAssembler = HarnessModelStreamAssembler()
+replayedEvents.forEach { replayAssembler.push($0) }
+expect(replayAssembler.toolCalls.first?.argumentsJSON == #"{\"query\":\"Swift 6\"}"#, "Provider Replay 必须正确恢复碎片化 Tool 参数")
+let redactedTraceRecorder = ProviderTraceRecorder()
+let redactedTraceID = try awaitValue {
+  await redactedTraceRecorder.start(
+    request: HarnessConversationRequest(modelID: "kimi-k2", messages: [.user("Authorization: Bearer sk-secret-token")]),
+    tools: []
+  )
+}
+try awaitValue {
+  await redactedTraceRecorder.append(.text("api_key=super-secret"))
+  await redactedTraceRecorder.finish(.stop)
+  return ()
+}
+let redactedTrace = try awaitValue { await redactedTraceRecorder.record(id: redactedTraceID) }
+let redactedTraceData = try JSONEncoder().encode(redactedTrace)
+let redactedTraceText = String(data: redactedTraceData, encoding: .utf8) ?? ""
+expect(!redactedTraceText.contains("sk-secret-token") && !redactedTraceText.contains("super-secret"), "Provider Trace 不得写入明文密钥")
 
 print("KimiAgentCore checks passed")
 

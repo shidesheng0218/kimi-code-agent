@@ -73,6 +73,7 @@ final class DesktopAppModel: ObservableObject {
   private let webResearchSettingsStore: WebResearchSettingsStore
   private let usageLedger: UsageLedger
   private let memoryStore: MemoryStore
+  private let providerTraceRecorder: ProviderTraceRecorder
   private let mcpToolCatalog = MCPToolCatalog()
   private let mcpWorkerSupervisor = MCPWorkerSupervisor()
   private let pluginWorkerSupervisor = PluginWorkerSupervisor()
@@ -86,9 +87,9 @@ final class DesktopAppModel: ObservableObject {
   private var taskWorkspaceAccessTokens: [AgentTask.ID: WorkspaceAccessToken] = [:]
   private var runningProcesses: [AgentTask.ID: KimiProcessHandle] = [:]
   private var runningAgentHosts: [AgentTask.ID: KimiAgentHostHandle] = [:]
-  private var childCoordinators: [UUID: ChildSessionCoordinator] = [:]
   private var automatedGraphTasks: [AgentTask.ID: Task<Void, Never>] = [:]
-  private var agentRunSchedulers: [AgentTask.ID: AgentRunScheduler] = [:]
+  private var agentGraphSupervisors: [AgentTask.ID: AgentGraphSupervisor] = [:]
+  private var graphContracts: [AgentTask.ID: TaskContract] = [:]
   private var runningTerminalCommands: [UUID: TerminalCommandHandle] = [:]
   private var runningTerminalSessionIDs: [UUID: UUID] = [:]
   private var terminalJobIDs: [UUID: UUID] = [:]
@@ -131,6 +132,7 @@ final class DesktopAppModel: ObservableObject {
     _ = try? HarnessMigrationCoordinator(directory: applicationSupport).prepare()
     usageLedger = UsageLedger(fileURL: applicationSupport.appendingPathComponent("harness-v3/usage-ledger.json"))
     memoryStore = MemoryStore(fileURL: applicationSupport.appendingPathComponent("harness-v3/memory.json"))
+    providerTraceRecorder = ProviderTraceRecorder(fileURL: applicationSupport.appendingPathComponent("harness-v3/provider-traces.jsonl"))
     repository = TaskRepository(fileURL: stateURL)
     persistenceWriter = StatePersistenceWriter(fileURL: stateURL)
     sessionEventStore = SessionEventStore(fileURL: sessionEventsURL)
@@ -171,6 +173,7 @@ final class DesktopAppModel: ObservableObject {
     refreshWebResearchSettings()
     refreshKimiModelsIfNeeded()
     restoreSessionSnapshots()
+    restoreAgentGraphSupervisors()
     importLegacyHarnessState(migratedState)
     if state != loadedState {
       schedulePersistence()
@@ -189,7 +192,8 @@ final class DesktopAppModel: ObservableObject {
     terminalTimeoutTasks.values.forEach { $0.cancel() }
     harnessEventTasks.values.forEach { $0.cancel() }
     automatedGraphTasks.values.forEach { $0.cancel() }
-    agentRunSchedulers.removeAll()
+    agentGraphSupervisors.removeAll()
+    graphContracts.removeAll()
   }
 
   private static func migrateConversationState(_ original: AppState) -> AppState {
@@ -415,103 +419,24 @@ final class DesktopAppModel: ObservableObject {
   }
 
   /// Runs one orchestration node in a real independent Child Session. The
-  /// parent task remains visible and receives only lifecycle/result artifacts;
-  /// the child keeps its own prompt, tools, worktree and runtime session ID.
+  /// Core-owned graph supervisor chooses the node and owns its Child Session;
+  /// this View Model only forwards the user's explicit resume/retry command.
   func runAgentRun(taskID: AgentTask.ID, runID: UUID) {
-    guard let task = state.tasks.first(where: { $0.id == taskID }),
-          let run = task.agentRuns.first(where: { $0.id == runID }) else { return }
-    guard run.state != .running else { return }
-    guard usesNativeHarnessProvider() else {
-      appendEvent("无法启动 Child Agent：Harness 需要 Kimi API Key；ACP/CLI 子执行已禁用，避免绕过统一 Tool Runtime。", kind: .error, for: taskID)
-      return
-    }
-
-    let workspacePath = run.worktreePath ?? task.worktreePath ?? task.workspacePath
-    let parentSessionID = UUID(uuidString: task.sessionID ?? "") ?? task.id
-    let parentSession = SessionRecord(
-      id: parentSessionID,
-      taskID: taskID,
-      agentID: "supervisor",
-      modelID: task.modelID,
-      status: .running,
-      worktreePath: task.worktreePath
-    )
-    let coordinator = ChildSessionCoordinator(
-      onEvent: { [weak self] event in
-        Task { @MainActor [weak self] in
-          guard let self else { return }
-          self.enqueueSessionKernelEvent(event)
-        }
-      },
-      onCancel: { _ in },
-      executor: { [weak self] session, prompt, tools in
-        try await Task { @MainActor [weak self] in
-          guard let self else { throw CancellationError() }
-          return try await self.executeNativeChildAgent(
-            parentTaskID: taskID,
-            session: session,
-            prompt: prompt,
-            tools: tools,
-            agentDefinition: run.definition
-          )
-        }.value
+    guard let supervisor = agentGraphSupervisors[taskID] else { return }
+    Task { @MainActor [weak self] in
+      let snapshot = await supervisor.snapshot()
+      guard let run = snapshot.runs.first(where: { $0.id == runID }) else { return }
+      switch run.state {
+      case .paused, .interrupted:
+        await supervisor.continueRun(runID)
+      case .failed:
+        await supervisor.retry(runID)
+      case .queued:
+        break
+      case .running, .awaitingApproval, .completed, .cancelled:
+        return
       }
-    )
-    childCoordinators[runID] = coordinator
-    updateTask(taskID) { current in
-      guard let index = current.agentRuns.firstIndex(where: { $0.id == runID }) else { return }
-      current.agentRuns[index].state = .running
-      current.agentRuns[index].progress = 0.05
-      current.agentRuns[index].worktreePath = workspacePath
-      current.agentRuns[index].updatedAt = .now
-    }
-    let prompt = "父任务：" + task.title + "\n请执行你的阶段：" + run.definition.description
-    Task { [weak self, coordinator] in
-      let child = await coordinator.createChild(
-        parent: parentSession,
-        taskID: taskID,
-        definition: run.definition,
-        prompt: prompt,
-        worktreePath: workspacePath
-      )
-      await MainActor.run {
-        self?.updateTask(taskID) { current in
-          guard let index = current.agentRuns.firstIndex(where: { $0.id == runID }) else { return }
-          current.agentRuns[index].childSessionID = child.id
-          current.agentRuns[index].updatedAt = .now
-        }
-      }
-      do {
-        let result = try await coordinator.run(child.id)
-        await MainActor.run {
-          self?.updateTask(taskID) { current in
-            guard let index = current.agentRuns.firstIndex(where: { $0.id == runID }) else { return }
-            current.agentRuns[index].state = .completed
-            current.agentRuns[index].progress = 1
-            current.agentRuns[index].result = result
-            current.agentRuns[index].updatedAt = .now
-          }
-          self?.appendEvent("Child Agent " + run.definition.kind.title + " 已完成：" + result.summary, kind: .toolFinished, for: taskID)
-          self?.childCoordinators.removeValue(forKey: runID)
-          if let scheduler = self?.agentRunSchedulers[taskID] {
-            Task { await scheduler.complete(runID, result: result) }
-          }
-        }
-      } catch {
-        await MainActor.run {
-          self?.updateTask(taskID) { current in
-            guard let index = current.agentRuns.firstIndex(where: { $0.id == runID }) else { return }
-            current.agentRuns[index].state = .failed
-            current.agentRuns[index].errorMessage = error.localizedDescription
-            current.agentRuns[index].updatedAt = .now
-          }
-          self?.appendEvent("Child Agent " + run.definition.kind.title + " 失败：" + error.localizedDescription, kind: .error, for: taskID)
-          self?.childCoordinators.removeValue(forKey: runID)
-          if let scheduler = self?.agentRunSchedulers[taskID] {
-            Task { await scheduler.fail(runID, message: error.localizedDescription) }
-          }
-        }
-      }
+      self?.startAgentGraphDriver(taskID: taskID)
     }
   }
 
@@ -536,7 +461,13 @@ final class DesktopAppModel: ObservableObject {
       .appendingPathComponent("browser-artifacts", isDirectory: true)
       .appendingPathComponent(session.id.uuidString, isDirectory: true)
     let allowedDomains = activeNetworkDomains
-    let modelID = session.modelID ?? parent.modelID ?? kimiRuntimeIdentity.modelID
+    let preferredModelID = session.modelID ?? parent.modelID ?? kimiRuntimeIdentity.modelID
+    let modelRoute = ModelRouter.route(
+      intent: agentDefinition.kind.modelRoutingIntent,
+      promptLength: prompt.count,
+      budget: .standard
+    )
+    let modelID = ModelRouteResolver.resolve(preferredModelID: preferredModelID, route: modelRoute).modelID
     let webToolExecutor: WebRuntimeToolExecutor?
     if tools.contains(where: { $0.id == "web.search" || $0.id == "web.fetch" }) {
       webToolExecutor = WebRuntimeToolExecutor(runtime: try await makeNativeWebRuntime(modelID: modelID, baseURL: baseURL, apiKey: apiKey))
@@ -564,7 +495,7 @@ final class DesktopAppModel: ObservableObject {
         exitCode: result.passed ? 0 : 1
       )
     }
-    let mcpExecutor = extensionRuntime.map(MCPHarnessToolExecutor.init(runtime:))
+    let mcpExecutor = extensionRuntime.map { MCPHarnessToolExecutor(runtime: $0, workerSupervisor: self.mcpWorkerSupervisor) }
     let computerUseHandler: NativeHarnessToolRuntime.SpecializedToolHandler = { request in
       try await ComputerUseController.executeHarnessRequest(request)
     }
@@ -603,7 +534,13 @@ final class DesktopAppModel: ObservableObject {
       },
       journal: journal
     )
-    let provider = KimiHTTPModelProvider(baseURL: baseURL, apiKey: apiKey, modelID: modelID, maximumOutputTokens: TaskBudget.standard.maxOutputTokens)
+    let provider = KimiHTTPModelProvider(
+      baseURL: baseURL,
+      apiKey: apiKey,
+      modelID: modelID,
+      maximumOutputTokens: modelRoute.maximumOutputTokens,
+      traceRecorder: providerTraceRecorder
+    )
     let evidenceStore = ChildToolEvidenceStore()
     let loop = HarnessConversationLoop(provider: provider, maxRounds: 8) { call, _ in
       let request = ToolExecutionRequest(
@@ -633,6 +570,9 @@ final class DesktopAppModel: ObservableObject {
     }
     let summary = ResponseQualityGate.enforce(result.text, outcome: .completed)
     let evidence = await evidenceStore.snapshot()
+    let receiptIDs = evidence.compactMap { entry in
+      entry.metadata["effectID"].flatMap(UUID.init(uuidString:))
+    }
     switch agentDefinition.kind {
     case .webResearch:
       let webEvidence = evidence.filter { entry in
@@ -648,14 +588,16 @@ final class DesktopAppModel: ObservableObject {
       let output = webEvidence.map(\.output).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.joined(separator: "\n")
       return AgentResult(
         summary: output.isEmpty ? summary : output,
+        receiptIDs: receiptIDs,
         status: .completed,
-        evidence: [AgentEvidence(label: "Web Research", value: sourceCount > 0 ? "已处理 (sourceCount) 个来源。" : "已完成搜索和抓取。", source: "harness receipt")],
+        evidence: [AgentEvidence(label: "Web Research", value: sourceCount > 0 ? "已处理 \(sourceCount) 个来源。" : "已完成搜索和抓取。", source: "harness receipt")],
         verification: ["Web Research receipt 已成功结算。"]
       )
     case .browserVerification:
       let browserOutput = evidence.last(where: { $0.toolID == "browser" })?.output ?? summary
       return AgentResult(
         summary: browserOutput,
+        receiptIDs: receiptIDs,
         status: .completed,
         evidence: [AgentEvidence(label: "Browser Adapter", value: browserOutput, source: "harness receipt")],
         verification: ["Browser Adapter receipt 已成功结算。"]
@@ -664,6 +606,7 @@ final class DesktopAppModel: ObservableObject {
       let computerOutput = evidence.last(where: { $0.toolID.hasPrefix("computer_use.") })?.output ?? summary
       return AgentResult(
         summary: computerOutput,
+        receiptIDs: receiptIDs,
         status: .completed,
         evidence: [AgentEvidence(label: "Computer Use Adapter", value: computerOutput, source: "harness receipt")],
         verification: ["Computer Use Adapter receipt 已成功结算。"]
@@ -674,14 +617,8 @@ final class DesktopAppModel: ObservableObject {
   }
 
   func cancelAgentRun(taskID: AgentTask.ID, runID: UUID) {
-    guard let coordinator = childCoordinators[runID],
-          let childID = state.tasks.first(where: { $0.id == taskID })?.agentRuns.first(where: { $0.id == runID })?.childSessionID else { return }
-    Task { await coordinator.cancel(childID) }
-    updateTask(taskID) { task in
-      guard let index = task.agentRuns.firstIndex(where: { $0.id == runID }) else { return }
-      task.agentRuns[index].state = .cancelled
-      task.agentRuns[index].updatedAt = .now
-    }
+    guard let supervisor = agentGraphSupervisors[taskID] else { return }
+    Task { await supervisor.cancel(runID) }
   }
 
   func refreshExtensions() {
@@ -690,11 +627,11 @@ final class DesktopAppModel: ObservableObject {
 
   func memories(for task: AgentTask? = nil) -> [MemoryRecord] {
     let resolvedTask = task ?? selectedTask
-    let user = memoryStore.records(scope: .user)
-    guard let resolvedTask else { return user }
-    let project = memoryStore.records(scope: .project, scopeKey: resolvedTask.workspacePath)
-    let taskScoped = memoryStore.records(scope: .task, scopeKey: resolvedTask.id.uuidString)
-    return user + project + taskScoped
+    guard let resolvedTask else { return memoryStore.effectiveRecords() }
+    return memoryStore.effectiveRecords(
+      projectKey: resolvedTask.workspacePath,
+      taskKey: resolvedTask.id.uuidString
+    )
   }
 
   func saveMemory(scope: MemoryScope, content: String, for task: AgentTask? = nil) {
@@ -889,7 +826,9 @@ final class DesktopAppModel: ObservableObject {
     guard let selectedTaskID else { return }
     cancelNativeToolApproval(for: selectedTaskID)
     automatedGraphTasks.removeValue(forKey: selectedTaskID)?.cancel()
-    agentRunSchedulers.removeValue(forKey: selectedTaskID)
+    if let supervisor = agentGraphSupervisors[selectedTaskID] {
+      Task { await supervisor.cancelAll() }
+    }
     if let operationID = harnessOperationIDs[selectedTaskID], let harness = harnesses[selectedTaskID] {
       Task { await harness.abort(operationID) }
       harnessOperationIDs.removeValue(forKey: selectedTaskID)
@@ -900,11 +839,6 @@ final class DesktopAppModel: ObservableObject {
     endTaskWorkspaceAccess(for: selectedTaskID)
     updateTask(selectedTaskID) { task in
       task.status = .cancelled
-      task.agentRuns = task.agentRuns.map { run in
-        var run = run
-        if !run.state.isTerminal { run.state = .cancelled; run.updatedAt = .now }
-        return run
-      }
       if let turnID = task.activeTurnID,
          let index = task.turns.firstIndex(where: { $0.id == turnID }) {
         task.turns[index].status = .cancelled
@@ -924,13 +858,16 @@ final class DesktopAppModel: ObservableObject {
     runningProcesses[task.id]?.terminate()
     runningAgentHosts[task.id]?.terminate()
     endTaskWorkspaceAccess(for: task.id)
+    if let supervisor = agentGraphSupervisors[task.id] {
+      Task {
+        let snapshot = await supervisor.snapshot()
+        for run in snapshot.runs where run.state == .running || run.state == .awaitingApproval {
+          await supervisor.pause(run.id)
+        }
+      }
+    }
     updateTask(task.id) { current in
       current.status = .waitingForUser
-      current.agentRuns = current.agentRuns.map { run in
-        var run = run
-        if run.state == .running { run.state = .paused; run.updatedAt = .now }
-        return run
-      }
       if let turnID = current.activeTurnID,
          let index = current.turns.firstIndex(where: { $0.id == turnID }) {
         current.turns[index].status = .paused
@@ -943,6 +880,16 @@ final class DesktopAppModel: ObservableObject {
 
   func resumeSelectedTask() {
     guard let task = selectedTask, task.status == .waitingForUser || task.status == .failed || task.status == .blocked else {
+      return
+    }
+    if let supervisor = agentGraphSupervisors[task.id] {
+      Task { @MainActor [weak self] in
+        let snapshot = await supervisor.snapshot()
+        for run in snapshot.runs where run.state == .paused || run.state == .interrupted {
+          await supervisor.continueRun(run.id)
+        }
+        self?.startAgentGraphDriver(taskID: task.id)
+      }
       return
     }
     if task.status == .waitingForUser,
@@ -2827,6 +2774,95 @@ final class DesktopAppModel: ObservableObject {
     }
   }
 
+  /// Rehydrates the Core-owned Supervisor from persisted AgentRun snapshots.
+  /// Nothing is replayed on launch: running/approval nodes become
+  /// `interrupted`, and execution only resumes after the user explicitly asks
+  /// to continue the task.
+  private func restoreAgentGraphSupervisors() {
+    for task in state.tasks where !task.agentRuns.isEmpty && task.agentRuns.contains(where: { !$0.state.isTerminal }) {
+      let taskID = task.id
+      let sessionID = UUID(uuidString: task.sessionID ?? "") ?? task.id
+      let taskPrompt = task.turns.first(where: { $0.id == task.activeTurnID })?.userMessage ?? task.title
+      let decision = TaskIntentRouter.decide(for: taskPrompt)
+      // Historical migration may have synthesized a default AgentRun graph
+      // for records that predate intent routing. Do not resurrect that graph
+      // for ordinary conversation or direct Web/Browser requests.
+      guard AgentGraphRecoveryPolicy.shouldRestoreGraph(decision: decision, runs: task.agentRuns) else { continue }
+      let contract = TaskContract.make(prompt: taskPrompt, decision: decision, mode: task.mode)
+      let parentSession = SessionRecord(
+        id: sessionID,
+        taskID: taskID,
+        agentID: "supervisor",
+        modelID: task.modelID,
+        status: .interrupted,
+        worktreePath: task.worktreePath
+      )
+      let restoredRuns = task.agentRuns.map { original -> AgentRun in
+        var run = original
+        if run.worktreePath == nil, run.definition.isolation == .worktree {
+          run.worktreePath = task.worktreePath ?? task.workspacePath
+        }
+        return run
+      }
+      let supervisor = AgentGraphSupervisor(
+        parent: parentSession,
+        snapshot: AgentRunSchedulerSnapshot(
+          runs: restoredRuns,
+          maxConcurrent: extensionConfiguration?.maxConcurrentWorkers ?? 8
+        ),
+        prompt: { run in
+          "父任务：\(task.title)\n请继续执行你的阶段：\(run.definition.description)"
+        },
+        onEvent: { [weak self] event in
+          Task { @MainActor [weak self] in
+            self?.consumeAgentGraphEvent(event, taskID: taskID)
+          }
+        },
+        onSessionEvent: { [weak self] event in
+          Task { @MainActor [weak self] in
+            self?.enqueueSessionKernelEvent(event)
+          }
+        },
+        onChildCancellation: { [weak self] _ in
+          Task { @MainActor [weak self] in
+            self?.cancelNativeToolApproval(for: taskID)
+          }
+        },
+        executor: { [weak self] run, session, childPrompt, tools in
+          try await Task { @MainActor [weak self] in
+            guard let self else { throw CancellationError() }
+            guard self.usesNativeHarnessProvider() else {
+              throw NSError(
+                domain: "HarnessChild",
+                code: 401,
+                userInfo: [NSLocalizedDescriptionKey: "Child Agent 缺少 Kimi API 连接；ACP/CLI 子执行已禁用，避免绕过统一 Tool Runtime。"]
+              )
+            }
+            return try await self.executeNativeChildAgent(
+              parentTaskID: taskID,
+              session: session,
+              prompt: childPrompt,
+              tools: tools,
+              agentDefinition: run.definition
+            )
+          }.value
+        }
+      )
+      agentGraphSupervisors[taskID] = supervisor
+      graphContracts[taskID] = contract
+      Task { @MainActor [weak self, supervisor] in
+        let snapshot = await supervisor.snapshot()
+        self?.updateTask(taskID) { current in
+          current.agentRuns = snapshot.runs
+          if current.status == .running || current.status == .planning {
+            current.status = .waitingForUser
+          }
+          current.updatedAt = .now
+        }
+      }
+    }
+  }
+
   private func importLegacyHarnessState(_ legacyState: AppState) {
     let store = harnessEventStore
     Task {
@@ -3245,10 +3281,70 @@ final class DesktopAppModel: ObservableObject {
     let contract = TaskContract.make(prompt: prompt, decision: decision, mode: task.mode)
     let graph = TaskGraphCompiler.compile(taskID: task.id, sessionID: sessionID, contract: contract, model: task.modelID)
     let graphPlan = TaskGraphCompiler.plan(from: graph)
-    let scheduler = AgentRunScheduler(runs: graphPlan.runs, maxConcurrent: self.extensionConfiguration?.maxConcurrentWorkers ?? 8)
-    agentRunSchedulers[task.id] = scheduler
+    let initialWorktreePath = task.worktreePath ?? task.workspacePath
+    let scheduledRuns = graphPlan.runs.map { run in
+      var run = run
+      if run.definition.isolation == .worktree {
+        run.worktreePath = initialWorktreePath
+      }
+      return run
+    }
+    let parentSession = SessionRecord(
+      id: sessionID,
+      taskID: task.id,
+      agentID: "supervisor",
+      modelID: task.modelID,
+      status: .running,
+      worktreePath: task.worktreePath
+    )
+    let taskID = task.id
+    let taskTitle = task.title
+    let supervisor = AgentGraphSupervisor(
+      parent: parentSession,
+      runs: scheduledRuns,
+      maxConcurrent: self.extensionConfiguration?.maxConcurrentWorkers ?? 8,
+      prompt: { run in
+        "父任务：\(taskTitle)\n请执行你的阶段：\(run.definition.description)"
+      },
+      onEvent: { [weak self] event in
+        Task { @MainActor [weak self] in
+          self?.consumeAgentGraphEvent(event, taskID: taskID)
+        }
+      },
+      onSessionEvent: { [weak self] event in
+        Task { @MainActor [weak self] in
+          self?.enqueueSessionKernelEvent(event)
+        }
+      },
+      onChildCancellation: { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.cancelNativeToolApproval(for: taskID)
+        }
+      },
+      executor: { [weak self] run, session, childPrompt, tools in
+        try await Task { @MainActor [weak self] in
+          guard let self else { throw CancellationError() }
+          guard self.usesNativeHarnessProvider() else {
+            throw NSError(
+              domain: "HarnessChild",
+              code: 401,
+              userInfo: [NSLocalizedDescriptionKey: "Child Agent 缺少 Kimi API 连接；ACP/CLI 子执行已禁用，避免绕过统一 Tool Runtime。"]
+            )
+          }
+          return try await self.executeNativeChildAgent(
+            parentTaskID: taskID,
+            session: session,
+            prompt: childPrompt,
+            tools: tools,
+            agentDefinition: run.definition
+          )
+        }.value
+      }
+    )
+    agentGraphSupervisors[task.id] = supervisor
+    graphContracts[task.id] = contract
     updateTask(task.id) { current in
-      current.agentRuns = graphPlan.runs.map { run in
+      current.agentRuns = scheduledRuns.map { run in
         var run = run
         if run.state == .paused || run.state == .interrupted { run.state = .queued }
         return run
@@ -3265,35 +3361,55 @@ final class DesktopAppModel: ObservableObject {
       "graphID": graph.id.uuidString,
       "stages": graph.nodes.map(\.stage.title).joined(separator: " → ")
     ])
+    startAgentGraphDriver(taskID: taskID)
+  }
 
-    let taskID = task.id
-    automatedGraphTasks[taskID] = Task { @MainActor [weak self] in
-      while !Task.isCancelled {
-        guard let self, let current = self.state.tasks.first(where: { $0.id == taskID }) else { break }
-        if current.status == .cancelled || current.status == .waitingForUser { break }
-        guard let scheduler = self.agentRunSchedulers[taskID] else { break }
-        let ready = await scheduler.scheduleReady()
-        for run in ready {
-          self.runAgentRun(taskID: taskID, runID: run.id)
-        }
-
-        let refreshed = self.state.tasks.first(where: { $0.id == taskID })
-        let runs = refreshed?.agentRuns ?? []
-        if !runs.isEmpty && runs.allSatisfy(\.state.isTerminal) {
-          self.finishAutomatedAgentGraph(taskID: taskID, contract: contract)
-          break
-        }
-        let hasActive = runs.contains { $0.state == .running || $0.state == .awaitingApproval }
-        let hasRunnable = runs.contains { $0.state == .queued && Set($0.dependencies).isSubset(of: Set(runs.filter { $0.state == .completed }.map(\.id))) }
-        if !hasActive && !hasRunnable && runs.contains(where: { $0.state == .queued }) {
-          self.updateTask(taskID) { $0.status = .failed; $0.updatedAt = .now }
-          self.appendEvent("阶段依赖未满足，任务已暂停等待处理。", kind: .error, for: taskID)
-          break
-        }
-        try? await Task.sleep(nanoseconds: 120_000_000)
+  /// Projects Core-owned graph snapshots into the persisted task record. The
+  /// event never decides scheduling; it only updates the SwiftUI projection.
+  private func consumeAgentGraphEvent(_ event: AgentGraphSupervisorEvent, taskID: AgentTask.ID) {
+    switch event {
+    case let .schedulerSnapshot(snapshot):
+      updateTask(taskID) { current in
+        current.agentRuns = snapshot.runs
+        current.updatedAt = .now
       }
-      self?.automatedGraphTasks.removeValue(forKey: taskID)
-      self?.agentRunSchedulers.removeValue(forKey: taskID)
+      schedulePersistence()
+    case let .childSessionCreated(runID, session):
+      guard let run = state.tasks.first(where: { $0.id == taskID })?.agentRuns.first(where: { $0.id == runID }) else { return }
+      appendEvent(
+        "Child Agent \(run.definition.kind.title) 已启动。",
+        kind: .toolStarted,
+        for: taskID,
+        payload: ["runID": runID.uuidString, "childSessionID": session.id.uuidString]
+      )
+    case .graphFinished:
+      break
+    }
+  }
+
+  /// Starts one Core-owned drive pass. There is no UI timer or manual
+  /// scheduleReady polling: the Supervisor releases dependent nodes itself.
+  private func startAgentGraphDriver(taskID: AgentTask.ID) {
+    guard automatedGraphTasks[taskID] == nil,
+          let supervisor = agentGraphSupervisors[taskID],
+          let contract = graphContracts[taskID] else { return }
+    automatedGraphTasks[taskID] = Task { @MainActor [weak self] in
+      defer { self?.automatedGraphTasks.removeValue(forKey: taskID) }
+      do {
+        let runs = try await supervisor.run()
+        guard let self else { return }
+        self.updateTask(taskID) { current in
+          current.agentRuns = runs
+          current.updatedAt = .now
+        }
+        self.finishAutomatedAgentGraph(taskID: taskID, contract: contract)
+      } catch is CancellationError {
+        // User cancellation is already reflected by the Supervisor snapshot.
+      } catch {
+        guard let self else { return }
+        self.updateTask(taskID) { $0.status = .failed; $0.updatedAt = .now }
+        self.appendEvent("Agent Graph 失败：\(error.localizedDescription)", kind: .error, for: taskID)
+      }
     }
   }
 
@@ -3635,23 +3751,41 @@ final class DesktopAppModel: ObservableObject {
     }
     let taskContract = TaskContract.make(prompt: context.prompt.text, decision: intentDecision, mode: task.mode)
     let taskBudget = TaskBudget.standard
+    let accumulatedCost = usageLedger.totalCost(operationID: context.operationID)
+    switch CostBudgetGate.decision(spent: accumulatedCost, budget: taskBudget.maxCost) {
+    case .exceeded:
+      throw NSError(
+        domain: "HarnessBudget",
+        code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "当前任务已超过成本预算；请提高预算或继续使用更低成本模型。"]
+      )
+    case .warning:
+      appendEvent("当前任务已使用超过 80% 的模型预算。", kind: .toolProgress, for: taskID, payload: ["budget": "warning"])
+    case .allowed:
+      break
+    }
     let modelRoute = ModelRouter.route(
       intent: intentDecision.intent,
       promptLength: context.prompt.text.count,
       budget: taskBudget
     )
     let usageStage = intentDecision.recommendedAgents.last ?? (task.mode.isReadOnly ? .explore : .implement)
+    let memoryRules = memories(for: task).map { "[\($0.scope.rawValue)] \($0.content)" }
+    let verifiedContext = task.verificationResult?.steps.filter(\.passed).map { step in
+      "\(step.kind.rawValue) 通过"
+    } ?? []
+    let unresolvedContext = task.agentRuns.compactMap { run -> String? in
+      guard !run.state.isTerminal else { return nil }
+      return "\(run.definition.kind.title)：\(run.errorMessage ?? "尚未完成")"
+    }
     let contextProjection = ContextProjector.project(
       turns: task.turns.filter { $0.id != turnID },
-      contract: taskContract
+      contract: taskContract,
+      rules: memoryRules,
+      verifiedResults: verifiedContext,
+      unresolved: unresolvedContext
     )
-    let memoryContext = memories(for: task)
-      .map { "[\($0.scope.rawValue)] \($0.content)" }
-      .joined(separator: "\n")
-    let effectiveConversationContext = [
-      memoryContext.isEmpty ? nil : "已确认记忆：\n\(memoryContext)",
-      contextProjection.promptText
-    ].compactMap { $0 }.joined(separator: "\n\n")
+    let effectiveConversationContext = contextProjection.promptText
     appendEvent(
       "策略已选择：\(intentDecision.intent.rawValue)。",
       kind: .taskPlanned,
@@ -3716,7 +3850,7 @@ final class DesktopAppModel: ObservableObject {
     let computerUseHandler: NativeHarnessToolRuntime.SpecializedToolHandler = { request in
       try await ComputerUseController.executeHarnessRequest(request)
     }
-    let mcpExecutor = extensionRuntime.map(MCPHarnessToolExecutor.init(runtime:))
+    let mcpExecutor = extensionRuntime.map { MCPHarnessToolExecutor(runtime: $0, workerSupervisor: self.mcpWorkerSupervisor) }
     let mcpHandler: NativeHarnessToolRuntime.SpecializedToolHandler?
     if let mcpExecutor {
       mcpHandler = { request in try await mcpExecutor.execute(request) }
@@ -3798,7 +3932,8 @@ final class DesktopAppModel: ObservableObject {
       baseURL: baseURL,
       apiKey: apiKey,
       modelID: modelID,
-      maximumOutputTokens: modelRoute.maximumOutputTokens
+      maximumOutputTokens: modelRoute.maximumOutputTokens,
+      traceRecorder: providerTraceRecorder
     )
     let providerStartedAt = Date()
     let loop = HarnessConversationLoop(
@@ -3864,17 +3999,29 @@ final class DesktopAppModel: ObservableObject {
         request: HarnessConversationRequest(modelID: modelID, messages: [.user(taskPrompt)]),
         tools: await registry.all()
       )
+      let reportedUsage = result.usage ?? HarnessModelUsage(
+        inputTokens: max(1, taskPrompt.count / 3),
+        outputTokens: max(0, result.text.count / 3)
+      )
+      let pricedUsage = ModelPriceCatalog.cost(
+        provider: "kimi",
+        model: modelID,
+        inputTokens: reportedUsage.inputTokens,
+        outputTokens: reportedUsage.outputTokens,
+        cachedTokens: reportedUsage.cachedTokens
+      )
       try? usageLedger.append(UsageLedgerEntry(
         operationID: context.operationID,
         stage: usageStage,
         provider: "kimi",
         model: modelID,
-        inputTokens: max(1, taskPrompt.count / 3),
-        outputTokens: max(0, result.text.count / 3),
-        cachedTokens: 0,
+        inputTokens: reportedUsage.inputTokens,
+        outputTokens: reportedUsage.outputTokens,
+        cachedTokens: reportedUsage.cachedTokens,
         latencyMS: Int(Date().timeIntervalSince(providerStartedAt) * 1_000),
-        estimatedCost: 0,
-        qualityScore: nil
+        estimatedCost: pricedUsage.value,
+        qualityScore: nil,
+        pricingStatus: pricedUsage.status
       ))
       appendNativeAssistantReply(result.text, taskID: taskID, turnID: turnID)
       await emit(.assistantText(result.text))

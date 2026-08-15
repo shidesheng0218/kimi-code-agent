@@ -29,6 +29,10 @@ public actor ChildSessionCoordinator {
   private var cancelledIDs: Set<UUID> = []
   private var pausedIDs: Set<UUID> = []
   private var eventSequences: [UUID: Int64] = [:]
+  /// The coordinator owns the task boundary around every Child executor. A
+  /// state change alone is not cancellation: keeping this handle lets pause
+  /// and cancel propagate immediately into a streaming provider or tool loop.
+  private var executionTasks: [UUID: Task<AgentResult, Error>] = [:]
 
   public init(
     onEvent: @escaping @Sendable (RuntimeEvent) -> Void = { _ in },
@@ -80,7 +84,12 @@ public actor ChildSessionCoordinator {
     emit(.sessionResumed, session: session)
 
     do {
-      let result = try await executor(session, prompt, tools)
+      let executionTask = Task.detached(priority: nil) { [executor, session, prompt, tools] in
+        try await executor(session, prompt, tools)
+      }
+      executionTasks[sessionID] = executionTask
+      defer { executionTasks.removeValue(forKey: sessionID) }
+      let result = try await executionTask.value
       if pausedIDs.contains(sessionID) {
         session.status = .paused
         session.updatedAt = .now
@@ -127,6 +136,7 @@ public actor ChildSessionCoordinator {
   public func pause(_ sessionID: UUID) {
     guard var session = sessions[sessionID], session.status == .running else { return }
     pausedIDs.insert(sessionID)
+    executionTasks[sessionID]?.cancel()
     onCancel(sessionID)
     session.status = .paused
     session.updatedAt = .now
@@ -147,6 +157,7 @@ public actor ChildSessionCoordinator {
   public func cancel(_ sessionID: UUID) {
     cancelledIDs.insert(sessionID)
     pausedIDs.remove(sessionID)
+    executionTasks[sessionID]?.cancel()
     onCancel(sessionID)
     guard var session = sessions[sessionID], !session.status.isTerminal else { return }
     session.status = .cancelled

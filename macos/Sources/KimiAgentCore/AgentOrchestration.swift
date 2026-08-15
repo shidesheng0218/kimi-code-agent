@@ -123,6 +123,7 @@ public struct AgentEvidence: Codable, Equatable, Sendable {
 public struct AgentResult: Codable, Equatable, Sendable {
   public let summary: String
   public let artifactIDs: [String]
+  public let receiptIDs: [UUID]
   public let nextActions: [String]
   public let status: AgentResultStatus
   public let evidence: [AgentEvidence]
@@ -132,6 +133,7 @@ public struct AgentResult: Codable, Equatable, Sendable {
   public init(
     summary: String,
     artifactIDs: [String] = [],
+    receiptIDs: [UUID] = [],
     nextActions: [String] = [],
     status: AgentResultStatus = .completed,
     evidence: [AgentEvidence] = [],
@@ -140,6 +142,7 @@ public struct AgentResult: Codable, Equatable, Sendable {
   ) {
     self.summary = summary
     self.artifactIDs = artifactIDs
+    self.receiptIDs = receiptIDs
     self.nextActions = nextActions
     self.status = status
     self.evidence = evidence
@@ -148,7 +151,7 @@ public struct AgentResult: Codable, Equatable, Sendable {
   }
 
   private enum CodingKeys: String, CodingKey {
-    case summary, artifactIDs, nextActions, status, evidence, verification, confidence
+    case summary, artifactIDs, receiptIDs, nextActions, status, evidence, verification, confidence
   }
 
   public init(from decoder: Decoder) throws {
@@ -156,6 +159,7 @@ public struct AgentResult: Codable, Equatable, Sendable {
     self.init(
       summary: try container.decode(String.self, forKey: .summary),
       artifactIDs: try container.decodeIfPresent([String].self, forKey: .artifactIDs) ?? [],
+      receiptIDs: try container.decodeIfPresent([UUID].self, forKey: .receiptIDs) ?? [],
       nextActions: try container.decodeIfPresent([String].self, forKey: .nextActions) ?? [],
       status: try container.decodeIfPresent(AgentResultStatus.self, forKey: .status) ?? .completed,
       evidence: try container.decodeIfPresent([AgentEvidence].self, forKey: .evidence) ?? [],
