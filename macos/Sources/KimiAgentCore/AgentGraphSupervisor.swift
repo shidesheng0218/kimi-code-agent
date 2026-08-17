@@ -5,6 +5,7 @@ import Foundation
 public enum AgentGraphSupervisorEvent: Sendable {
   case schedulerSnapshot(AgentRunSchedulerSnapshot)
   case childSessionCreated(runID: UUID, session: SessionRecord)
+  case handoffPrepared(runID: UUID, handoffs: [AgentHandoff])
   case graphFinished(AgentRunSchedulerSnapshot)
 }
 
@@ -38,6 +39,7 @@ public actor AgentGraphSupervisor {
   private let scheduler: AgentRunScheduler
   private var coordinators: [UUID: ChildSessionCoordinator] = [:]
   private var childSessionIDs: [UUID: UUID] = [:]
+  private var handoffsByRunID: [UUID: [AgentHandoff]] = [:]
   private var isDriving = false
 
   public init(
@@ -104,6 +106,13 @@ public actor AgentGraphSupervisor {
     await scheduler.snapshotRecord()
   }
 
+  /// Returns the durable upstream results prepared for each dependent Child
+  /// Session.  The Kernel uses this when settling a graph so a late UI event
+  /// can never make an already-completed graph lose its handoff record.
+  public func handoffs() -> [UUID: [AgentHandoff]] {
+    handoffsByRunID
+  }
+
   public func pause(_ runID: UUID) async {
     await scheduler.pause(runID)
     if let coordinator = coordinators[runID], let sessionID = childSessionIDs[runID] {
@@ -149,6 +158,20 @@ public actor AgentGraphSupervisor {
       return try await coordinator.run(sessionID)
     }
 
+    let upstreamRuns = await scheduler.snapshot().filter { run.dependencies.contains($0.id) && $0.state == .completed }
+    let handoffs = upstreamRuns.compactMap { upstream -> AgentHandoff? in
+      guard let result = upstream.result else { return nil }
+      return AgentHandoff(sourceRunID: upstream.id, targetRunID: run.id, result: result)
+    }
+    handoffsByRunID[run.id] = handoffs
+    if !handoffs.isEmpty { onEvent(.handoffPrepared(runID: run.id, handoffs: handoffs)) }
+    let resolvedPrompt: String
+    if handoffs.isEmpty {
+      resolvedPrompt = promptBuilder(run)
+    } else {
+      resolvedPrompt = promptBuilder(run) + "\n\n" + handoffs.map(\.promptSection).joined(separator: "\n\n")
+    }
+
     let coordinator = ChildSessionCoordinator(
       onEvent: onSessionEvent,
       onCancel: onChildCancellation,
@@ -161,7 +184,7 @@ public actor AgentGraphSupervisor {
       parent: parent,
       taskID: run.taskID,
       definition: run.definition,
-      prompt: promptBuilder(run),
+      prompt: resolvedPrompt,
       worktreePath: run.worktreePath
     )
     childSessionIDs[run.id] = session.id

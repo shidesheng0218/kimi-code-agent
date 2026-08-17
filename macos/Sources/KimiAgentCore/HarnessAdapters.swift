@@ -51,14 +51,40 @@ public struct HarnessProviderContext: Sendable {
   public let operationID: OperationID
   public let lane: LaneID
   public let modelID: String
-  public let messages: [String]
+  /// Provider context preserves roles and tool-call linkage. Flattening this
+  /// to strings turns system, assistant and tool facts into user prose.
+  public let messages: [HarnessChatMessage]
 
-  public init(sessionID: UUID, operationID: OperationID, lane: LaneID, modelID: String, messages: [String]) {
+  public init(
+    sessionID: UUID,
+    operationID: OperationID,
+    lane: LaneID,
+    modelID: String,
+    messages: [HarnessChatMessage]
+  ) {
     self.sessionID = sessionID
     self.operationID = operationID
     self.lane = lane
     self.modelID = modelID
     self.messages = messages
+  }
+
+  /// Compatibility import boundary for older adapters. New execution paths
+  /// must use the typed initializer above.
+  public init(
+    sessionID: UUID,
+    operationID: OperationID,
+    lane: LaneID,
+    modelID: String,
+    messages: [String]
+  ) {
+    self.init(
+      sessionID: sessionID,
+      operationID: operationID,
+      lane: lane,
+      modelID: modelID,
+      messages: messages.map(HarnessChatMessage.user)
+    )
   }
 }
 
@@ -208,9 +234,11 @@ public final class KimiHTTPModelProvider: HarnessModelProvider, HarnessConversat
     tools: [ToolDefinition],
     signal: AsyncStream<Void>?
   ) async throws -> AsyncThrowingStream<HarnessModelEvent, Error> {
-    let requestMessages = context.messages.map { HarnessChatMessage.user($0) }
     let conversationStream = try await stream(
-      request: HarnessConversationRequest(modelID: modelID, messages: requestMessages),
+      request: HarnessConversationRequest(
+        modelID: context.modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? modelID : context.modelID,
+        messages: context.messages
+      ),
       tools: tools,
       signal: signal
     )

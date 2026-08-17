@@ -492,6 +492,86 @@ public final class ProjectExtensionRuntime: @unchecked Sendable {
     return try client.listTools()
   }
 
+  public func listMCPResources(serverID: UUID) throws -> [MCPResource] {
+    let configuration = try loadConfiguration()
+    guard let server = configuration.mcpServers.first(where: { $0.id == serverID }), server.isEnabled else {
+      return []
+    }
+
+    switch server.transport {
+    case .stdio:
+      let client = try connectOrCreateClient(server)
+      let initialize = try client.initialize()
+      guard initialize.capabilities.resources else { return [] }
+      return try client.listResources()
+    case .http:
+      let client = try connectOrCreateHTTPClient(server, allowedDomains: configuration.allowedDomains)
+      let initialize = try client.initialize()
+      guard initialize.capabilities.resources else { return [] }
+      return try client.listResources()
+    }
+  }
+
+  public func listMCPPrompts(serverID: UUID) throws -> [MCPPrompt] {
+    let configuration = try loadConfiguration()
+    guard let server = configuration.mcpServers.first(where: { $0.id == serverID }), server.isEnabled else {
+      return []
+    }
+
+    switch server.transport {
+    case .stdio:
+      let client = try connectOrCreateClient(server)
+      let initialize = try client.initialize()
+      guard initialize.capabilities.prompts else { return [] }
+      return try client.listPrompts()
+    case .http:
+      let client = try connectOrCreateHTTPClient(server, allowedDomains: configuration.allowedDomains)
+      let initialize = try client.initialize()
+      guard initialize.capabilities.prompts else { return [] }
+      return try client.listPrompts()
+    }
+  }
+
+  public func readMCPResource(serverID: UUID, uri: String) throws -> [MCPResourceContent] {
+    let configuration = try loadConfiguration()
+    guard let server = configuration.mcpServers.first(where: { $0.id == serverID }), server.isEnabled else {
+      throw MCPClientError.notConnected
+    }
+
+    switch server.transport {
+    case .stdio:
+      let client = try connectOrCreateClient(server)
+      _ = try client.initialize()
+      return try client.readResource(uri: uri)
+    case .http:
+      let client = try connectOrCreateHTTPClient(server, allowedDomains: configuration.allowedDomains)
+      _ = try client.initialize()
+      return try client.readResource(uri: uri)
+    }
+  }
+
+  public func getMCPPrompt(
+    serverID: UUID,
+    name: String,
+    arguments: [String: String] = [:]
+  ) throws -> MCPPromptResult {
+    let configuration = try loadConfiguration()
+    guard let server = configuration.mcpServers.first(where: { $0.id == serverID }), server.isEnabled else {
+      throw MCPClientError.notConnected
+    }
+
+    switch server.transport {
+    case .stdio:
+      let client = try connectOrCreateClient(server)
+      _ = try client.initialize()
+      return try client.getPrompt(name: name, arguments: arguments)
+    case .http:
+      let client = try connectOrCreateHTTPClient(server, allowedDomains: configuration.allowedDomains)
+      _ = try client.initialize()
+      return try client.getPrompt(name: name, arguments: arguments)
+    }
+  }
+
   public func callMCPTool(serverID: UUID, name: String, arguments: [String: String]) throws -> MCPToolCallResult {
     let configuration = try loadConfiguration()
     guard let server = configuration.mcpServers.first(where: { $0.id == serverID }), server.isEnabled else {

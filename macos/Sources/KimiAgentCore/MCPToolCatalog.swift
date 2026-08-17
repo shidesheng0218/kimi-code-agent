@@ -129,17 +129,28 @@ public struct MCPWorkerHealth: Codable, Equatable, Sendable {
 public actor MCPWorkerSupervisor {
   private var healthByServer: [String: MCPWorkerHealth] = [:]
   private let maxRestarts: Int
+  private let stateFileURL: URL?
 
-  public init(maxRestarts: Int = 5) { self.maxRestarts = max(0, maxRestarts) }
+  public init(maxRestarts: Int = 5, stateFileURL: URL? = nil) {
+    self.maxRestarts = max(0, maxRestarts)
+    self.stateFileURL = stateFileURL
+    if let stateFileURL,
+       let data = try? Data(contentsOf: stateFileURL),
+       let values = try? JSONDecoder().decode([MCPWorkerHealth].self, from: data) {
+      self.healthByServer = Dictionary(uniqueKeysWithValues: values.map { ($0.serverID, $0) })
+    }
+  }
 
   public func markStarting(serverID: String) {
     healthByServer[serverID] = MCPWorkerHealth(serverID: serverID, status: .starting)
+    persistHealth()
   }
 
   public func markHealthy(serverID: String) {
     var health = healthByServer[serverID] ?? MCPWorkerHealth(serverID: serverID)
     health.status = .healthy; health.lastError = nil; health.updatedAt = .now
     healthByServer[serverID] = health
+    persistHealth()
   }
 
   public func markFailure(serverID: String, message: String) -> Bool {
@@ -149,11 +160,13 @@ public actor MCPWorkerSupervisor {
     guard health.restartCount < maxRestarts else {
       health.status = .unavailable
       healthByServer[serverID] = health
+      persistHealth()
       return false
     }
     health.restartCount += 1
     health.status = .reconnecting
     healthByServer[serverID] = health
+    persistHealth()
     return true
   }
 
@@ -161,5 +174,12 @@ public actor MCPWorkerSupervisor {
 
   public func snapshot() -> [MCPWorkerHealth] {
     healthByServer.values.sorted { $0.serverID < $1.serverID }
+  }
+
+  private func persistHealth() {
+    guard let stateFileURL,
+          let data = try? JSONEncoder().encode(healthByServer.values.sorted { $0.serverID < $1.serverID }) else { return }
+    try? FileManager.default.createDirectory(at: stateFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? data.write(to: stateFileURL, options: .atomic)
   }
 }

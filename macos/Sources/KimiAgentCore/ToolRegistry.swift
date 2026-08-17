@@ -721,6 +721,8 @@ public actor ToolExecutionCoordinator {
 
   private let registry: ToolRegistry
   private let permissionResolver: any ToolPermissionResolver
+  private let permissionGate: (any HarnessPermissionGate)?
+  private let permissionContext: HarnessPermissionContext?
   private let approvalHandler: ApprovalHandler?
   private let hookResolver: HookResolver?
   private let journal: ToolEffectJournal?
@@ -729,6 +731,8 @@ public actor ToolExecutionCoordinator {
   public init(
     registry: ToolRegistry,
     permissionResolver: any ToolPermissionResolver,
+    permissionGate: (any HarnessPermissionGate)? = nil,
+    permissionContext: HarnessPermissionContext? = nil,
     approvalHandler: ApprovalHandler? = nil,
     hookResolver: HookResolver? = nil,
     journal: ToolEffectJournal? = nil,
@@ -736,6 +740,8 @@ public actor ToolExecutionCoordinator {
   ) {
     self.registry = registry
     self.permissionResolver = permissionResolver
+    self.permissionGate = permissionGate
+    self.permissionContext = permissionContext
     self.approvalHandler = approvalHandler
     self.hookResolver = hookResolver
     self.journal = journal
@@ -743,6 +749,17 @@ public actor ToolExecutionCoordinator {
   }
 
   public func execute(_ request: ToolExecutionRequest) async throws -> ToolExecutionResult {
+    try await execute(request, remainingHookRetries: 1)
+  }
+
+  /// A hook may request one re-evaluation when an external precondition is
+  /// transient (for example a just-restarted Worker). The retry is bounded and
+  /// happens before permission, intent, or executor boundaries, so it cannot
+  /// replay an effect that may already have started.
+  private func execute(
+    _ request: ToolExecutionRequest,
+    remainingHookRetries: Int
+  ) async throws -> ToolExecutionResult {
     guard let definition = await registry.definition(id: request.toolID) else {
       throw ToolExecutionError.unknownTool(request.toolID)
     }
@@ -755,9 +772,25 @@ public actor ToolExecutionCoordinator {
     }
 
     var effectiveRequest = request
+    var hookRequiresApproval = false
     if let hookResolver,
        let resolution = await hookResolver(HarnessHookRequest(event: .beforeTool, toolID: request.toolID, arguments: request.input)) {
-      guard resolution.isAllowed else {
+      if resolution.action == .skip {
+        return ToolExecutionResult(
+          output: "工具已跳过。" + (resolution.denialReason.map { " 原因：" + $0 } ?? ""),
+          metadata: ["hookAction": "skip", "hookIDs": resolution.auditHookIDs.map(\.uuidString).joined(separator: ",")]
+        )
+      }
+      if resolution.action == .retry {
+        guard remainingHookRetries > 0 else {
+          throw ToolExecutionError.denied(resolution.denialReason ?? "Hook 重试次数已用尽。")
+        }
+        return try await execute(request, remainingHookRetries: remainingHookRetries - 1)
+      }
+      if resolution.action == .askUser {
+        hookRequiresApproval = true
+      }
+      guard resolution.isAllowed || hookRequiresApproval else {
         throw ToolExecutionError.denied(resolution.denialReason ?? request.toolID)
       }
       effectiveRequest = ToolExecutionRequest(
@@ -783,7 +816,18 @@ public actor ToolExecutionCoordinator {
       )
     }
 
-    let initialDecision = await permissionResolver.resolve(request: effectiveRequest, definition: definition)
+    let initialDecision: PermissionDecision
+    if hookRequiresApproval {
+      initialDecision = .ask
+    } else if let permissionGate, let permissionContext {
+      initialDecision = await permissionGate.evaluate(
+        request: effectiveRequest,
+        tool: definition,
+        context: permissionContext
+      )
+    } else {
+      initialDecision = await permissionResolver.resolve(request: effectiveRequest, definition: definition)
+    }
     let finalDecision: PermissionDecision
     switch initialDecision {
     case .deny:

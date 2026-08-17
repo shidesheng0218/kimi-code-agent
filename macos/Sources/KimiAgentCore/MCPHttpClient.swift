@@ -37,7 +37,7 @@ public final class MCPHttpClient: @unchecked Sendable {
     let response = try request(method: "initialize", params: [
       "protocolVersion": "2024-11-05",
       "clientInfo": ["name": "KimiAgentDesktop", "version": "0.3.0"],
-      "capabilities": ["tools": [:]]
+      "capabilities": ["tools": [:], "resources": [:], "prompts": [:], "elicitation": [:]]
     ])
     let protocolVersion = response["protocolVersion"] as? String ?? "2024-11-05"
     guard let serverInfo = response["serverInfo"] as? [String: Any],
@@ -48,7 +48,8 @@ public final class MCPHttpClient: @unchecked Sendable {
     _ = try? request(method: "notifications/initialized", params: [:], expectResult: false)
     let result = MCPInitializeResult(
       protocolVersion: protocolVersion,
-      serverInfo: MCPServerInfo(name: name, version: version)
+      serverInfo: MCPServerInfo(name: name, version: version),
+      capabilities: MCPCapabilities(raw: response["capabilities"] as? [String: Any] ?? [:])
     )
     initializeResult = result
     return result
@@ -65,6 +66,73 @@ public final class MCPHttpClient: @unchecked Sendable {
       let inputSchema = tool["inputSchema"].flatMap { Self.jsonString($0) } ?? "{}"
       return MCPTool(name: name, description: description, inputSchemaJSON: inputSchema)
     }
+  }
+
+  public func listResources() throws -> [MCPResource] {
+    let response = try request(method: "resources/list", params: [:])
+    guard let resources = response["resources"] as? [[String: Any]] else {
+      throw MCPClientError.malformedResponse
+    }
+    return resources.compactMap { resource in
+      guard let uri = resource["uri"] as? String,
+            let name = resource["name"] as? String else { return nil }
+      return MCPResource(
+        uri: uri,
+        name: name,
+        description: resource["description"] as? String,
+        mimeType: resource["mimeType"] as? String
+      )
+    }
+  }
+
+  public func listPrompts() throws -> [MCPPrompt] {
+    let response = try request(method: "prompts/list", params: [:])
+    guard let prompts = response["prompts"] as? [[String: Any]] else {
+      throw MCPClientError.malformedResponse
+    }
+    return prompts.compactMap { prompt in
+      guard let name = prompt["name"] as? String else { return nil }
+      let arguments = (prompt["arguments"] as? [[String: Any]] ?? []).compactMap { argument -> MCPPromptArgument? in
+        guard let argumentName = argument["name"] as? String else { return nil }
+        return MCPPromptArgument(
+          name: argumentName,
+          description: argument["description"] as? String,
+          required: argument["required"] as? Bool ?? false
+        )
+      }
+      return MCPPrompt(
+        name: name,
+        description: prompt["description"] as? String,
+        arguments: arguments
+      )
+    }
+  }
+
+  public func readResource(uri: String) throws -> [MCPResourceContent] {
+    let response = try request(method: "resources/read", params: ["uri": uri])
+    guard let contents = response["contents"] as? [[String: Any]] else {
+      throw MCPClientError.malformedResponse
+    }
+    return contents.compactMap { content in
+      guard let contentURI = content["uri"] as? String else { return nil }
+      return MCPResourceContent(
+        uri: contentURI,
+        mimeType: content["mimeType"] as? String,
+        text: content["text"] as? String,
+        blob: content["blob"] as? String
+      )
+    }
+  }
+
+  public func getPrompt(name: String, arguments: [String: String] = [:]) throws -> MCPPromptResult {
+    let response = try request(method: "prompts/get", params: ["name": name, "arguments": arguments])
+    let messages = (response["messages"] as? [[String: Any]] ?? []).compactMap { message -> MCPPromptMessage? in
+      guard let role = message["role"] as? String,
+            let content = message["content"] as? [String: Any],
+            let text = content["text"] as? String else { return nil }
+      return MCPPromptMessage(role: role, text: text)
+    }
+    return MCPPromptResult(description: response["description"] as? String, messages: messages)
   }
 
   public func callTool(name: String, arguments: [String: String]) throws -> MCPToolCallResult {

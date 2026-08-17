@@ -75,8 +75,8 @@ final class DesktopAppModel: ObservableObject {
   private let memoryStore: MemoryStore
   private let providerTraceRecorder: ProviderTraceRecorder
   private let mcpToolCatalog = MCPToolCatalog()
-  private let mcpWorkerSupervisor = MCPWorkerSupervisor()
-  private let pluginWorkerSupervisor = PluginWorkerSupervisor()
+  private let mcpWorkerSupervisor: MCPWorkerSupervisor
+  private let pluginWorkerSupervisor: PluginWorkerSupervisor
   private var extensionRuntime: ProjectExtensionRuntime?
   private var extensionRuntimeWorkspacePath: String?
   private var pendingAutomaticTaskID: AgentTask.ID?
@@ -87,8 +87,6 @@ final class DesktopAppModel: ObservableObject {
   private var taskWorkspaceAccessTokens: [AgentTask.ID: WorkspaceAccessToken] = [:]
   private var runningProcesses: [AgentTask.ID: KimiProcessHandle] = [:]
   private var runningAgentHosts: [AgentTask.ID: KimiAgentHostHandle] = [:]
-  private var automatedGraphTasks: [AgentTask.ID: Task<Void, Never>] = [:]
-  private var agentGraphSupervisors: [AgentTask.ID: AgentGraphSupervisor] = [:]
   private var graphContracts: [AgentTask.ID: TaskContract] = [:]
   private var runningTerminalCommands: [UUID: TerminalCommandHandle] = [:]
   private var runningTerminalSessionIDs: [UUID: UUID] = [:]
@@ -114,14 +112,23 @@ final class DesktopAppModel: ObservableObject {
   private var persistenceRevision = 0
   private let maximumPersistedEvents = 1_000
   private let terminalQueueScheduler = TerminalQueueScheduler(maxConcurrent: 4)
-  private var harnesses: [AgentTask.ID: AgentHarness] = [:]
-  private var harnessOperationIDs: [AgentTask.ID: OperationID] = [:]
-  private var harnessEventTasks: [AgentTask.ID: Task<Void, Never>] = [:]
+  /// All task execution is routed through one Core-owned Kernel per persisted
+  /// session. The View Model retains only projection subscriptions and the
+  /// operation ID needed to forward user commands.
+  private var agentKernels: [AgentTask.ID: AgentKernel] = [:]
+  private var agentKernelOperationIDs: [AgentTask.ID: OperationID] = [:]
+  private var agentKernelEventTasks: [AgentTask.ID: Task<Void, Never>] = [:]
   private var nativeToolApprovalContinuations: [String: CheckedContinuation<PermissionDecision, Never>] = [:]
 
   init() {
     let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("Kimi Agent Desktop", isDirectory: true)
+    mcpWorkerSupervisor = MCPWorkerSupervisor(
+      stateFileURL: applicationSupport.appendingPathComponent("harness-v3/workers/mcp-status.json")
+    )
+    pluginWorkerSupervisor = PluginWorkerSupervisor(
+      stateFileURL: applicationSupport.appendingPathComponent("harness-v3/workers/plugin-status.json")
+    )
     let stateURL = applicationSupport.appendingPathComponent("state.json")
     let sessionEventsURL = applicationSupport.appendingPathComponent("session-events.jsonl")
     let harnessEventsURL = applicationSupport.appendingPathComponent("harness-v2/events.jsonl")
@@ -190,9 +197,7 @@ final class DesktopAppModel: ObservableObject {
     terminalPTYWaitTasks.values.forEach { $0.cancel() }
     terminalReconnectTasks.values.forEach { $0.cancel() }
     terminalTimeoutTasks.values.forEach { $0.cancel() }
-    harnessEventTasks.values.forEach { $0.cancel() }
-    automatedGraphTasks.values.forEach { $0.cancel() }
-    agentGraphSupervisors.removeAll()
+    agentKernelEventTasks.values.forEach { $0.cancel() }
     graphContracts.removeAll()
   }
 
@@ -422,21 +427,21 @@ final class DesktopAppModel: ObservableObject {
   /// Core-owned graph supervisor chooses the node and owns its Child Session;
   /// this View Model only forwards the user's explicit resume/retry command.
   func runAgentRun(taskID: AgentTask.ID, runID: UUID) {
-    guard let supervisor = agentGraphSupervisors[taskID] else { return }
     Task { @MainActor [weak self] in
-      let snapshot = await supervisor.snapshot()
-      guard let run = snapshot.runs.first(where: { $0.id == runID }) else { return }
+      guard let kernel = self?.agentKernels[taskID],
+            let operationID = self?.agentKernelOperationIDs[taskID] else { return }
+      let snapshot = await kernel.snapshot()
+      guard let graph = snapshot.graphSnapshots[operationID],
+            let run = graph.runs.first(where: { $0.id == runID }) else { return }
       switch run.state {
-      case .paused, .interrupted:
-        await supervisor.continueRun(runID)
+      case .paused, .interrupted, .queued:
+        await kernel.continueGraph(operationID, runID: runID)
       case .failed:
-        await supervisor.retry(runID)
-      case .queued:
-        break
+        await kernel.retryGraph(operationID, runID: runID)
       case .running, .awaitingApproval, .completed, .cancelled:
         return
       }
-      self?.startAgentGraphDriver(taskID: taskID)
+      self?.appendEvent("已继续 Child Agent 阶段。", kind: .toolProgress, for: taskID)
     }
   }
 
@@ -522,9 +527,21 @@ final class DesktopAppModel: ObservableObject {
       }
     }
     let journal = ToolEffectJournal(store: harnessEventStore, sessionID: session.id, lane: .main)
+    let childPermissionResolver = ChildAgentToolPermissionResolver(definition: agentDefinition)
+    let childPermissionGate = LayeredHarnessPermissionGate(fallback: childPermissionResolver)
+    let childPermissionContext = HarnessPermissionContext(
+      taskID: parentTaskID,
+      sessionID: session.id,
+      parentSessionID: parent.id,
+      worktreePath: workspaceURL.path,
+      allowedToolIDs: Set(tools.map(\.id)),
+      allowPublicWebRead: agentDefinition.kind == .webResearch
+    )
     let coordinator = ToolExecutionCoordinator(
       registry: registry,
-      permissionResolver: ChildAgentToolPermissionResolver(definition: agentDefinition),
+      permissionResolver: childPermissionResolver,
+      permissionGate: childPermissionGate,
+      permissionContext: childPermissionContext,
       approvalHandler: { [weak self] request, definition in
         guard let self else { return .deny }
         return await self.requestNativeToolApproval(request: request, definition: definition, workspacePath: workspaceURL.path)
@@ -534,13 +551,14 @@ final class DesktopAppModel: ObservableObject {
       },
       journal: journal
     )
-    let provider = KimiHTTPModelProvider(
+    let baseProvider = KimiHTTPModelProvider(
       baseURL: baseURL,
       apiKey: apiKey,
       modelID: modelID,
       maximumOutputTokens: modelRoute.maximumOutputTokens,
       traceRecorder: providerTraceRecorder
     )
+    let provider = RetryingHarnessConversationProvider(base: baseProvider, maxAttempts: 2)
     let evidenceStore = ChildToolEvidenceStore()
     let loop = HarnessConversationLoop(provider: provider, maxRounds: 8) { call, _ in
       let request = ToolExecutionRequest(
@@ -617,8 +635,8 @@ final class DesktopAppModel: ObservableObject {
   }
 
   func cancelAgentRun(taskID: AgentTask.ID, runID: UUID) {
-    guard let supervisor = agentGraphSupervisors[taskID] else { return }
-    Task { await supervisor.cancel(runID) }
+    guard let kernel = agentKernels[taskID], let operationID = agentKernelOperationIDs[taskID] else { return }
+    Task { await kernel.cancelGraphRun(operationID, runID: runID) }
   }
 
   func refreshExtensions() {
@@ -825,13 +843,9 @@ final class DesktopAppModel: ObservableObject {
   func cancelSelectedTask() {
     guard let selectedTaskID else { return }
     cancelNativeToolApproval(for: selectedTaskID)
-    automatedGraphTasks.removeValue(forKey: selectedTaskID)?.cancel()
-    if let supervisor = agentGraphSupervisors[selectedTaskID] {
-      Task { await supervisor.cancelAll() }
-    }
-    if let operationID = harnessOperationIDs[selectedTaskID], let harness = harnesses[selectedTaskID] {
-      Task { await harness.abort(operationID) }
-      harnessOperationIDs.removeValue(forKey: selectedTaskID)
+    if let kernel = agentKernels[selectedTaskID], let operationID = agentKernelOperationIDs[selectedTaskID] {
+      Task { await kernel.cancel(operationID) }
+      agentKernelOperationIDs.removeValue(forKey: selectedTaskID)
     }
     runningProcesses[selectedTaskID]?.terminate()
     runningAgentHosts[selectedTaskID]?.terminate()
@@ -852,20 +866,21 @@ final class DesktopAppModel: ObservableObject {
   func pauseSelectedTask() {
     guard let task = selectedTask, task.status == .running else { return }
     cancelNativeToolApproval(for: task.id)
-    if let operationID = harnessOperationIDs[task.id], let harness = harnesses[task.id] {
-      Task { await harness.suspend(operationID) }
+    if let kernel = agentKernels[task.id], let operationID = agentKernelOperationIDs[task.id] {
+      Task { @MainActor in
+        let snapshot = await kernel.snapshot()
+        if let graph = snapshot.graphSnapshots[operationID] {
+          for run in graph.runs where run.state == .running || run.state == .awaitingApproval {
+            await kernel.pauseGraph(operationID, runID: run.id)
+          }
+        } else {
+          await kernel.suspendMain()
+        }
+      }
     }
     runningProcesses[task.id]?.terminate()
     runningAgentHosts[task.id]?.terminate()
     endTaskWorkspaceAccess(for: task.id)
-    if let supervisor = agentGraphSupervisors[task.id] {
-      Task {
-        let snapshot = await supervisor.snapshot()
-        for run in snapshot.runs where run.state == .running || run.state == .awaitingApproval {
-          await supervisor.pause(run.id)
-        }
-      }
-    }
     updateTask(task.id) { current in
       current.status = .waitingForUser
       if let turnID = current.activeTurnID,
@@ -882,29 +897,20 @@ final class DesktopAppModel: ObservableObject {
     guard let task = selectedTask, task.status == .waitingForUser || task.status == .failed || task.status == .blocked else {
       return
     }
-    if let supervisor = agentGraphSupervisors[task.id] {
+    if let kernel = agentKernels[task.id], let operationID = agentKernelOperationIDs[task.id] {
       Task { @MainActor [weak self] in
-        let snapshot = await supervisor.snapshot()
-        for run in snapshot.runs where run.state == .paused || run.state == .interrupted {
-          await supervisor.continueRun(run.id)
-        }
-        self?.startAgentGraphDriver(taskID: task.id)
-      }
-      return
-    }
-    if task.status == .waitingForUser,
-       let operationID = harnessOperationIDs[task.id],
-       let harness = harnesses[task.id] {
-      Task {
-        do {
-          try await harness.resume(.main)
-        } catch {
-          await MainActor.run { [weak self] in
+        let snapshot = await kernel.snapshot()
+        if snapshot.graphSnapshots[operationID] != nil {
+          await kernel.resumeGraph(operationID)
+        } else {
+          do {
+            try await kernel.resumeMain()
+          } catch {
             self?.startTask(task, permission: task.mode.isReadOnly ? .interactive : .automatic)
           }
         }
+        self?.appendEvent("继续执行任务。", kind: .taskStarted, for: task.id)
       }
-      _ = operationID
       return
     }
     appendEvent("继续执行任务。", kind: .taskStarted, for: task.id)
@@ -2070,9 +2076,14 @@ final class DesktopAppModel: ObservableObject {
         guard plugin.isEnabled else { continue }
         do {
           try await pluginWorkerSupervisor.start(pluginID: plugin.id, nodeExecutable: nodePath)
+          _ = try await pluginWorkerSupervisor.performHandshake(
+            pluginID: plugin.id,
+            requiredCapabilities: []
+          )
         } catch {
-          // A plugin without a worker is still a valid manifest-only plugin.
-          // Keep its failure visible without preventing the main runtime.
+          // A manifest-only plugin remains discoverable, but a runnable Worker
+          // is never marked active until its JSON-RPC capabilities handshake
+          // succeeds. The failure stays visible in Integrations.
         }
       }
       let statuses = await pluginWorkerSupervisor.snapshot()
@@ -2804,60 +2815,31 @@ final class DesktopAppModel: ObservableObject {
         }
         return run
       }
-      let supervisor = AgentGraphSupervisor(
-        parent: parentSession,
-        snapshot: AgentRunSchedulerSnapshot(
-          runs: restoredRuns,
-          maxConcurrent: extensionConfiguration?.maxConcurrentWorkers ?? 8
-        ),
-        prompt: { run in
-          "父任务：\(task.title)\n请继续执行你的阶段：\(run.definition.description)"
-        },
-        onEvent: { [weak self] event in
-          Task { @MainActor [weak self] in
-            self?.consumeAgentGraphEvent(event, taskID: taskID)
-          }
-        },
-        onSessionEvent: { [weak self] event in
-          Task { @MainActor [weak self] in
-            self?.enqueueSessionKernelEvent(event)
-          }
-        },
-        onChildCancellation: { [weak self] _ in
-          Task { @MainActor [weak self] in
-            self?.cancelNativeToolApproval(for: taskID)
-          }
-        },
-        executor: { [weak self] run, session, childPrompt, tools in
-          try await Task { @MainActor [weak self] in
-            guard let self else { throw CancellationError() }
-            guard self.usesNativeHarnessProvider() else {
-              throw NSError(
-                domain: "HarnessChild",
-                code: 401,
-                userInfo: [NSLocalizedDescriptionKey: "Child Agent 缺少 Kimi API 连接；ACP/CLI 子执行已禁用，避免绕过统一 Tool Runtime。"]
-              )
-            }
-            return try await self.executeNativeChildAgent(
-              parentTaskID: taskID,
-              session: session,
-              prompt: childPrompt,
-              tools: tools,
-              agentDefinition: run.definition
-            )
-          }.value
-        }
-      )
-      agentGraphSupervisors[taskID] = supervisor
       graphContracts[taskID] = contract
-      Task { @MainActor [weak self, supervisor] in
-        let snapshot = await supervisor.snapshot()
-        self?.updateTask(taskID) { current in
-          current.agentRuns = snapshot.runs
-          if current.status == .running || current.status == .planning {
-            current.status = .waitingForUser
+      guard let kernel = agentKernels[taskID] ?? makeAgentKernel(for: taskID) else { continue }
+      Task { @MainActor [weak self, kernel] in
+        do {
+          let operationID = try await kernel.registerSuspendedGraph(
+            taskID: taskID,
+            parent: parentSession,
+            snapshot: AgentRunSchedulerSnapshot(
+              runs: restoredRuns,
+              maxConcurrent: self?.extensionConfiguration?.maxConcurrentWorkers ?? 8
+            ),
+            recoveryPrompt: "父任务：" + task.title
+          )
+          let snapshot = await kernel.snapshot()
+          guard let self else { return }
+          self.agentKernelOperationIDs[taskID] = operationID
+          self.updateTask(taskID) { current in
+            current.agentRuns = snapshot.graphSnapshots[operationID]?.runs ?? restoredRuns
+            if current.status == .running || current.status == .planning {
+              current.status = .waitingForUser
+            }
+            current.updatedAt = .now
           }
-          current.updatedAt = .now
+        } catch {
+          self?.appendEvent("恢复统一 Harness Graph 失败：" + error.localizedDescription, kind: .error, for: taskID)
         }
       }
     }
@@ -3275,20 +3257,12 @@ final class DesktopAppModel: ObservableObject {
   /// supervisor path for planning/implementation tasks; ordinary conversation
   /// remains on the low-latency single-session path above.
   private func startAutomatedAgentGraph(_ task: AgentTask, prompt: String) {
-    automatedGraphTasks[task.id]?.cancel()
     let sessionID = UUID(uuidString: task.sessionID ?? "") ?? task.id
     let decision = TaskIntentRouter.decide(for: prompt)
     let contract = TaskContract.make(prompt: prompt, decision: decision, mode: task.mode)
     let graph = TaskGraphCompiler.compile(taskID: task.id, sessionID: sessionID, contract: contract, model: task.modelID)
     let graphPlan = TaskGraphCompiler.plan(from: graph)
-    let initialWorktreePath = task.worktreePath ?? task.workspacePath
-    let scheduledRuns = graphPlan.runs.map { run in
-      var run = run
-      if run.definition.isolation == .worktree {
-        run.worktreePath = initialWorktreePath
-      }
-      return run
-    }
+    let scheduledRuns = prepareAgentGraphRuns(graphPlan.runs, task: task)
     let parentSession = SessionRecord(
       id: sessionID,
       taskID: task.id,
@@ -3299,49 +3273,6 @@ final class DesktopAppModel: ObservableObject {
     )
     let taskID = task.id
     let taskTitle = task.title
-    let supervisor = AgentGraphSupervisor(
-      parent: parentSession,
-      runs: scheduledRuns,
-      maxConcurrent: self.extensionConfiguration?.maxConcurrentWorkers ?? 8,
-      prompt: { run in
-        "父任务：\(taskTitle)\n请执行你的阶段：\(run.definition.description)"
-      },
-      onEvent: { [weak self] event in
-        Task { @MainActor [weak self] in
-          self?.consumeAgentGraphEvent(event, taskID: taskID)
-        }
-      },
-      onSessionEvent: { [weak self] event in
-        Task { @MainActor [weak self] in
-          self?.enqueueSessionKernelEvent(event)
-        }
-      },
-      onChildCancellation: { [weak self] _ in
-        Task { @MainActor [weak self] in
-          self?.cancelNativeToolApproval(for: taskID)
-        }
-      },
-      executor: { [weak self] run, session, childPrompt, tools in
-        try await Task { @MainActor [weak self] in
-          guard let self else { throw CancellationError() }
-          guard self.usesNativeHarnessProvider() else {
-            throw NSError(
-              domain: "HarnessChild",
-              code: 401,
-              userInfo: [NSLocalizedDescriptionKey: "Child Agent 缺少 Kimi API 连接；ACP/CLI 子执行已禁用，避免绕过统一 Tool Runtime。"]
-            )
-          }
-          return try await self.executeNativeChildAgent(
-            parentTaskID: taskID,
-            session: session,
-            prompt: childPrompt,
-            tools: tools,
-            agentDefinition: run.definition
-          )
-        }.value
-      }
-    )
-    agentGraphSupervisors[task.id] = supervisor
     graphContracts[task.id] = contract
     updateTask(task.id) { current in
       current.agentRuns = scheduledRuns.map { run in
@@ -3357,11 +3288,100 @@ final class DesktopAppModel: ObservableObject {
         current.turns[index].updatedAt = .now
       }
     }
-    appendEvent("已建立 (graph.nodes.count) 个可恢复阶段。", kind: .taskPlanned, for: task.id, payload: [
+    appendEvent("已建立 " + String(graph.nodes.count) + " 个可恢复阶段。", kind: .taskPlanned, for: task.id, payload: [
       "graphID": graph.id.uuidString,
       "stages": graph.nodes.map(\.stage.title).joined(separator: " → ")
     ])
-    startAgentGraphDriver(taskID: taskID)
+    guard let kernel = agentKernels[task.id] ?? makeAgentKernel(for: task.id) else {
+      updateTask(task.id) { current in
+        current.status = .failed
+        current.updatedAt = .now
+      }
+      appendEvent("统一 Harness Kernel 创建失败。", kind: .error, for: task.id)
+      return
+    }
+    Task { @MainActor [weak self] in
+      do {
+        let operationID = try await kernel.startGraph(
+          taskID: taskID,
+          parent: parentSession,
+          runs: scheduledRuns,
+          prompt: { run in
+            "父任务：\(taskTitle)\n请执行你的阶段：\(run.definition.description)"
+          },
+          maxConcurrent: self?.extensionConfiguration?.maxConcurrentWorkers ?? 8,
+          recoveryPrompt: taskTitle
+        )
+        self?.agentKernelOperationIDs[taskID] = operationID
+      } catch {
+        self?.updateTask(taskID) { current in
+          current.status = .failed
+          current.updatedAt = .now
+        }
+        self?.appendEvent("统一 Harness Graph 启动失败：\(error.localizedDescription)", kind: .error, for: taskID)
+      }
+    }
+  }
+
+  /// Allocates a real Git Worktree per write-capable graph node before the
+  /// scheduler can start it. Read-only nodes remain pathless; they inherit the
+  /// parent snapshot through their Child Session. If the project has no usable
+  /// HEAD, the graph remains runnable but records an explicit shared-workspace
+  /// fallback instead of pretending isolation exists.
+  private func prepareAgentGraphRuns(_ runs: [AgentRun], task: AgentTask) -> [AgentRun] {
+    let workspaceURL = URL(fileURLWithPath: task.worktreePath ?? task.workspacePath, isDirectory: true)
+    let root = applicationSupportDirectory
+      .appendingPathComponent("worktrees", isDirectory: true)
+      .appendingPathComponent("graph-" + task.id.uuidString.lowercased(), isDirectory: true)
+    let hasGitHEAD = GitWorktreeManager.hasUsableHEAD(workspaceURL)
+    let planned = AgentWorktreeAllocator.assign(runs: runs, rootDirectory: root)
+    guard hasGitHEAD else {
+      appendEvent(
+        "当前项目没有可用 Git HEAD，写入 Worker 将共享当前目录执行。",
+        kind: .toolProgress,
+        for: task.id,
+        payload: ["worktreeFallback": "workspace", "reason": "missing_head"]
+      )
+      return planned.map { run in
+        var fallback = run
+        if run.worktreePath != nil { fallback.worktreePath = workspaceURL.path }
+        return fallback
+      }
+    }
+
+    var actualPathByPlannedPath: [String: String] = [:]
+    for run in planned {
+      guard let plannedPath = run.worktreePath,
+            actualPathByPlannedPath[plannedPath] == nil else { continue }
+      let owner = planned.first(where: { candidate in
+        candidate.worktreePath == plannedPath && candidate.definition.isolation == .worktree
+      }) ?? run
+      do {
+        let worktree = try GitWorktreeManager.create(for: workspaceURL, taskID: owner.id, rootDirectory: root)
+        actualPathByPlannedPath[plannedPath] = worktree.path.path
+        appendEvent(
+          "已为 " + owner.definition.kind.title + " 创建隔离 Worktree。",
+          kind: .toolProgress,
+          for: task.id,
+          payload: ["runID": owner.id.uuidString, "path": worktree.path.path, "branch": worktree.branch]
+        )
+      } catch {
+        actualPathByPlannedPath[plannedPath] = workspaceURL.path
+        appendEvent(
+          owner.definition.kind.title + " Worktree 创建失败，已降级到当前项目目录：" + error.localizedDescription,
+          kind: .error,
+          for: task.id,
+          payload: ["runID": owner.id.uuidString, "worktreeFallback": "workspace", "reason": "creation_failed"]
+        )
+      }
+    }
+    return planned.map { run in
+      var resolved = run
+      if let plannedPath = run.worktreePath {
+        resolved.worktreePath = actualPathByPlannedPath[plannedPath] ?? workspaceURL.path
+      }
+      return resolved
+    }
   }
 
   /// Projects Core-owned graph snapshots into the persisted task record. The
@@ -3382,40 +3402,26 @@ final class DesktopAppModel: ObservableObject {
         for: taskID,
         payload: ["runID": runID.uuidString, "childSessionID": session.id.uuidString]
       )
+    case let .handoffPrepared(runID, handoffs):
+      appendEvent(
+        "Child Agent " + String(runID.uuidString.prefix(8)) + " 已接收 " + String(handoffs.count) + " 个上游阶段结果。",
+        kind: .toolProgress,
+        for: taskID,
+        payload: ["runID": runID.uuidString, "handoffs": String(handoffs.count)]
+      )
     case .graphFinished:
       break
-    }
-  }
-
-  /// Starts one Core-owned drive pass. There is no UI timer or manual
-  /// scheduleReady polling: the Supervisor releases dependent nodes itself.
-  private func startAgentGraphDriver(taskID: AgentTask.ID) {
-    guard automatedGraphTasks[taskID] == nil,
-          let supervisor = agentGraphSupervisors[taskID],
-          let contract = graphContracts[taskID] else { return }
-    automatedGraphTasks[taskID] = Task { @MainActor [weak self] in
-      defer { self?.automatedGraphTasks.removeValue(forKey: taskID) }
-      do {
-        let runs = try await supervisor.run()
-        guard let self else { return }
-        self.updateTask(taskID) { current in
-          current.agentRuns = runs
-          current.updatedAt = .now
-        }
-        self.finishAutomatedAgentGraph(taskID: taskID, contract: contract)
-      } catch is CancellationError {
-        // User cancellation is already reflected by the Supervisor snapshot.
-      } catch {
-        guard let self else { return }
-        self.updateTask(taskID) { $0.status = .failed; $0.updatedAt = .now }
-        self.appendEvent("Agent Graph 失败：\(error.localizedDescription)", kind: .error, for: taskID)
-      }
     }
   }
 
   private func finishAutomatedAgentGraph(taskID: AgentTask.ID, contract: TaskContract) {
     guard let task = state.tasks.first(where: { $0.id == taskID }) else { return }
     let aggregation = AgentResultMerger.merge(runs: task.agentRuns, contract: contract, requestedLanguage: .chinese)
+    applyAutomatedAgentGraphAggregation(taskID: taskID, aggregation: aggregation)
+  }
+
+  private func applyAutomatedAgentGraphAggregation(taskID: AgentTask.ID, aggregation: AgentAggregationResult) {
+    guard let task = state.tasks.first(where: { $0.id == taskID }) else { return }
     let turnID = task.activeTurnID ?? task.turns.last?.id
     updateTask(taskID) { current in
       if let turnID, let index = current.turns.firstIndex(where: { $0.id == turnID }) {
@@ -3456,37 +3462,132 @@ final class DesktopAppModel: ObservableObject {
     schedulePersistence()
   }
 
-  private func startHarnessTask(_ task: AgentTask, permission: KimiPermissionMode, promptOverride: String?) {
+  /// Builds the sole Core runtime for a task. Provider creation, tool
+  /// execution and Child Agent execution stay inside this factory so the
+  /// SwiftUI model only projects Kernel events and never owns a second loop.
+  private func makeAgentKernel(for taskID: AgentTask.ID) -> AgentKernel? {
+    guard let task = state.tasks.first(where: { $0.id == taskID }) else { return nil }
     let sessionID = UUID(uuidString: task.sessionID ?? "") ?? task.id
-    let harness: AgentHarness
-    if let existing = harnesses[task.id] {
-      harness = existing
-    } else {
-      let taskID = task.id
-      harness = AgentHarness(sessionID: sessionID, store: harnessEventStore) { [weak self] context, emit in
+    let runtime = AgentKernelRuntime(
+      operationDriver: { [weak self] context, emit in
         guard let self else { throw CancellationError() }
-        if await self.usesNativeHarnessProvider() {
-          do {
-            try await self.runNativeHarnessOperation(taskID: taskID, context: context, emit: emit)
-          } catch let error as KimiHTTPProviderError {
-            // Do not silently switch execution authority after a native
-            // Provider failure. A compatibility runtime can have its own
-            // tool side effects and would break Intent/Receipt guarantees.
-            await emit(.artifact("nativeProvider=failed; fallback=disabled"))
-            throw error
+        try await Task { @MainActor in
+          try await self.runNativeHarnessOperation(taskID: taskID, context: context, emit: emit)
+        }.value
+      },
+      childExecutor: { [weak self] run, session, childPrompt, tools in
+        guard let self else { throw CancellationError() }
+        return try await Task { @MainActor in
+          guard self.usesNativeHarnessProvider() else {
+            throw NSError(
+              domain: "HarnessChild",
+              code: 401,
+              userInfo: [NSLocalizedDescriptionKey: "Child Agent 缺少 Kimi API 连接；ACP/CLI 子执行已禁用，避免绕过统一 Tool Runtime。"]
+            )
           }
-        } else {
-          await emit(.artifact("nativeProvider=unavailable; compatibilityExecution=disabled"))
-          throw NSError(
-            domain: "Harness",
-            code: 401,
-            userInfo: [NSLocalizedDescriptionKey: "Harness 执行需要已配置的 Kimi API Key；ACP/CLI 兼容执行已禁用，避免绕过统一 Tool Runtime。"]
+          return try await self.executeNativeChildAgent(
+            parentTaskID: taskID,
+            session: session,
+            prompt: childPrompt,
+            tools: tools,
+            agentDefinition: run.definition
           )
+        }.value
+      },
+      onChildSessionEvent: { [weak self] event in
+        Task { @MainActor [weak self] in
+          self?.enqueueSessionKernelEvent(event)
+        }
+      },
+      onChildCancellation: { [weak self] _ in
+        Task { @MainActor [weak self] in
+          self?.cancelNativeToolApproval(for: taskID)
         }
       }
-      harnesses[task.id] = harness
-      attachHarnessEvents(for: task.id, harness: harness)
+    )
+    let kernel = AgentKernel(sessionID: sessionID, store: harnessEventStore, runtime: runtime)
+    agentKernels[taskID] = kernel
+    attachAgentKernelEvents(for: taskID, kernel: kernel)
+    return kernel
+  }
+
+  private func attachAgentKernelEvents(for taskID: AgentTask.ID, kernel: AgentKernel) {
+    guard agentKernelEventTasks[taskID] == nil else { return }
+    agentKernelEventTasks[taskID] = Task { @MainActor [weak self] in
+      let stream = await kernel.events()
+      for await event in stream {
+        guard let self else { return }
+        switch event {
+        case let .harness(harnessEvent):
+          self.consumeHarnessEvent(harnessEvent, taskID: taskID)
+        case let .operationChanged(operation):
+          self.consumeKernelOperation(operation, taskID: taskID)
+        case let .graphSnapshot(_, snapshot):
+          self.consumeAgentGraphEvent(.schedulerSnapshot(snapshot), taskID: taskID)
+        case let .childSessionCreated(_, runID, session):
+          self.consumeAgentGraphEvent(.childSessionCreated(runID: runID, session: session), taskID: taskID)
+        case let .handoffPrepared(_, runID, handoffs):
+          self.consumeAgentGraphEvent(.handoffPrepared(runID: runID, handoffs: handoffs), taskID: taskID)
+        case let .graphFinished(_, snapshot):
+          self.consumeAgentGraphEvent(.graphFinished(snapshot), taskID: taskID)
+          self.finishAutomatedAgentGraphIfReady(taskID: taskID, snapshot: snapshot)
+        }
+      }
     }
+  }
+
+  private func consumeKernelOperation(_ operation: HarnessOperation, taskID: AgentTask.ID) {
+    switch operation.state {
+    case .running:
+      updateTask(taskID) { current in
+        if current.status == .planning || current.status == .waitingForUser {
+          current.status = .running
+        }
+        current.updatedAt = .now
+      }
+    case .suspended:
+      updateTask(taskID) { current in
+        current.status = .waitingForUser
+        current.updatedAt = .now
+      }
+    case .failed:
+      updateTask(taskID) { current in
+        current.status = .failed
+        current.updatedAt = .now
+      }
+    case .completed:
+      // Graph completion is finalized from the scheduler snapshot so that a
+      // partially completed graph cannot be presented as a successful turn.
+      if operation.kind != .prompt || state.tasks.first(where: { $0.id == taskID })?.agentRuns.isEmpty == false {
+        schedulePersistence()
+      }
+    default:
+      break
+    }
+  }
+
+  private func finishAutomatedAgentGraphIfReady(taskID: AgentTask.ID, snapshot: AgentRunSchedulerSnapshot) {
+    guard snapshot.runs.allSatisfy({ $0.state.isTerminal }) else { return }
+    guard let contract = graphContracts[taskID] else { return }
+    if let operationID = agentKernelOperationIDs[taskID], let kernel = agentKernels[taskID] {
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        do {
+          let aggregation = try await kernel.finalAnswer(for: operationID, contract: contract, requestedLanguage: .chinese)
+          self.applyAutomatedAgentGraphAggregation(taskID: taskID, aggregation: aggregation)
+        } catch {
+          self.appendEvent("Kernel 最终答案生成失败：\(error.localizedDescription)", kind: .error, for: taskID)
+          self.finishAutomatedAgentGraph(taskID: taskID, contract: contract)
+        }
+      }
+    } else {
+      finishAutomatedAgentGraph(taskID: taskID, contract: contract)
+    }
+  }
+
+  private func startHarnessTask(_ task: AgentTask, permission: KimiPermissionMode, promptOverride: String?) {
+    _ = permission
+    guard let kernel = agentKernels[task.id] ?? makeAgentKernel(for: task.id) else { return }
 
     let prompt: String
     if let override = promptOverride?.trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
@@ -3494,27 +3595,27 @@ final class DesktopAppModel: ObservableObject {
     } else {
       prompt = task.title
     }
-    Task { [weak self] in
+    Task { @MainActor [weak self] in
       do {
-        try await harness.restore()
-        let restored = await harness.snapshot()
-        let restoredOperation = restored.lanes[.main]?.activeOperation.flatMap { restored.operations[$0] }
+        try await kernel.restore()
+        let restored = await kernel.snapshot()
+        let restoredOperation = restored.harness.lanes[.main]?.activeOperation.flatMap { restored.operations[$0] }
         let operationID: OperationID
         if promptOverride == nil, let restoredOperation, restoredOperation.state == .suspended {
           operationID = restoredOperation.id
-          try await harness.resume(.main)
+          try await kernel.resumeMain()
         } else {
-          operationID = try await harness.prompt(PromptInput(text: prompt), lane: .main)
+          operationID = try await kernel.prompt(PromptInput(text: prompt), lane: .main)
         }
         guard let self else { return }
-        self.harnessOperationIDs[task.id] = operationID
+        self.agentKernelOperationIDs[task.id] = operationID
         self.appendEvent(restoredOperation != nil && promptOverride == nil ? "Harness 已恢复任务。" : "Harness 已接收任务。", kind: .taskStarted, for: task.id, payload: [
           "operationID": operationID.uuidString,
           "authority": HarnessExecutionAuthority.harnessNative.rawValue
         ])
       } catch {
         guard let self else { return }
-        self.harnessOperationIDs.removeValue(forKey: task.id)
+        self.agentKernelOperationIDs.removeValue(forKey: task.id)
         self.updateTask(task.id) { current in
           current.status = .failed
           current.updatedAt = .now
@@ -3526,17 +3627,6 @@ final class DesktopAppModel: ObservableObject {
           }
         }
         self.appendEvent("Harness 无法启动任务：\(error.localizedDescription)", kind: .error, for: task.id)
-      }
-    }
-  }
-
-  private func attachHarnessEvents(for taskID: AgentTask.ID, harness: AgentHarness) {
-    guard harnessEventTasks[taskID] == nil else { return }
-    harnessEventTasks[taskID] = Task { [weak self] in
-      let stream = await harness.events()
-      for await event in stream {
-        guard let self else { return }
-        self.consumeHarnessEvent(event, taskID: taskID)
       }
     }
   }
@@ -3586,7 +3676,7 @@ final class DesktopAppModel: ObservableObject {
       guard let payload = event.payload,
             let receipt = try? JSONDecoder().decode(HarnessPermissionReceipt.self, from: payload) else { return }
       appendEvent(
-        receipt.decision == .allow ? "已批准工具请求：(receipt.toolID)" : "已拒绝工具请求：(receipt.toolID)",
+        receipt.decision == .allow ? "已批准工具请求：" + receipt.toolID : "已拒绝工具请求：" + receipt.toolID,
         kind: receipt.decision == .allow ? .permissionApproved : .permissionDenied,
         for: taskID,
         payload: [
@@ -3635,43 +3725,10 @@ final class DesktopAppModel: ObservableObject {
          .turnEnded,
          .entryAppended,
          .queueEnqueued,
-         .snapshotPublished:
+         .snapshotPublished,
+         .kernelGraphSnapshot,
+         .kernelHandoffPrepared:
       break
-    }
-  }
-
-  private func runCompatibilityOperation(
-    taskID: AgentTask.ID,
-    context: HarnessOperationContext,
-    permission: KimiPermissionMode,
-    emit: @escaping AgentHarness.DriverEventSink
-  ) async throws {
-    guard let task = state.tasks.first(where: { $0.id == taskID }) else {
-      throw NSError(domain: "Harness", code: 404, userInfo: [NSLocalizedDescriptionKey: "找不到任务。"])
-    }
-    await emit(.artifact("executionAuthority=compatibilityACP"))
-    startCompatibilityTask(task, permission: permission, promptOverride: context.prompt.text)
-
-    while true {
-      try Task.checkCancellation()
-      guard let current = state.tasks.first(where: { $0.id == taskID }) else {
-        throw NSError(domain: "Harness", code: 404, userInfo: [NSLocalizedDescriptionKey: "任务已被删除。"])
-      }
-      switch current.status {
-      case .running, .planning, .verifying:
-        try await Task.sleep(nanoseconds: 50_000_000)
-      case .waitingForUser:
-        throw NSError(domain: "Harness", code: 409, userInfo: [NSLocalizedDescriptionKey: "任务等待用户审批。"])
-      case .failed, .cancelled, .blocked:
-        throw NSError(domain: "Harness", code: 1, userInfo: [NSLocalizedDescriptionKey: "任务执行失败或已取消。"])
-      default:
-        let reply = current.turns.last?.assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let reply, !reply.isEmpty {
-          await emit(.assistantText(reply))
-        }
-        await emit(.artifact("operation=\(context.operationID.uuidString) completed"))
-        return
-      }
     }
   }
 
@@ -3898,7 +3955,19 @@ final class DesktopAppModel: ObservableObject {
           return definition.id.hasSuffix(".\(toolName)")
         }
       }
-      let definitionsToRegister = relevantDefinitions.isEmpty ? Array(mcpDefinitions.prefix(12)) : relevantDefinitions
+      // Resources and Prompts are capability endpoints rather than ordinary
+      // catalogued MCP tools. Keep their two generic Harness adapters present
+      // whenever a server advertises them, while Tool Search still limits the
+      // potentially large set of ordinary tool schemas sent to the model.
+      let capabilityDefinitions = mcpDefinitions.filter { definition in
+        guard let parsed = MCPHarnessToolIdentifier.parse(definition.id) else { return false }
+        return definition.id == MCPHarnessToolIdentifier.resourceReader(serverID: parsed.serverID) ||
+          definition.id == MCPHarnessToolIdentifier.promptGetter(serverID: parsed.serverID)
+      }
+      let selectedToolDefinitions = relevantDefinitions.isEmpty ? Array(mcpDefinitions.prefix(12)) : relevantDefinitions
+      let definitionsToRegister = Dictionary(
+        uniqueKeysWithValues: (selectedToolDefinitions + capabilityDefinitions).map { ($0.id, $0) }
+      ).values.sorted { $0.id < $1.id }
       for definition in definitionsToRegister {
         await registry.register(definition, executor: mcpExecutor)
       }
@@ -3917,6 +3986,15 @@ final class DesktopAppModel: ObservableObject {
     let coordinator = ToolExecutionCoordinator(
       registry: registry,
       permissionResolver: StaticToolPermissionResolver(decision: .ask),
+      permissionGate: LayeredHarnessPermissionGate(
+        fallback: StaticToolPermissionResolver(decision: .ask)
+      ),
+      permissionContext: HarnessPermissionContext(
+        taskID: taskID,
+        sessionID: context.sessionID,
+        worktreePath: toolWorkspacePath,
+        allowPublicWebRead: intentDecision.intent == .webResearch
+      ),
       approvalHandler: { [weak self] request, definition in
         guard let self else { return .deny }
         return await self.requestNativeToolApproval(request: request, definition: definition, workspacePath: toolWorkspacePath)
@@ -3928,13 +4006,14 @@ final class DesktopAppModel: ObservableObject {
       },
       journal: journal
     )
-    let provider = KimiHTTPModelProvider(
+    let baseProvider = KimiHTTPModelProvider(
       baseURL: baseURL,
       apiKey: apiKey,
       modelID: modelID,
       maximumOutputTokens: modelRoute.maximumOutputTokens,
       traceRecorder: providerTraceRecorder
     )
+    let provider = RetryingHarnessConversationProvider(base: baseProvider, maxAttempts: 2)
     let providerStartedAt = Date()
     let loop = HarnessConversationLoop(
       provider: provider,

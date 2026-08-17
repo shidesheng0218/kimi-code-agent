@@ -10,13 +10,38 @@ public struct MCPServerInfo: Codable, Equatable, Sendable {
   }
 }
 
+public struct MCPCapabilities: Codable, Equatable, Sendable {
+  public let tools: Bool
+  public let resources: Bool
+  public let prompts: Bool
+  public let elicitation: Bool
+
+  public init(tools: Bool = false, resources: Bool = false, prompts: Bool = false, elicitation: Bool = false) {
+    self.tools = tools
+    self.resources = resources
+    self.prompts = prompts
+    self.elicitation = elicitation
+  }
+
+  public init(raw: [String: Any]) {
+    self.init(
+      tools: raw["tools"] != nil,
+      resources: raw["resources"] != nil,
+      prompts: raw["prompts"] != nil,
+      elicitation: raw["elicitation"] != nil
+    )
+  }
+}
+
 public struct MCPInitializeResult: Codable, Equatable, Sendable {
   public let protocolVersion: String
   public let serverInfo: MCPServerInfo
+  public let capabilities: MCPCapabilities
 
-  public init(protocolVersion: String, serverInfo: MCPServerInfo) {
+  public init(protocolVersion: String, serverInfo: MCPServerInfo, capabilities: MCPCapabilities = MCPCapabilities()) {
     self.protocolVersion = protocolVersion
     self.serverInfo = serverInfo
+    self.capabilities = capabilities
   }
 }
 
@@ -41,6 +66,82 @@ public struct MCPToolCallResult: Codable, Equatable, Sendable {
   public init(standardOutput: String, rawJSON: String) {
     self.standardOutput = standardOutput
     self.rawJSON = rawJSON
+  }
+}
+
+public struct MCPResource: Codable, Equatable, Identifiable, Sendable {
+  public let id: String
+  public let uri: String
+  public let name: String
+  public let description: String?
+  public let mimeType: String?
+
+  public init(uri: String, name: String, description: String? = nil, mimeType: String? = nil) {
+    self.id = uri
+    self.uri = uri
+    self.name = name
+    self.description = description
+    self.mimeType = mimeType
+  }
+}
+
+public struct MCPPromptArgument: Codable, Equatable, Sendable {
+  public let name: String
+  public let description: String?
+  public let required: Bool
+
+  public init(name: String, description: String? = nil, required: Bool = false) {
+    self.name = name
+    self.description = description
+    self.required = required
+  }
+}
+
+public struct MCPPrompt: Codable, Equatable, Identifiable, Sendable {
+  public let id: String
+  public let name: String
+  public let description: String?
+  public let arguments: [MCPPromptArgument]
+
+  public init(name: String, description: String? = nil, arguments: [MCPPromptArgument] = []) {
+    self.id = name
+    self.name = name
+    self.description = description
+    self.arguments = arguments
+  }
+}
+
+public struct MCPResourceContent: Codable, Equatable, Sendable {
+  public let uri: String
+  public let mimeType: String?
+  public let text: String?
+  public let blob: String?
+
+  public init(uri: String, mimeType: String? = nil, text: String? = nil, blob: String? = nil) {
+    self.uri = uri
+    self.mimeType = mimeType
+    self.text = text
+    self.blob = blob
+  }
+}
+
+public struct MCPPromptMessage: Codable, Equatable, Sendable {
+  public let role: String
+  public let text: String
+
+  public init(role: String, text: String) {
+    self.role = role
+    self.text = text
+  }
+}
+
+public struct MCPPromptResult: Codable, Equatable, Sendable {
+  public let description: String?
+  public let messages: [MCPPromptMessage]
+
+  public init(description: String? = nil, messages: [MCPPromptMessage] = []) {
+    self.description = description
+    self.messages = messages
   }
 }
 
@@ -147,7 +248,7 @@ public final class MCPStdioClient: @unchecked Sendable {
     let params: [String: Any] = [
       "protocolVersion": "2024-11-05",
       "clientInfo": ["name": "KimiAgentDesktop", "version": "0.3.0"],
-      "capabilities": ["tools": [:]]
+      "capabilities": ["tools": [:], "resources": [:], "prompts": [:], "elicitation": [:]]
     ]
     let response = try request(method: "initialize", params: params)
     let protocolVersion = response["protocolVersion"] as? String ?? "2024-11-05"
@@ -157,7 +258,11 @@ public final class MCPStdioClient: @unchecked Sendable {
       throw MCPClientError.malformedResponse
     }
     _ = try? request(method: "notifications/initialized", params: [:], expectResponse: false)
-    let result = MCPInitializeResult(protocolVersion: protocolVersion, serverInfo: MCPServerInfo(name: name, version: version))
+    let result = MCPInitializeResult(
+      protocolVersion: protocolVersion,
+      serverInfo: MCPServerInfo(name: name, version: version),
+      capabilities: MCPCapabilities(raw: response["capabilities"] as? [String: Any] ?? [:])
+    )
     initializeResult = result
     return result
   }
@@ -173,6 +278,73 @@ public final class MCPStdioClient: @unchecked Sendable {
       let inputSchema = tool["inputSchema"].flatMap { Self.jsonString($0) } ?? "{}"
       return MCPTool(name: name, description: description, inputSchemaJSON: inputSchema)
     }
+  }
+
+  public func listResources() throws -> [MCPResource] {
+    let response = try request(method: "resources/list", params: [:])
+    guard let resources = response["resources"] as? [[String: Any]] else {
+      throw MCPClientError.malformedResponse
+    }
+    return resources.compactMap { resource in
+      guard let uri = resource["uri"] as? String,
+            let name = resource["name"] as? String else { return nil }
+      return MCPResource(
+        uri: uri,
+        name: name,
+        description: resource["description"] as? String,
+        mimeType: resource["mimeType"] as? String
+      )
+    }
+  }
+
+  public func listPrompts() throws -> [MCPPrompt] {
+    let response = try request(method: "prompts/list", params: [:])
+    guard let prompts = response["prompts"] as? [[String: Any]] else {
+      throw MCPClientError.malformedResponse
+    }
+    return prompts.compactMap { prompt in
+      guard let name = prompt["name"] as? String else { return nil }
+      let arguments = (prompt["arguments"] as? [[String: Any]] ?? []).compactMap { argument -> MCPPromptArgument? in
+        guard let argumentName = argument["name"] as? String else { return nil }
+        return MCPPromptArgument(
+          name: argumentName,
+          description: argument["description"] as? String,
+          required: argument["required"] as? Bool ?? false
+        )
+      }
+      return MCPPrompt(
+        name: name,
+        description: prompt["description"] as? String,
+        arguments: arguments
+      )
+    }
+  }
+
+  public func readResource(uri: String) throws -> [MCPResourceContent] {
+    let response = try request(method: "resources/read", params: ["uri": uri])
+    guard let contents = response["contents"] as? [[String: Any]] else {
+      throw MCPClientError.malformedResponse
+    }
+    return contents.compactMap { content in
+      guard let contentURI = content["uri"] as? String else { return nil }
+      return MCPResourceContent(
+        uri: contentURI,
+        mimeType: content["mimeType"] as? String,
+        text: content["text"] as? String,
+        blob: content["blob"] as? String
+      )
+    }
+  }
+
+  public func getPrompt(name: String, arguments: [String: String] = [:]) throws -> MCPPromptResult {
+    let response = try request(method: "prompts/get", params: ["name": name, "arguments": arguments])
+    let messages = (response["messages"] as? [[String: Any]] ?? []).compactMap { message -> MCPPromptMessage? in
+      guard let role = message["role"] as? String,
+            let content = message["content"] as? [String: Any],
+            let text = content["text"] as? String else { return nil }
+      return MCPPromptMessage(role: role, text: text)
+    }
+    return MCPPromptResult(description: response["description"] as? String, messages: messages)
   }
 
   public func callTool(name: String, arguments: [String: String]) throws -> MCPToolCallResult {

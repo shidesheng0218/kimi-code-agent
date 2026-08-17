@@ -268,6 +268,10 @@ public final class UsageLedger: @unchecked Sendable {
 
   public func append(_ entry: UsageLedgerEntry) throws {
     lock.lock()
+    if entries.contains(where: { $0.id == entry.id }) {
+      lock.unlock()
+      return
+    }
     entries.append(entry)
     let snapshot = entries
     lock.unlock()

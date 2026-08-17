@@ -468,6 +468,37 @@ public struct HarnessToolResultRecord: Codable, Equatable, Sendable {
   }
 }
 
+/// Durable boundary for resuming a model/tool turn after process loss. It is
+/// intentionally separate from the user-facing transcript: a checkpoint may
+/// contain an unresolved tool call, but never claims that effect settled.
+public struct HarnessCheckpoint: Codable, Equatable, Sendable {
+  public let operationID: OperationID
+  public var turnID: UUID?
+  public var step: Int
+  public var status: HarnessStepStatus
+  public var activeToolCallIDs: [String]
+  public var settledEffectIDs: [UUID]
+  public var updatedAt: Date
+
+  public init(
+    operationID: OperationID,
+    turnID: UUID? = nil,
+    step: Int = 1,
+    status: HarnessStepStatus = .running,
+    activeToolCallIDs: [String] = [],
+    settledEffectIDs: [UUID] = [],
+    updatedAt: Date = .now
+  ) {
+    self.operationID = operationID
+    self.turnID = turnID
+    self.step = max(1, step)
+    self.status = status
+    self.activeToolCallIDs = activeToolCallIDs
+    self.settledEffectIDs = settledEffectIDs
+    self.updatedAt = updatedAt
+  }
+}
+
 public enum HarnessEventKind: String, Codable, CaseIterable, Sendable {
   case operationAccepted
   case operationStateChanged
@@ -487,6 +518,8 @@ public enum HarnessEventKind: String, Codable, CaseIterable, Sendable {
   case effectSettled
   case entryAppended
   case snapshotPublished
+  case kernelGraphSnapshot
+  case kernelHandoffPrepared
 }
 
 public struct HarnessEvent: Codable, Equatable, Identifiable, Sendable {
@@ -585,6 +618,7 @@ public struct HarnessSnapshot: Codable, Equatable, Sendable {
   public var intents: [UUID: HarnessEffectIntent]
   public var permissions: [UUID: HarnessPermissionReceipt]
   public var receipts: [UUID: HarnessEffectReceipt]
+  public var checkpoints: [OperationID: HarnessCheckpoint]
 
   public init(
     sessionID: UUID,
@@ -593,7 +627,8 @@ public struct HarnessSnapshot: Codable, Equatable, Sendable {
     entries: [HarnessSessionEntry] = [],
     intents: [UUID: HarnessEffectIntent] = [:],
     permissions: [UUID: HarnessPermissionReceipt] = [:],
-    receipts: [UUID: HarnessEffectReceipt] = [:]
+    receipts: [UUID: HarnessEffectReceipt] = [:],
+    checkpoints: [OperationID: HarnessCheckpoint] = [:]
   ) {
     self.sessionID = sessionID
     self.lanes = lanes
@@ -602,6 +637,25 @@ public struct HarnessSnapshot: Codable, Equatable, Sendable {
     self.intents = intents
     self.permissions = permissions
     self.receipts = receipts
+    self.checkpoints = checkpoints
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case sessionID, lanes, operations, entries, intents, permissions, receipts, checkpoints
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      sessionID: try container.decode(UUID.self, forKey: .sessionID),
+      lanes: try container.decodeIfPresent([LaneID: HarnessLaneState].self, forKey: .lanes) ?? [.main: HarnessLaneState(id: .main)],
+      operations: try container.decodeIfPresent([OperationID: HarnessOperation].self, forKey: .operations) ?? [:],
+      entries: try container.decodeIfPresent([HarnessSessionEntry].self, forKey: .entries) ?? [],
+      intents: try container.decodeIfPresent([UUID: HarnessEffectIntent].self, forKey: .intents) ?? [:],
+      permissions: try container.decodeIfPresent([UUID: HarnessPermissionReceipt].self, forKey: .permissions) ?? [:],
+      receipts: try container.decodeIfPresent([UUID: HarnessEffectReceipt].self, forKey: .receipts) ?? [:],
+      checkpoints: try container.decodeIfPresent([OperationID: HarnessCheckpoint].self, forKey: .checkpoints) ?? [:]
+    )
   }
 }
 
@@ -895,6 +949,10 @@ public actor AgentHarness {
         guard let payload = event.payload,
               let receipt = try? JSONDecoder().decode(HarnessEffectReceipt.self, from: payload) else { continue }
         restored.receipts[receipt.effectID] = receipt
+      case .snapshotPublished:
+        guard let payload = event.payload,
+              let checkpoint = try? JSONDecoder().decode(HarnessCheckpoint.self, from: payload) else { continue }
+        restored.checkpoints[checkpoint.operationID] = checkpoint
       case .turnStarted,
            .stepStarted,
            .requestHeader,
@@ -905,7 +963,8 @@ public actor AgentHarness {
            .stepEnded,
            .turnEnded,
            .effectStarted,
-           .snapshotPublished:
+           .kernelGraphSnapshot,
+           .kernelHandoffPrepared:
         continue
       case .queueEnqueued:
         var lane = restored.lanes[event.lane] ?? HarnessLaneState(id: event.lane)
@@ -1100,7 +1159,14 @@ public actor AgentHarness {
     case let .turnStarted(record):
       try? await publish(.turnStarted, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(record))
     case let .stepStarted(record):
+      var checkpoint = snapshotValue.checkpoints[operationID] ?? HarnessCheckpoint(operationID: operationID)
+      checkpoint.turnID = record.turnID
+      checkpoint.step = record.step
+      checkpoint.status = record.status
+      checkpoint.updatedAt = .now
+      snapshotValue.checkpoints[operationID] = checkpoint
       try? await publish(.stepStarted, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(record))
+      try? await publish(.snapshotPublished, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(checkpoint))
     case let .requestHeader(header):
       try? await publish(.requestHeader, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(header))
     case let .modelChunk(block):
@@ -1108,11 +1174,33 @@ public actor AgentHarness {
     case let .assistantMessage(message):
       try? await publish(.assistantMessage, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(message))
     case let .toolCallDeclared(call):
+      var checkpoint = snapshotValue.checkpoints[operationID] ?? HarnessCheckpoint(operationID: operationID)
+      if !checkpoint.activeToolCallIDs.contains(call.call.id) { checkpoint.activeToolCallIDs.append(call.call.id) }
+      checkpoint.turnID = call.turnID
+      checkpoint.step = call.step
+      checkpoint.status = .toolCalls
+      checkpoint.updatedAt = .now
+      snapshotValue.checkpoints[operationID] = checkpoint
       try? await publish(.toolCallDeclared, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(call))
+      try? await publish(.snapshotPublished, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(checkpoint))
     case let .toolResultRecorded(result):
+      var checkpoint = snapshotValue.checkpoints[operationID] ?? HarnessCheckpoint(operationID: operationID)
+      checkpoint.activeToolCallIDs.removeAll { $0 == result.result.callID }
+      checkpoint.turnID = result.turnID
+      checkpoint.step = result.step
+      checkpoint.updatedAt = .now
+      snapshotValue.checkpoints[operationID] = checkpoint
       try? await publish(.toolResultRecorded, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(result))
+      try? await publish(.snapshotPublished, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(checkpoint))
     case let .stepEnded(record):
+      var checkpoint = snapshotValue.checkpoints[operationID] ?? HarnessCheckpoint(operationID: operationID)
+      checkpoint.turnID = record.turnID
+      checkpoint.step = record.step
+      checkpoint.status = record.status
+      checkpoint.updatedAt = .now
+      snapshotValue.checkpoints[operationID] = checkpoint
       try? await publish(.stepEnded, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(record))
+      try? await publish(.snapshotPublished, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(checkpoint))
     case let .turnEnded(record):
       try? await publish(.turnEnded, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(record))
     case let .effectIntentWritten(intent):
@@ -1129,7 +1217,12 @@ public actor AgentHarness {
     case let .effectSettled(receipt):
       guard snapshotValue.intents[receipt.effectID] != nil else { return }
       snapshotValue.receipts[receipt.effectID] = receipt
+      var checkpoint = snapshotValue.checkpoints[operationID] ?? HarnessCheckpoint(operationID: operationID)
+      if !checkpoint.settledEffectIDs.contains(receipt.effectID) { checkpoint.settledEffectIDs.append(receipt.effectID) }
+      checkpoint.updatedAt = .now
+      snapshotValue.checkpoints[operationID] = checkpoint
       try? await publish(.effectSettled, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(receipt))
+      try? await publish(.snapshotPublished, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(checkpoint))
     case let .assistantText(text):
       appendEntry(parent: operation.sourceEntryID, lane: operation.lane, kind: .assistant, text: text, operationID: operationID)
     case let .artifact(text):

@@ -38,6 +38,45 @@ final class InvocationCounter: @unchecked Sendable {
   }
 }
 
+actor FlakyHarnessProvider: HarnessModelProvider {
+  private var attempts = 0
+
+  func stream(
+    context: HarnessProviderContext,
+    tools: [ToolDefinition],
+    signal: AsyncStream<Void>?
+  ) async throws -> AsyncThrowingStream<HarnessModelEvent, Error> {
+    attempts += 1
+    let attempt = attempts
+    if attempt == 1 {
+      throw NSError(domain: "FlakyHarnessProvider", code: 1, userInfo: [NSLocalizedDescriptionKey: "transient provider failure"])
+    }
+    return AsyncThrowingStream { continuation in
+      continuation.yield(.text("retry succeeded"))
+      continuation.finish()
+    }
+  }
+}
+
+actor FlakyConversationProvider: HarnessConversationProvider {
+  private var attempts = 0
+
+  func stream(
+    request: HarnessConversationRequest,
+    tools: [ToolDefinition],
+    signal: AsyncStream<Void>?
+  ) async throws -> AsyncThrowingStream<HarnessConversationEvent, Error> {
+    attempts += 1
+    if attempts == 1 {
+      throw NSError(domain: "FlakyConversationProvider", code: 1, userInfo: [NSLocalizedDescriptionKey: "transient conversation failure"])
+    }
+    return AsyncThrowingStream { continuation in
+      continuation.yield(.text("conversation retry succeeded"))
+      continuation.finish()
+    }
+  }
+}
+
 final class ThreadSafeStringTrace: @unchecked Sendable {
   private let lock = NSLock()
   private var values: [String] = []
@@ -455,6 +494,13 @@ let repeatedMCPFailureCanReconnect = await mcpWorkerSupervisor.markFailure(serve
 expect(!repeatedMCPFailureCanReconnect, "MCP Worker 恢复后也必须保留生命周期重启预算，达到上限后不可无限重连")
 let unavailableWorker = await mcpWorkerSupervisor.health(serverID: "docs")
 expect(unavailableWorker?.status == .unavailable, "MCP Worker 达到上限后不得继续伪造可用")
+let mcpStateURL = temporaryDirectory.appendingPathComponent("mcp-worker-status.json")
+let durableMCPSupervisor = MCPWorkerSupervisor(maxRestarts: 3, stateFileURL: mcpStateURL)
+await durableMCPSupervisor.markStarting(serverID: "durable-docs")
+_ = await durableMCPSupervisor.markFailure(serverID: "durable-docs", message: "connection lost")
+let restoredMCPSupervisor = MCPWorkerSupervisor(maxRestarts: 3, stateFileURL: mcpStateURL)
+let restoredMCPHealth = await restoredMCPSupervisor.health(serverID: "durable-docs")
+expect(restoredMCPHealth?.status == .reconnecting && restoredMCPHealth?.restartCount == 1, "MCP Worker 状态必须在重启后恢复，不能丢失重连预算")
 let pluginRoot = temporaryDirectory.appendingPathComponent("plugin", isDirectory: true)
 try FileManager.default.createDirectory(at: pluginRoot.appendingPathComponent(".kimi-plugin", isDirectory: true), withIntermediateDirectories: true)
 let plugin = KimiPluginDescriptor(
@@ -468,6 +514,26 @@ let pluginState = try awaitValue { () async throws -> PluginWorkerState in
   return await pluginSupervisor.state(pluginID: "demo") ?? .registered
 }
 expect(pluginState == .registered, "插件 Worker 必须先经过注册状态")
+try """
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  const request = JSON.parse(chunk.trim());
+  process.stdout.write(JSON.stringify({jsonrpc:'2.0', id:request.id, result:{protocolVersion:'1.0', worker:{name:'demo', version:'1.0.0'}, capabilities:['tools','hooks']}}) + '\\n');
+});
+""".write(to: pluginRoot.appendingPathComponent(".kimi-plugin/worker.js"), atomically: true, encoding: .utf8)
+let pluginHandshake = try awaitValue {
+  try await pluginSupervisor.start(pluginID: "demo", nodeExecutable: "node")
+  defer { Task { await pluginSupervisor.stop(pluginID: "demo") } }
+  return try await pluginSupervisor.performHandshake(pluginID: "demo", requiredCapabilities: ["tools"])
+}
+expect(pluginHandshake.workerName == "demo" && pluginHandshake.capabilities.contains("hooks"), "插件 Worker 必须完成 JSON-RPC 握手并声明能力")
+let pluginStateURL = temporaryDirectory.appendingPathComponent("plugin-worker-status.json")
+let durablePluginSupervisor = PluginWorkerSupervisor(stateFileURL: pluginStateURL)
+await durablePluginSupervisor.register(plugin)
+try await durablePluginSupervisor.markFailure(pluginID: "demo", message: "handshake timeout")
+let restoredPluginSupervisor = PluginWorkerSupervisor(stateFileURL: pluginStateURL)
+let restoredPluginStatus = await restoredPluginSupervisor.status(pluginID: "demo")
+expect(restoredPluginStatus?.state == .reconnecting && restoredPluginStatus?.restartCount == 1, "插件 Worker 状态必须在重启后恢复，不能丢失重连预算")
 let sandboxedPluginRoot = temporaryDirectory.appendingPathComponent("sandboxed-plugin", isDirectory: true)
 let sandboxedPluginManifestDirectory = sandboxedPluginRoot.appendingPathComponent(".kimi-plugin", isDirectory: true)
 try FileManager.default.createDirectory(at: sandboxedPluginManifestDirectory, withIntermediateDirectories: true)
@@ -547,6 +613,8 @@ let usageLedger = UsageLedger()
 let usageEntry = UsageLedgerEntry(operationID: UUID(), stage: .explore, provider: "kimi", model: "kimi-fast", inputTokens: 100, outputTokens: 40, cachedTokens: 50, latencyMS: 120, estimatedCost: 0.1, qualityScore: nil)
 try usageLedger.append(usageEntry)
 expect(usageLedger.snapshot().count == 1 && usageLedger.totalCost() == 0.1, "模型调用必须记录 Token、延迟和成本")
+try usageLedger.append(usageEntry)
+expect(usageLedger.snapshot().count == 1, "同一 Usage Ledger Entry 重放时不得重复计费")
 expect(usageLedger.contains(operationID: usageEntry.operationID), "用量账本必须能防止同一 Operation 重复记账")
 let priceCard = ModelPriceCard(inputPerMillion: 1, outputPerMillion: 2, cachedInputPerMillion: 0.25)
 expect(priceCard.estimate(inputTokens: 1_000, outputTokens: 500, cachedTokens: 200) == Decimal(string: "0.00185")!, "模型价格卡必须按输入、输出和缓存 Token 计算成本")
@@ -641,6 +709,67 @@ let hookedCoordinator = ToolExecutionCoordinator(
 )
 let hookedResult = try await hookedCoordinator.execute(ToolExecutionRequest(taskID: UUID(), sessionID: UUID(), agentID: "test", toolID: "hooked", input: ["path": "../escape"]))
 expect(hookedResult.output == "safe.txt", "Hook 修改参数后必须在真实 Tool 执行链生效")
+let skipExecutionCounter = InvocationCounter()
+let skipCoordinator = ToolExecutionCoordinator(
+  registry: hookRegistry,
+  permissionResolver: StaticToolPermissionResolver(decision: .allow),
+  hookResolver: { _ in
+    HarnessHookResolution(action: .skip, isAllowed: true, denialReason: "hook skip", arguments: [:], context: [], auditHookIDs: [])
+  }
+)
+await hookRegistry.register(
+  ToolDefinition(id: "skipped", title: "Skipped", description: "skip test", permissionScopes: []),
+  executor: ClosureToolExecutor { _ in
+    skipExecutionCounter.increment()
+    return ToolExecutionResult(output: "must not execute")
+  }
+)
+let skippedResult = try awaitValue {
+  try await skipCoordinator.execute(ToolExecutionRequest(taskID: UUID(), sessionID: UUID(), agentID: "test", toolID: "skipped"))
+}
+expect(skipExecutionCounter.count == 0 && skippedResult.metadata["hookAction"] == "skip", "Hook skip 必须在统一 Runtime 中短路执行且返回结构化结果")
+let askApprovalCounter = InvocationCounter()
+let askCoordinator = ToolExecutionCoordinator(
+  registry: hookRegistry,
+  permissionResolver: StaticToolPermissionResolver(decision: .allow),
+  approvalHandler: { _, _ in
+    askApprovalCounter.increment()
+    return .allow
+  },
+  hookResolver: { _ in
+    HarnessHookResolution(action: .askUser, isAllowed: false, denialReason: "hook asks", arguments: [:], context: [], auditHookIDs: [])
+  }
+)
+await hookRegistry.register(
+  ToolDefinition(id: "asked", title: "Asked", description: "ask test", permissionScopes: []),
+  executor: ClosureToolExecutor { _ in
+    ToolExecutionResult(output: "approved")
+  }
+)
+let askedResult = try awaitValue {
+  try await askCoordinator.execute(ToolExecutionRequest(taskID: UUID(), sessionID: UUID(), agentID: "test", toolID: "asked"))
+}
+expect(askApprovalCounter.count == 1 && askedResult.output == "approved", "Hook askUser 必须复用统一审批入口后继续执行")
+let retryHookCounter = InvocationCounter()
+let retryCoordinator = ToolExecutionCoordinator(
+  registry: hookRegistry,
+  permissionResolver: StaticToolPermissionResolver(decision: .allow),
+  hookResolver: { _ in
+    retryHookCounter.increment()
+    if retryHookCounter.count == 1 {
+      return HarnessHookResolution(action: .retry, isAllowed: true, denialReason: "transient hook", arguments: [:], context: [], auditHookIDs: [])
+    }
+    return HarnessHookResolution(isAllowed: true, arguments: [:], context: [], auditHookIDs: [])
+  }
+)
+await hookRegistry.register(
+  ToolDefinition(id: "retried", title: "Retried", description: "retry test", permissionScopes: []),
+  executor: ClosureToolExecutor { _ in ToolExecutionResult(output: "retry approved") }
+)
+let retriedResult = try awaitValue {
+  try await retryCoordinator.execute(ToolExecutionRequest(taskID: UUID(), sessionID: UUID(), agentID: "test", toolID: "retried"))
+}
+expect(retryHookCounter.count == 2 && retriedResult.output == "retry approved", "Hook retry 必须重新评估当前工具后再进入副作用链")
 
 let webResearchEvent = AgentEvent(
   sessionID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
@@ -1753,9 +1882,17 @@ rl.on('line', line => {
   if (!line.trim()) return;
   const request = JSON.parse(line);
   if (request.method === 'initialize') {
-    respond({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2024-11-05', serverInfo: { name: 'fake-mcp', version: '1.0.0' }, capabilities: { tools: {} } } });
+    respond({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2024-11-05', serverInfo: { name: 'fake-mcp', version: '1.0.0' }, capabilities: { tools: {}, resources: {}, prompts: {}, elicitation: {} } } });
   } else if (request.method === 'tools/list') {
     respond({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'echo', description: 'echo text', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } }] } });
+  } else if (request.method === 'resources/list') {
+    respond({ jsonrpc: '2.0', id: request.id, result: { resources: [{ uri: 'file:///workspace/README.md', name: 'README', description: 'Project README', mimeType: 'text/markdown' }] } });
+  } else if (request.method === 'prompts/list') {
+    respond({ jsonrpc: '2.0', id: request.id, result: { prompts: [{ name: 'explain', description: 'Explain project', arguments: [{ name: 'path', required: true }] }] } });
+  } else if (request.method === 'resources/read') {
+    respond({ jsonrpc: '2.0', id: request.id, result: { contents: [{ uri: request.params.uri, mimeType: 'text/markdown', text: '# README' }] } });
+  } else if (request.method === 'prompts/get') {
+    respond({ jsonrpc: '2.0', id: request.id, result: { description: 'Explain project', messages: [{ role: 'user', content: { type: 'text', text: `Explain:${request.params.arguments.path}` } }] } });
   } else if (request.method === 'tools/call') {
     respond({ jsonrpc: '2.0', id: request.id, result: { content: [{ type: 'text', text: `echo:${request.params.arguments.text}` }] } });
   }
@@ -1820,6 +1957,10 @@ expect(mcpStatuses.first?.state == .running, "stdio MCP 服务器启动后应报
 let runtimeMCPServerID = loadedExtensionConfig.mcpServers[0].id
 let runtimeMCPTools = try extensionRuntime.listMCPTools(serverID: runtimeMCPServerID)
 expect(runtimeMCPTools.first?.name == "echo", "扩展运行时必须能通过 MCP 读取工具列表")
+let runtimeMCPResources = try extensionRuntime.listMCPResources(serverID: runtimeMCPServerID)
+expect(runtimeMCPResources.first?.name == "README", "扩展运行时必须暴露 MCP Resources")
+let runtimeMCPPrompts = try extensionRuntime.listMCPPrompts(serverID: runtimeMCPServerID)
+expect(runtimeMCPPrompts.first?.name == "explain", "扩展运行时必须暴露 MCP Prompts")
 let runtimeMCPCall = try extensionRuntime.callMCPTool(serverID: runtimeMCPServerID, name: "echo", arguments: ["text": "Runtime"])
 expect(runtimeMCPCall.standardOutput.contains("echo:Runtime"), "扩展运行时必须能通过 MCP 调用工具")
 let mcpEscapeScriptURL = extensionWorkspace.appendingPathComponent("escape-mcp.mjs")
@@ -1869,6 +2010,90 @@ if let harnessMCPDefinition {
   }
   expect(harnessMCPResult.output.contains("echo:Harness"), "Harness MCP Adapter 必须通过 MCP Worker 返回真实 Tool Result")
 }
+let harnessMCPResourceID = "mcp.\(runtimeMCPServerID.uuidString.lowercased()).resources.read"
+let harnessMCPPromptID = "mcp.\(runtimeMCPServerID.uuidString.lowercased()).prompts.get"
+expect(
+  harnessMCPDefinitions.contains(where: { $0.id == harnessMCPResourceID }),
+  "Harness 必须将 MCP Resources 注册为可审计的读取工具"
+)
+expect(
+  harnessMCPDefinitions.contains(where: { $0.id == harnessMCPPromptID }),
+  "Harness 必须将 MCP Prompts 注册为可审计的提示工具"
+)
+let harnessMCPResourceResult = try awaitValue {
+  try await harnessMCPExecutor.execute(ToolExecutionRequest(
+    taskID: kernelTaskID,
+    sessionID: kernelSessionID,
+    operationID: kernelTaskID,
+    agentID: "main",
+    toolID: harnessMCPResourceID,
+    input: ["uri": "file:///workspace/README.md"]
+  ))
+}
+expect(harnessMCPResourceResult.output.contains("# README"), "Harness MCP Resource 工具必须返回真实正文")
+let harnessMCPPromptResult = try awaitValue {
+  try await harnessMCPExecutor.execute(ToolExecutionRequest(
+    taskID: kernelTaskID,
+    sessionID: kernelSessionID,
+    operationID: kernelTaskID,
+    agentID: "main",
+    toolID: harnessMCPPromptID,
+    input: ["name": "explain", "path": "README.md"]
+  ))
+}
+expect(harnessMCPPromptResult.output.contains("Explain:README.md"), "Harness MCP Prompt 工具必须返回真实 Prompt 消息")
+
+let toolsOnlyMCPWorkspace = temporaryDirectory.appendingPathComponent("mcp-tools-only-\(UUID().uuidString)", isDirectory: true)
+try FileManager.default.createDirectory(at: toolsOnlyMCPWorkspace, withIntermediateDirectories: true)
+let toolsOnlyMCPServerScriptURL = toolsOnlyMCPWorkspace.appendingPathComponent("tools-only.mjs")
+try #"""
+import readline from 'node:readline';
+const rl = readline.createInterface({ input: process.stdin });
+const respond = (message) => process.stdout.write(JSON.stringify(message) + '\n');
+rl.on('line', line => {
+  if (!line.trim()) return;
+  const request = JSON.parse(line);
+  if (request.method === 'initialize') {
+    respond({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2024-11-05', serverInfo: { name: 'tools-only', version: '1.0.0' }, capabilities: { tools: {} } } });
+  } else if (request.method === 'tools/list') {
+    respond({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'echo', description: 'echo', inputSchema: { type: 'object' } }] } });
+  } else if (request.id !== undefined) {
+    respond({ jsonrpc: '2.0', id: request.id, error: { code: -32601, message: 'Method not found' } });
+  }
+});
+"""#.write(to: toolsOnlyMCPServerScriptURL, atomically: true, encoding: .utf8)
+let toolsOnlyConfiguration = ProjectAgentConfiguration(
+  mcpServers: [
+    MCPServerConfiguration(
+      name: "tools-only",
+      transport: .stdio,
+      command: "/usr/bin/env",
+      endpoint: nil,
+      arguments: ["node", toolsOnlyMCPServerScriptURL.path],
+      isEnabled: true
+    )
+  ]
+)
+try toolsOnlyConfiguration.write(projectDirectory: toolsOnlyMCPWorkspace)
+let toolsOnlyRuntime = ProjectExtensionRuntime(projectDirectory: toolsOnlyMCPWorkspace)
+let toolsOnlyServerID = toolsOnlyConfiguration.mcpServers[0].id
+let toolsOnlyResources = try toolsOnlyRuntime.listMCPResources(serverID: toolsOnlyServerID)
+expect(
+  toolsOnlyResources.isEmpty,
+  "未声明 Resources 能力的 MCP Server 必须在 Harness 中安全跳过 Resources"
+)
+let toolsOnlyPrompts = try toolsOnlyRuntime.listMCPPrompts(serverID: toolsOnlyServerID)
+expect(
+  toolsOnlyPrompts.isEmpty,
+  "未声明 Prompts 能力的 MCP Server 必须在 Harness 中安全跳过 Prompts"
+)
+let toolsOnlyDefinitions = try MCPHarnessToolExecutor(runtime: toolsOnlyRuntime).discoverDefinitions()
+expect(
+  toolsOnlyDefinitions.contains(where: { $0.id.hasSuffix(".echo") }) &&
+    !toolsOnlyDefinitions.contains(where: { $0.id == MCPHarnessToolIdentifier.resourceReader(serverID: toolsOnlyServerID) }) &&
+    !toolsOnlyDefinitions.contains(where: { $0.id == MCPHarnessToolIdentifier.promptGetter(serverID: toolsOnlyServerID) }),
+  "可选 MCP 能力缺失不得阻断普通 MCP Tool 发现"
+)
 
 let extensionManagement = ExtensionManagementPresentation(
   configuration: loadedExtensionConfig,
@@ -1894,8 +2119,17 @@ let mcpClient = try MCPStdioClient(
 )
 let mcpInitializeResult = try mcpClient.initialize()
 expect(mcpInitializeResult.serverInfo.name == "fake-mcp", "MCP 客户端必须完成初始化握手")
+expect(mcpInitializeResult.capabilities.resources && mcpInitializeResult.capabilities.prompts, "MCP 握手必须保留 Resources 和 Prompts 能力声明")
 let mcpTools = try mcpClient.listTools()
 expect(mcpTools.count == 1 && mcpTools.first?.name == "echo", "MCP 客户端必须读取工具列表")
+let mcpResources = try mcpClient.listResources()
+expect(mcpResources.first?.uri == "file:///workspace/README.md", "MCP 客户端必须读取 Resources")
+let mcpPrompts = try mcpClient.listPrompts()
+expect(mcpPrompts.first?.name == "explain" && mcpPrompts.first?.arguments.first?.required == true, "MCP 客户端必须读取 Prompts 参数声明")
+let mcpResourceContents = try mcpClient.readResource(uri: "file:///workspace/README.md")
+expect(mcpResourceContents.first?.text == "# README", "MCP 客户端必须读取 Resource 正文")
+let mcpPromptResult = try mcpClient.getPrompt(name: "explain", arguments: ["path": "README.md"])
+expect(mcpPromptResult.messages.first?.text == "Explain:README.md", "MCP 客户端必须获取 Prompt 消息")
 let mcpCall = try mcpClient.callTool(name: "echo", arguments: ["text": "Kimi"])
 expect(mcpCall.standardOutput.contains("echo:Kimi"), "MCP 客户端必须调用工具并回传结果")
 mcpClient.close()
@@ -1928,6 +2162,43 @@ MockMCPHTTPURLProtocol.responses = [
     "jsonrpc": "2.0",
     "id": 4,
     "result": [
+      "resources": [
+        ["uri": "https://mcp.example/docs", "name": "Docs", "description": "HTTP docs", "mimeType": "text/html"]
+      ]
+    ]
+  ]),
+  try JSONSerialization.data(withJSONObject: [
+    "jsonrpc": "2.0",
+    "id": 5,
+    "result": [
+      "prompts": [
+        ["name": "summarize", "description": "Summarize docs", "arguments": [["name": "uri", "required": true]]]
+      ]
+    ]
+  ]),
+  try JSONSerialization.data(withJSONObject: [
+    "jsonrpc": "2.0",
+    "id": 6,
+    "result": [
+      "contents": [
+        ["uri": "https://mcp.example/docs", "mimeType": "text/html", "text": "<h1>Docs</h1>"]
+      ]
+    ]
+  ]),
+  try JSONSerialization.data(withJSONObject: [
+    "jsonrpc": "2.0",
+    "id": 7,
+    "result": [
+      "description": "Summarize docs",
+      "messages": [
+        ["role": "user", "content": ["type": "text", "text": "Summarize:https://mcp.example/docs"]]
+      ]
+    ]
+  ]),
+  try JSONSerialization.data(withJSONObject: [
+    "jsonrpc": "2.0",
+    "id": 8,
+    "result": [
       "content": [
         ["type": "text", "text": "echo:HTTP"]
       ]
@@ -1945,6 +2216,14 @@ let httpMCPInitializeResult = try httpMCPClient.initialize()
 expect(httpMCPInitializeResult.serverInfo.name == "http-mcp", "HTTP MCP 客户端必须完成 initialize 握手")
 let httpMCPTools = try httpMCPClient.listTools()
 expect(httpMCPTools.first?.name == "echo", "HTTP MCP 客户端必须读取工具列表")
+let httpMCPResources = try httpMCPClient.listResources()
+expect(httpMCPResources.first?.mimeType == "text/html", "HTTP MCP 客户端必须读取 Resources")
+let httpMCPPrompts = try httpMCPClient.listPrompts()
+expect(httpMCPPrompts.first?.arguments.first?.name == "uri", "HTTP MCP 客户端必须读取 Prompts 参数")
+let httpMCPResourceContents = try httpMCPClient.readResource(uri: "https://mcp.example/docs")
+expect(httpMCPResourceContents.first?.text == "<h1>Docs</h1>", "HTTP MCP 客户端必须读取 Resource 正文")
+let httpMCPPromptResult = try httpMCPClient.getPrompt(name: "summarize", arguments: ["uri": "https://mcp.example/docs"])
+expect(httpMCPPromptResult.messages.first?.text == "Summarize:https://mcp.example/docs", "HTTP MCP 客户端必须获取 Prompt 消息")
 let httpMCPCall = try httpMCPClient.callTool(name: "echo", arguments: ["text": "HTTP"])
 expect(httpMCPCall.standardOutput.contains("echo:HTTP"), "HTTP MCP 客户端必须调用工具并回传结果")
 httpMCPClient.close()
@@ -3062,6 +3341,36 @@ let restoredScheduler = AgentRunScheduler(snapshot: schedulerSnapshot)
 let restoredSchedulerRuns = try awaitValue { await restoredScheduler.snapshot() }
 expect(restoredSchedulerRuns.count == sameWorktreeRuns.count && restoredSchedulerRuns.contains(where: { $0.state == .interrupted }), "Scheduler 快照恢复必须把未结算节点标为 interrupted，等待用户继续")
 
+let allocatorImplement = AgentRun(parentSessionID: schedulerSession, taskID: schedulerTask, definition: AgentOrchestrator.builtInDefinition(for: .implement))
+let allocatorTest = AgentRun(
+  parentSessionID: schedulerSession,
+  taskID: schedulerTask,
+  definition: AgentOrchestrator.builtInDefinition(for: .test),
+  dependencies: [allocatorImplement.id]
+)
+let allocatorDebug = AgentRun(
+  parentSessionID: schedulerSession,
+  taskID: schedulerTask,
+  definition: AgentOrchestrator.builtInDefinition(for: .debug),
+  dependencies: [allocatorTest.id]
+)
+let allocatorParallelImplement = AgentRun(
+  parentSessionID: schedulerSession,
+  taskID: schedulerTask,
+  definition: AgentOrchestrator.builtInDefinition(for: .implement)
+)
+let allocatorRuns = [allocatorImplement, allocatorTest, allocatorDebug, allocatorParallelImplement]
+let allocatedRuns = AgentWorktreeAllocator.assign(
+  runs: allocatorRuns,
+  rootDirectory: temporaryDirectory.appendingPathComponent("graph-worktrees", isDirectory: true)
+)
+let implementationPath = allocatedRuns.first(where: { $0.id == allocatorImplement.id })?.worktreePath
+let parallelImplementationPath = allocatedRuns.first(where: { $0.id == allocatorParallelImplement.id })?.worktreePath
+expect(implementationPath != nil && implementationPath != parallelImplementationPath, "并行独立实现 Worker 必须分配不同 Worktree")
+expect(allocatedRuns.first(where: { $0.id == allocatorTest.id })?.worktreePath == implementationPath, "Test 必须在 Implement 的 Worktree 上验证真实改动")
+expect(allocatedRuns.first(where: { $0.id == allocatorDebug.id })?.worktreePath == implementationPath, "Debug 必须回到失败实现的 Worktree 修复")
+expect(allocatedRuns.first(where: { $0.definition.kind == .explore })?.worktreePath == nil, "只读 Worker 不应占用写入 Worktree")
+
 let supervisedTaskID = UUID()
 let supervisedParent = SessionRecord(taskID: supervisedTaskID, agentID: "supervisor", modelID: "kimi-k2.7-code")
 let supervisedExplore = AgentRun(
@@ -3095,6 +3404,7 @@ expect(supervisedRuns.allSatisfy { $0.state == .completed }, "Graph Supervisor �
 expect(supervisedRuns.allSatisfy { $0.childSessionID != nil }, "Graph Supervisor 必须将真实 Child Session ID 回写到 Scheduler")
 expect(supervisorRunTrace.snapshot.map { $0.split(separator: ":").first.map(String.init) ?? "" } == ["explore", "plan"], "Graph Supervisor 必须按 DAG 依赖顺序执行 Child Session")
 expect(supervisorRunTrace.snapshot.allSatisfy { $0.contains(":true:") && $0.hasSuffix(":false") }, "Child Session 必须继承父 Session、阶段 Prompt 与过滤后的工具集")
+expect(supervisorRunTrace.snapshot.last?.contains("上游阶段回流") == true, "下游 Child Session 必须获得上游阶段的结构化 Handoff")
 expect(supervisorSnapshots.count >= 3, "Graph Supervisor 必须在调度和结算时发布可投影快照，UI 不得轮询 Scheduler")
 
 var interruptedGraphRun = AgentRun(
@@ -3116,6 +3426,108 @@ let resumedGraphSnapshot = await restoredGraphSupervisor.snapshot()
 expect(resumedGraphSnapshot.runs.first?.state == .queued, "重启恢复必须将 interrupted Child Session 显式转回 queued，禁止静默重放")
 let restoredGraphRuns = try await restoredGraphSupervisor.run()
 expect(restoredGraphRuns.first?.state == .completed, "用户明确继续后 Graph Supervisor 必须从 durable snapshot 恢复执行")
+
+let unifiedKernelSessionID = UUID()
+let unifiedKernelTaskID = UUID()
+let kernelRuntimeCalls = InvocationCounter()
+let kernel = AgentKernel(
+  sessionID: unifiedKernelSessionID,
+  store: HarnessEventStore(),
+  runtime: AgentKernelRuntime(
+    operationDriver: { context, emit in
+      kernelRuntimeCalls.increment()
+      await emit(.assistantText("主会话完成：\(context.prompt.text)"))
+    },
+    childExecutor: { run, _, _, _ in
+      kernelRuntimeCalls.increment()
+      return AgentResult(summary: "Child \(run.definition.kind.title) 完成")
+    }
+  )
+)
+let kernelOperationID = try awaitValue {
+  try await kernel.prompt(PromptInput(text: "统一内核主会话"))
+}
+_ = try awaitValue {
+  try await kernel.wait(kernelOperationID, timeout: 2)
+  return true
+}
+let kernelRun = AgentRun(
+  parentSessionID: unifiedKernelSessionID,
+  taskID: unifiedKernelTaskID,
+  definition: AgentOrchestrator.builtInDefinition(for: .explore)
+)
+let kernelPlanRun = AgentRun(
+  parentSessionID: unifiedKernelSessionID,
+  taskID: unifiedKernelTaskID,
+  definition: AgentOrchestrator.builtInDefinition(for: .plan),
+  dependencies: [kernelRun.id]
+)
+let kernelGraphOperationID = try awaitValue {
+  try await kernel.startGraph(
+    taskID: unifiedKernelTaskID,
+    parent: SessionRecord(id: unifiedKernelSessionID, taskID: unifiedKernelTaskID, agentID: "supervisor"),
+    runs: [kernelRun, kernelPlanRun],
+    prompt: { _ in "统一内核 Child" }
+  )
+}
+_ = try awaitValue {
+  try await kernel.wait(kernelGraphOperationID, timeout: 2)
+  return true
+}
+let unifiedKernelSnapshot = try awaitValue { await kernel.snapshot() }
+expect(unifiedKernelSnapshot.operations[kernelOperationID]?.state == .completed, "AgentKernel 必须统一驱动主会话 Operation")
+expect(unifiedKernelSnapshot.operations[kernelGraphOperationID]?.state == .completed, "AgentKernel 必须统一驱动 Child Graph Operation")
+expect(unifiedKernelSnapshot.handoffs[kernelGraphOperationID]?[kernelPlanRun.id]?.first?.sourceRunID == kernelRun.id, "AgentKernel Snapshot 必须保留并暴露上游阶段 Handoff")
+expect(kernelRuntimeCalls.count == 3, "主会话与 Child Graph 必须从同一个 Kernel Runtime 进入执行")
+let kernelGraphAnswer = try awaitValue {
+  try await kernel.finalAnswer(for: kernelGraphOperationID, contract: graphContract)
+}
+expect(kernelGraphAnswer.outcome == .completed && kernelGraphAnswer.finalAnswer.contains("已完成"), "Graph 最终答案必须由 Kernel 基于持久化快照统一生成")
+
+let durableGraphStore = HarnessEventStore()
+let durableGraphGate = OneShotAsyncGate()
+let durableGraphSessionID = UUID()
+let durableGraphTaskID = UUID()
+let durableGraphParent = SessionRecord(id: durableGraphSessionID, taskID: durableGraphTaskID, agentID: "supervisor")
+let durableGraphKernel = AgentKernel(
+  sessionID: durableGraphSessionID,
+  store: durableGraphStore,
+  runtime: AgentKernelRuntime(
+    operationDriver: { _, _ in },
+    childExecutor: { _, _, _, _ in
+      await durableGraphGate.wait()
+      return AgentResult(summary: "durable graph complete")
+    }
+  )
+)
+let durableGraphRun = AgentRun(
+  parentSessionID: durableGraphSessionID,
+  taskID: durableGraphTaskID,
+  definition: AgentOrchestrator.builtInDefinition(for: .explore)
+)
+let durableGraphOperationID = try awaitValue {
+  try await durableGraphKernel.startGraph(
+    taskID: durableGraphTaskID,
+    parent: durableGraphParent,
+    runs: [durableGraphRun],
+    prompt: { _ in "可恢复 Graph" }
+  )
+}
+try? await Task.sleep(nanoseconds: 50_000_000)
+let reopenedGraphKernel = AgentKernel(
+  sessionID: durableGraphSessionID,
+  store: durableGraphStore,
+  runtime: AgentKernelRuntime(
+    operationDriver: { _, _ in },
+    childExecutor: { _, _, _, _ in AgentResult(summary: "reopened graph complete") }
+  )
+)
+_ = try awaitValue { try await reopenedGraphKernel.restore(); return true }
+let reopenedGraphKernelSnapshot = try awaitValue { await reopenedGraphKernel.snapshot() }
+expect(reopenedGraphKernelSnapshot.graphSnapshots[durableGraphOperationID] != nil, "Kernel 必须从事件存储恢复 Graph Scheduler 快照")
+expect(reopenedGraphKernelSnapshot.operations[durableGraphOperationID]?.state == .suspended, "重启恢复的 Graph Operation 必须等待用户显式继续")
+await durableGraphGate.open()
+_ = try? awaitValue { try await durableGraphKernel.wait(durableGraphOperationID, timeout: 2); return true }
 
 let childCancellationTaskID = UUID()
 let childCancellationParent = SessionRecord(taskID: childCancellationTaskID, agentID: "supervisor")
@@ -3365,6 +3777,42 @@ let capabilityGrant = CapabilityGrant(
 expect(capabilityGrant.allows(action: .read, resource: temporaryDirectory.path, subjectID: orchestrationTaskID), "Agent 读取权限必须允许访问已授权工作区")
 expect(!capabilityGrant.allows(action: .write, resource: temporaryDirectory.path, subjectID: orchestrationTaskID), "未声明的写入权限必须被 Capability Grant 拒绝")
 expect(!capabilityGrant.allows(action: .read, resource: "/tmp/outside", subjectID: orchestrationTaskID), "Worktree 外的路径必须被 Capability Grant 拒绝")
+
+let unifiedPermissionGate = DefaultHarnessPermissionGate()
+let unifiedPermissionContext = HarnessPermissionContext(
+  taskID: orchestrationTaskID,
+  sessionID: UUID(),
+  worktreePath: temporaryDirectory.path,
+  grants: [capabilityGrant]
+)
+let unifiedReadDecision = try awaitValue {
+  await unifiedPermissionGate.evaluate(
+    request: ToolExecutionRequest(
+      taskID: orchestrationTaskID,
+      sessionID: unifiedPermissionContext.sessionID,
+      agentID: "explore",
+      toolID: "read",
+      resource: temporaryDirectory.appendingPathComponent("README.md").path
+    ),
+    tool: ToolDefinition(id: "read", title: "读取", description: "读取文件", permissionScopes: [.readWorkspace]),
+    context: unifiedPermissionContext
+  )
+}
+expect(unifiedReadDecision == .allow, "统一 Permission Gate 必须接受 Worktree 内已授权读取")
+let unifiedOutsideWriteDecision = try awaitValue {
+  await unifiedPermissionGate.evaluate(
+    request: ToolExecutionRequest(
+      taskID: orchestrationTaskID,
+      sessionID: unifiedPermissionContext.sessionID,
+      agentID: "implement",
+      toolID: "write",
+      resource: "/tmp/outside"
+    ),
+    tool: ToolDefinition(id: "write", title: "写入", description: "写入文件", permissionScopes: [.writeWorkspace]),
+    context: unifiedPermissionContext
+  )
+}
+expect(unifiedOutsideWriteDecision == .deny, "统一 Permission Gate 必须拒绝 Worktree 外写入")
 
 let kernelSessionID = UUID()
 let kernelTaskID = UUID()
@@ -3730,6 +4178,19 @@ expect(transcriptEvents.contains { $0.kind == .toolCallDeclared }, "Harness 必�
 expect(transcriptEvents.contains { $0.kind == .toolResultRecorded }, "Harness 必须持久化 tool result")
 expect(transcriptEvents.contains { $0.kind == .turnEnded }, "Harness 必须持久化 turnEnded")
 
+let checkpointHarness = AgentHarness(store: HarnessEventStore()) { context, emit in
+  await emit(.stepStarted(HarnessStepRecord(turnID: UUID(), step: 2, status: .running)))
+  await emit(.toolCallDeclared(HarnessToolCallRecord(
+    turnID: UUID(),
+    step: 2,
+    call: HarnessToolCall(id: "checkpoint-call", name: "read", argumentsJSON: "{}")
+  )))
+}
+let checkpointOperation = try awaitValue { try await checkpointHarness.prompt(PromptInput(text: "检查点")) }
+_ = try awaitValue { try await checkpointHarness.wait(for: checkpointOperation, timeout: 1); return true }
+let checkpointSnapshot = try awaitValue { await checkpointHarness.snapshot() }
+expect(checkpointSnapshot.checkpoints[checkpointOperation]?.step == 2, "Harness 必须在模型步骤边界持久化可恢复 checkpoint")
+
 let steeringTrace = ThreadSafeStringTrace()
 let steeringDriverReady = OneShotAsyncGate()
 let steeringMayRead = OneShotAsyncGate()
@@ -3877,8 +4338,14 @@ let providerContext = HarnessProviderContext(
   operationID: recoveryOperation,
   lane: .main,
   modelID: "kimi-k2.7-code",
-  messages: ["你好"]
+  messages: [
+    HarnessChatMessage(role: .system, content: "始终使用中文。"),
+    .user("你好"),
+    .assistant("我会读取文件。", toolCalls: [HarnessToolCall(id: "provider-call", name: "read", argumentsJSON: #"{\"path\":\"README.md\"}"#)]),
+    .tool(HarnessToolResult(callID: "provider-call", toolName: "read", output: "README 内容", isError: false))
+  ]
 )
+expect(providerContext.messages.map(\.role) == [.system, .user, .assistant, .tool], "Provider Context 必须保留 system/user/assistant/tool 的原始角色顺序")
 let provider = StaticHarnessModelProvider(events: [.text("回复")])
 let providerEvents = try awaitValue {
   let stream = try await provider.stream(context: providerContext, tools: [], signal: nil)
@@ -3887,6 +4354,34 @@ let providerEvents = try awaitValue {
   return values
 }
 expect(providerEvents.contains { $0.kind == .text && $0.text == "回复" }, "Provider Adapter 必须输出统一 ModelEvent")
+let retryingProvider = RetryingHarnessModelProvider(
+  base: FlakyHarnessProvider(),
+  maxAttempts: 2,
+  backoffNanoseconds: 1
+)
+let retryingEvents = try awaitValue {
+  let stream = try await retryingProvider.stream(context: providerContext, tools: [], signal: nil)
+  var values: [HarnessModelEvent] = []
+  for try await event in stream { values.append(event) }
+  return values
+}
+expect(retryingEvents.contains { $0.text == "retry succeeded" }, "Provider 瞬态失败必须在没有输出时按退避策略重试")
+let retryingConversationProvider = RetryingHarnessConversationProvider(
+  base: FlakyConversationProvider(),
+  maxAttempts: 2,
+  backoffNanoseconds: 1
+)
+let retryingConversationEvents = try awaitValue {
+  let stream = try await retryingConversationProvider.stream(
+    request: HarnessConversationRequest(modelID: "kimi", messages: [.user("重试")]),
+    tools: [],
+    signal: nil
+  )
+  var values: [HarnessConversationEvent] = []
+  for try await event in stream { values.append(event) }
+  return values
+}
+expect(retryingConversationEvents.contains { $0 == .text("conversation retry succeeded") }, "Conversation Provider 瞬态失败必须在没有输出时自动重试")
 
 let nativeLoopProvider = ScriptedHarnessConversationProvider(turns: [
   [.text("我先读取文件。"), .toolCall(id: "call-1", name: "read", argumentsJSON: "{\"path\":\"README.md\"}")],
@@ -4170,8 +4665,8 @@ expect(
 )
 
 // Specialized adapters must be executable through the same native runtime
-// boundary as filesystem and shell tools. These checks intentionally exercise
-// the Browser/MCP/Computer Use paths before the implementation is wired.
+// boundary as filesystem and shell tools. These checks exercise the Browser,
+// MCP, and Computer Use paths through their production Harness adapters.
 let specializedCalls = LockedStringCollector()
 let specializedRuntime = NativeHarnessToolRuntime(
   workspaceURL: nativeToolWorkspace,
