@@ -145,16 +145,26 @@ public struct ProjectedContext: Equatable, Sendable {
   public let unresolved: [String]
 
   public var promptText: String {
-    [
-      contract.promptText,
-      rules.isEmpty ? nil : "生效规则：\n" + rules.joined(separator: "\n"),
-      verifiedResults.isEmpty ? nil : "已验证证据：\n" + verifiedResults.joined(separator: "\n"),
-      unresolved.isEmpty ? nil : "未解决问题：\n" + unresolved.joined(separator: "\n"),
-      summary.isEmpty ? nil : "历史摘要：\(summary)",
-      recentTurns.isEmpty ? nil : "最近对话：\n" + recentTurns.map { "用户：\($0.userMessage)\n助手：\($0.assistantMessage)" }.joined(separator: "\n\n")
-    ]
-      .compactMap { $0 }
-      .joined(separator: "\n\n")
+    var sections: [String] = [contract.promptText]
+    if !rules.isEmpty {
+      sections.append("生效规则：\n" + rules.joined(separator: "\n"))
+    }
+    if !verifiedResults.isEmpty {
+      sections.append("已验证证据：\n" + verifiedResults.joined(separator: "\n"))
+    }
+    if !unresolved.isEmpty {
+      sections.append("未解决问题：\n" + unresolved.joined(separator: "\n"))
+    }
+    if !summary.isEmpty {
+      sections.append("历史摘要：\(summary)")
+    }
+    if !recentTurns.isEmpty {
+      let recentConversation = recentTurns
+        .map { "用户：\($0.userMessage)\n助手：\($0.assistantMessage)" }
+        .joined(separator: "\n\n")
+      sections.append("最近对话：\n" + recentConversation)
+    }
+    return sections.joined(separator: "\n\n")
   }
 
   public init(
