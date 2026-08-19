@@ -251,9 +251,22 @@ cd vendor/opencode/packages/kimi-code-agent-plugin && bun test
 git diff --check
 ```
 
+## 安装（从 GitHub Releases 下载）
+
+发布包使用 ad-hoc 签名，未经过 Apple 公证，因此首次打开时 macOS Gatekeeper 会拦截。两种放行方式任选其一：
+
+1. 在「应用程序」文件夹里**右键点击 Kimi Code Agent → 打开**，在弹窗中再点「打开」；或
+2. 终端执行：
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Kimi Code Agent.app"
+```
+
+之后正常双击启动即可。应用只需要一次放行。
+
 ## 发布与校验
 
-GitHub 分发不是 App Store 分发。正式 Release 需要 Developer ID 签名和 Apple 公证；本地开发包可能使用 ad-hoc 签名。完整流程见 [`docs/GITHUB_RELEASES.md`](docs/GITHUB_RELEASES.md)。
+GitHub 分发不是 App Store 分发。发布包统一使用 ad-hoc 签名直接分发，**不需要 Apple Developer ID，也不做公证**；CI 只有在配置了可选签名 secrets 时才会走 Developer ID + 公证路径。完整流程见 [`docs/GITHUB_RELEASES.md`](docs/GITHUB_RELEASES.md)。
 
 ### 自动更新（Sparkle）
 
@@ -320,7 +333,7 @@ codesign --verify --deep --strict \
 - 默认 Kimi API，保留 OpenCode Provider 协议与兼容 Provider；
 - Browser、Computer Use、MCP、Skills、Hooks、Plugins 的真实能力受本机权限、服务配置和 Worker 状态影响；
 - Computer Use 不是后台静默自动化，高风险动作始终需要用户确认；
-- 本地开发包的签名和公证状态取决于发布环境；
+- 发布包为 ad-hoc 签名、未公证，首次启动需按安装章节放行 Gatekeeper；仅支持 Apple Silicon（arm64）；
 - 未配置真实 MCP Server 时，只能验证 MCP 协议和故障恢复，不应宣称某个第三方 MCP 集成已验收。
 
 ## 维护原则

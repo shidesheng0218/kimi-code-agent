@@ -34,7 +34,7 @@
 - GitHub / GitLab 管理入口；
 - WKWebView 浏览器验证；
 - 内置 Kimi Runtime 与 macOS Node Runtime；
-- arm64 / x86_64 / universal 原生发布路径。
+- arm64 原生发布路径（GitHub Releases 直接分发，ad-hoc 签名、不公证）。
 
 ## 当前维护原则
 

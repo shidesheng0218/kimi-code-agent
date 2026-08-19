@@ -63,7 +63,7 @@ jobs:
           swift build --package-path macos --product KimiNativeBridge -Xswiftc -disable-batch-mode --jobs 1
 
   release:
-    name: Build, notarize, and publish macOS release
+    name: Build and publish macOS release
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.version != '')
@@ -91,7 +91,27 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      # Distribution is GitHub-Releases-only with ad-hoc signing. Developer ID
+      # certificate import and notarization are skipped unless the optional
+      # secrets are configured.
+      - name: Detect optional signing credentials
+        id: signing
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          if [ -n "$BUILD_CERTIFICATE_BASE64" ] && [ -n "$APPLE_ID" ] && \
+             [ -n "$APPLE_TEAM_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "No Developer ID secrets configured; release will use ad-hoc signing (not notarized)."
+          fi
+
       - name: Import Developer ID certificate
+        if: steps.signing.outputs.available == 'true'
         env:
           BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
@@ -110,6 +130,7 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
 
       - name: Configure notary credentials
+        if: steps.signing.outputs.available == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
