@@ -8,8 +8,6 @@
   "type": "commonjs",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "bundle:cli": "node scripts/bundle-cli.mjs",
-    "build:full": "npm run build && npm run bundle:cli",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
