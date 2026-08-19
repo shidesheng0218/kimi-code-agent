@@ -14,25 +14,5 @@
       <pubDate>Wed, 19 Aug 2026 06:53:06 GMT</pubDate>
       <enclosure url="https://github.com/shidesheng0218/kimi-code-agent/releases/download/v0.3.3/Kimi-Code-Agent-0.3.3-mac-arm64.zip" type="application/octet-stream" sparkle:edSignature="YzH1jupSRbERGQxGoKUJhG86E59MawowMAdDLlxuN7CrfdqzzrBWuqZiBVJ3clQWTrJ5JB62/aGkYS+zvw0FCA==" length="42062857"/>
     </item>
-
-    <item>
-      <title>0.3.2</title>
-      <sparkle:version>032</sparkle:version>
-      <sparkle:shortVersionString>0.3.2</sparkle:shortVersionString>
-      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-      <sparkle:releaseNotesLink>https://github.com/shidesheng0218/kimi-code-agent/releases/tag/v0.3.2</sparkle:releaseNotesLink>
-      <pubDate>Wed, 19 Aug 2026 04:52:04 GMT</pubDate>
-      <enclosure url="https://github.com/shidesheng0218/kimi-code-agent/releases/download/v0.3.2/Kimi-Code-Agent-0.3.2-mac-arm64.zip" type="application/octet-stream" sparkle:edSignature="milcOWeoxTiMnQteTBc0wSQ4q7dRpHQOeu/gSWo2W549Hp0S1mkfLhQ82OxI6lKAm9ErmFbGQUYRseeLjWfGCw==" length="42008303"/>
-    </item>
-
-    <item>
-      <title>0.3.1</title>
-      <sparkle:version>031</sparkle:version>
-      <sparkle:shortVersionString>0.3.1</sparkle:shortVersionString>
-      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-      <sparkle:releaseNotesLink>https://github.com/shidesheng0218/kimi-code-agent/releases/tag/v0.3.1</sparkle:releaseNotesLink>
-      <pubDate>Wed, 19 Aug 2026 03:46:37 GMT</pubDate>
-      <enclosure url="https://github.com/shidesheng0218/kimi-code-agent/releases/download/v0.3.1/Kimi-Code-Agent-0.3.1-mac-arm64.zip" type="application/octet-stream" sparkle:edSignature="Un+EH4rIIejCazfDo1vq0ZKGMYgZlxuJnfNsGcufmIzjcZnOuPgQzZTTCi4+W5xsgA+v6wkEWcioPWzNX1P5Cg==" length="41455289"/>
-    </item>
   </channel>
 </rss>
