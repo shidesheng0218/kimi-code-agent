@@ -116,7 +116,7 @@ Needs Input → Working → Waiting Approval → Completed
 
 ### 1. 下载
 
-打开 [GitHub Releases](https://github.com/shidesheng0218/kimi-agent-desktop-macos/releases)，下载对应架构的 DMG 或 ZIP。
+打开 [GitHub Releases](https://github.com/shidesheng0218/kimi-code-agent/releases)，下载对应架构的 DMG 或 ZIP。
 
 1. 双击 DMG，将 **Kimi Code Agent** 拖入“应用程序”；
 2. 启动应用；
@@ -222,8 +222,8 @@ Kimi API 是默认模型入口。ACP / CLI 只产生模型事件，作为兼容�
 要求：macOS 14+、Xcode Command Line Tools、Swift 6 工具链和 Node.js。发布包自带运行所需组件，最终用户不需要另行安装 Node 或 Bun。
 
 ```bash
-git clone https://github.com/shidesheng0218/kimi-agent-desktop-macos.git
-cd kimi-agent-desktop-macos
+git clone https://github.com/shidesheng0218/kimi-code-agent.git
+cd kimi-code-agent
 npm install
 
 # 旧项目的 TypeScript 检查、JS 单测、Swift CoreChecks
