@@ -43,13 +43,24 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
-      - name: Verify source and native core
-        run: npm run verify
+      - name: Verify source
+        run: npm run check && npm test
+
+      # Build and run as separate steps: `swift run` keeps the SPM driver
+      # process resident with the full build graph (several GB after compiling
+      # 120 KimiAgentCore files) and then execs the checks binary, so the 8 GB
+      # runner's jetsam kills the process group (exit 137). Building first lets
+      # the driver exit and free memory; the binary itself peaks at ~37 MB.
+      - name: Verify native core
+        run: |
+          cd macos
+          swift build --product KimiAgentCoreChecks -Xswiftc -disable-batch-mode --jobs 1
+          "$(swift build --show-bin-path)/KimiAgentCoreChecks"
 
       - name: Build native Kimi Code Agent targets
         run: |
-          swift build --package-path macos --product KimiCodeAgent
-          swift build --package-path macos --product KimiNativeBridge
+          swift build --package-path macos --product KimiCodeAgent -Xswiftc -disable-batch-mode --jobs 1
+          swift build --package-path macos --product KimiNativeBridge -Xswiftc -disable-batch-mode --jobs 1
 
   release:
     name: Build, notarize, and publish macOS release
