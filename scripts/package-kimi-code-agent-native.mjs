@@ -7,7 +7,11 @@ import { fileURLToPath } from "node:url"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const packageJSON = JSON.parse(await readFile(path.join(root, "package.json"), "utf8"))
-const version = process.env.KIMI_VERSION || packageJSON.version
+// KIMI_VERSION arrives as a git tag (e.g. "v0.3.3") in CI but as a bare
+// semver locally. Normalize to the bare semver so bundle versions, artifact
+// filenames, and appcast entries never carry a "v" prefix; the tag is
+// re-derived as `v${version}` where needed.
+const version = (process.env.KIMI_VERSION || packageJSON.version).replace(/^v/, "")
 const arch = process.arch === "arm64" ? "arm64" : "x64"
 // Sparkle update feed and EdDSA public key. The private key lives only in the
 // release machine's Keychain (see README release process); losing it blocks
