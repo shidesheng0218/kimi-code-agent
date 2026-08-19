@@ -2,22 +2,18 @@
 import PackageDescription
 
 let package = Package(
-  name: "KimiAgentDesktop",
+  name: "KimiCodeAgent",
   platforms: [.macOS(.v14)],
   products: [
     .library(name: "KimiAgentCore", targets: ["KimiAgentCore"]),
-    .executable(name: "KimiAgentDesktop", targets: ["KimiAgentDesktop"])
+    .executable(name: "KimiCodeAgent", targets: ["KimiCodeAgent"]),
+    .executable(name: "KimiNativeBridge", targets: ["KimiNativeBridge"])
   ],
-  dependencies: [
-    .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.18.0")
-  ],
+  dependencies: [],
   targets: [
     .target(name: "KimiAgentCore"),
-    .executableTarget(
-      name: "KimiAgentDesktop",
-      dependencies: ["KimiAgentCore", .product(name: "SwiftTerm", package: "SwiftTerm")],
-      resources: [.copy("Resources")]
-    ),
+    .executableTarget(name: "KimiCodeAgent", dependencies: ["KimiAgentCore"]),
+    .executableTarget(name: "KimiNativeBridge", dependencies: ["KimiAgentCore"]),
     .executableTarget(name: "KimiAgentCoreChecks", dependencies: ["KimiAgentCore"])
   ]
 )

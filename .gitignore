@@ -7,6 +7,11 @@ release-native/
 macos/.build/
 macos/.cache/
 macos/Sources/KimiAgentDesktop/Resources/kimi.mjs
+vendor/opencode/**/node_modules/
+vendor/opencode/**/dist/
+vendor/opencode/**/out/
+vendor/opencode/**/.turbo/
+vendor/opencode/packages/desktop/resources/opencode-cli
 *.vsix
 .DS_Store
 coverage/

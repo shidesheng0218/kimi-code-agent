@@ -247,7 +247,7 @@ public final class MCPStdioClient: @unchecked Sendable {
     }
     let params: [String: Any] = [
       "protocolVersion": "2024-11-05",
-      "clientInfo": ["name": "KimiAgentDesktop", "version": "0.3.0"],
+      "clientInfo": ["name": "KimiCodeAgent", "version": "0.3.0"],
       "capabilities": ["tools": [:], "resources": [:], "prompts": [:], "elicitation": [:]]
     ]
     let response = try request(method: "initialize", params: params)

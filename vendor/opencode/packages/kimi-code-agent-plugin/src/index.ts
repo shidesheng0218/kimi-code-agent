@@ -1,0 +1,325 @@
+import { randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import { mkdir } from 'node:fs/promises'
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { tool, type Plugin } from '@opencode-ai/plugin'
+
+type BrowserStep = {
+  kind: string
+  url?: string
+  selector?: string
+  text?: string
+  key?: string
+  artifactName?: string
+  requiresApproval?: boolean
+  timeoutSeconds?: number
+}
+
+type BrowserPlan = {
+  allowedDomains: string[]
+  steps: BrowserStep[]
+  stopOnFailure?: boolean
+  maxRepairRounds?: number
+}
+
+type NativeResponse = {
+  requestID: string
+  ok: boolean
+  output: string
+  metadata: Record<string, string>
+  error?: string
+  browserResult?: {
+    artifacts: Array<{ kind: string; name: string; path?: string }>
+  }
+}
+
+const browserStepKinds = new Set([
+  'open',
+  'navigate',
+  'inspect',
+  'click',
+  'typeText',
+  'pressKey',
+  'scroll',
+  'screenshot',
+  'collectConsole',
+  'collectNetwork',
+])
+
+const highRiskBrowserSteps = new Set(['click', 'typeText', 'pressKey'])
+
+export function prepareWebSearchRequest(input: unknown): { query: string; maxResults: number } {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('web search request must be an object')
+  const record = input as Record<string, unknown>
+  const query = typeof record.query === 'string' ? record.query.trim() : ''
+  if (!query) throw new Error('web search requires a query')
+  const requested = typeof record.maxResults === 'number' && Number.isFinite(record.maxResults)
+    ? Math.trunc(record.maxResults)
+    : 8
+  return { query, maxResults: Math.min(Math.max(requested, 1), 8) }
+}
+
+export function prepareWebFetchRequest(input: unknown): { url: string; sourceID?: string; maxCharacters: number } {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('web fetch request must be an object')
+  const record = input as Record<string, unknown>
+  if (typeof record.url !== 'string') throw new Error('web fetch requires a URL')
+  const url = new URL(record.url.trim())
+  assertPublicWebURL(url)
+  const requested = typeof record.maxCharacters === 'number' && Number.isFinite(record.maxCharacters)
+    ? Math.trunc(record.maxCharacters)
+    : 100000
+  const sourceID = typeof record.sourceID === 'string' && record.sourceID.trim() ? record.sourceID.trim() : undefined
+  return {
+    url: url.toString(),
+    ...(sourceID ? { sourceID } : {}),
+    maxCharacters: Math.min(Math.max(requested, 1000), 100000),
+  }
+}
+
+export function prepareBrowserPlan(raw: string): { plan: BrowserPlan; requiresApproval: boolean } {
+  const decoded: unknown = JSON.parse(raw)
+  if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) throw new Error('browser plan must be an object')
+  const record = decoded as Record<string, unknown>
+  if (!Array.isArray(record.steps) || record.steps.length === 0) throw new Error('browser plan requires at least one step')
+
+  const allowed = new Set(
+    Array.isArray(record.allowedDomains)
+      ? record.allowedDomains.filter((value): value is string => typeof value === 'string').map((value) => value.trim().toLowerCase()).filter(Boolean)
+      : [],
+  )
+  let requiresApproval = false
+  const steps = record.steps.map((rawStep) => {
+    if (!rawStep || typeof rawStep !== 'object' || Array.isArray(rawStep)) throw new Error('browser step must be an object')
+    const step = rawStep as Record<string, unknown>
+    if (typeof step.kind !== 'string' || !browserStepKinds.has(step.kind)) throw new Error(`unsupported browser step: ${String(step.kind)}`)
+
+    const value: BrowserStep = { kind: step.kind }
+    for (const key of ['selector', 'text', 'key', 'artifactName'] as const) {
+      if (typeof step[key] === 'string') value[key] = step[key]
+    }
+    if (typeof step.requiresApproval === 'boolean') value.requiresApproval = step.requiresApproval
+    if (typeof step.timeoutSeconds === 'number') value.timeoutSeconds = step.timeoutSeconds
+    if (typeof step.url === 'string') {
+      const url = new URL(step.url)
+      assertPublicBrowserURL(url)
+      value.url = url.toString()
+      allowed.add(url.hostname.toLowerCase())
+    }
+    if (highRiskBrowserSteps.has(value.kind) || value.requiresApproval) requiresApproval = true
+    return value
+  })
+
+  return {
+    plan: {
+      allowedDomains: [...allowed].sort(),
+      steps,
+      ...(typeof record.stopOnFailure === 'boolean' ? { stopOnFailure: record.stopOnFailure } : {}),
+      ...(typeof record.maxRepairRounds === 'number' ? { maxRepairRounds: record.maxRepairRounds } : {}),
+    },
+    requiresApproval,
+  }
+}
+
+const PluginServer: Plugin = async () => ({
+  tool: {
+    websearch: tool({
+      description: 'Search public web sources through the Kimi native WebRuntime. Public read-only research runs without a repeated approval prompt.',
+      args: {
+        query: tool.schema.string().describe('Search query'),
+        maxResults: tool.schema.number().optional().describe('Maximum sources to return, from 1 to 8'),
+      },
+      async execute(args, context) {
+        const request = prepareWebSearchRequest(args)
+        context.metadata({ title: `Kimi Web Search · ${request.query}`, metadata: { provider: 'kimi_official' } })
+        return toToolResult(await runNativeBridge({
+          requestID: randomUUID(),
+          operation: 'web.search',
+          query: request.query,
+          maxResults: request.maxResults,
+        }, context.abort, false))
+      },
+    }),
+    webfetch: tool({
+      description: 'Fetch and extract a public HTTP(S) page through the Kimi native WebRuntime. Private, credential-bearing, non-HTTP(S), and unsafe redirect targets are blocked.',
+      args: {
+        url: tool.schema.string().describe('Public HTTP(S) URL to fetch'),
+        sourceID: tool.schema.string().optional().describe('Optional source identifier returned by websearch'),
+        maxCharacters: tool.schema.number().optional().describe('Maximum extracted characters, from 1000 to 100000'),
+      },
+      async execute(args, context) {
+        const request = prepareWebFetchRequest(args)
+        context.metadata({ title: `Kimi Web Fetch · ${request.url}`, metadata: { provider: 'native_http' } })
+        return toToolResult(await runNativeBridge({
+          requestID: randomUUID(),
+          operation: 'web.fetch',
+          url: request.url,
+          ...(request.sourceID ? { sourceID: request.sourceID } : {}),
+          maxCharacters: request.maxCharacters,
+        }, context.abort, false))
+      },
+    }),
+    kimi_browser_verify: tool({
+      description: 'Use the native macOS WebKit verifier to open public pages, inspect DOM selectors, capture screenshots and collect console/network evidence.',
+      args: { plan: tool.schema.string().describe('JSON browser verification plan') },
+      async execute(args, context) {
+        const prepared = prepareBrowserPlan(args.plan)
+        if (prepared.requiresApproval) {
+          await context.ask({
+            permission: 'kimi_browser',
+            patterns: prepared.plan.allowedDomains,
+            always: [],
+            metadata: { operation: 'browser.verify' },
+          })
+        }
+        return toToolResult(await runNativeBridge({
+          requestID: randomUUID(),
+          operation: 'browser.verify',
+          browserPlan: bridgeBrowserPlan(prepared.plan),
+        }, context.abort, prepared.requiresApproval))
+      },
+    }),
+    kimi_computer_inspect: tool({
+      description: 'Read the current macOS Computer Use permission diagnostics without interacting with another app.',
+      args: {},
+      async execute(_args, context) {
+        return toToolResult(await runNativeBridge({ requestID: randomUUID(), operation: 'computer.inspect' }, context.abort, false))
+      },
+    }),
+    kimi_computer_screenshot: tool({
+      description: 'Capture a macOS screenshot as an auditable artifact after approval.',
+      args: {},
+      async execute(_args, context) {
+        await approveComputerUse(context, 'computer.screenshot')
+        return toToolResult(await runNativeBridge({ requestID: randomUUID(), operation: 'computer.screenshot' }, context.abort, true))
+      },
+    }),
+    kimi_computer_click: tool({
+      description: 'Click a macOS screen coordinate after explicit approval.',
+      args: { x: tool.schema.number(), y: tool.schema.number() },
+      async execute(args, context) {
+        await approveComputerUse(context, 'computer.click')
+        return toToolResult(await runNativeBridge({ requestID: randomUUID(), operation: 'computer.click', x: args.x, y: args.y }, context.abort, true))
+      },
+    }),
+    kimi_computer_type_text: tool({
+      description: 'Type text into the active macOS application after explicit approval.',
+      args: { text: tool.schema.string() },
+      async execute(args, context) {
+        await approveComputerUse(context, 'computer.type_text')
+        return toToolResult(await runNativeBridge({ requestID: randomUUID(), operation: 'computer.type_text', text: args.text }, context.abort, true))
+      },
+    }),
+    kimi_computer_press_key: tool({
+      description: 'Press a supported macOS key after explicit approval.',
+      args: { key: tool.schema.string() },
+      async execute(args, context) {
+        await approveComputerUse(context, 'computer.press_key')
+        return toToolResult(await runNativeBridge({ requestID: randomUUID(), operation: 'computer.press_key', key: args.key }, context.abort, true))
+      },
+    }),
+  },
+})
+
+export default { id: 'kimi-code-agent-native', server: PluginServer }
+
+async function approveComputerUse(context: Parameters<NonNullable<Awaited<ReturnType<typeof PluginServer>>['tool']>[string]['execute']>[1], operation: string) {
+  await context.ask({ permission: 'kimi_computer', patterns: [operation], always: [], metadata: { operation } })
+}
+
+function assertPublicBrowserURL(url: URL) {
+  if (url.protocol !== 'https:') throw new Error('browser verification requires HTTPS public URLs')
+  if (url.username || url.password) throw new Error('browser verification does not accept credential-bearing URLs')
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || isPrivateIPv4(host) || host === '::1') {
+    throw new Error('private browser targets are not allowed')
+  }
+}
+
+function assertPublicWebURL(url: URL) {
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('web fetch requires HTTP or HTTPS')
+  if (url.username || url.password) throw new Error('web fetch does not accept credential-bearing URLs')
+  const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local') || isPrivateIPv4(host) || host === '::1') {
+    throw new Error('private web targets are not allowed')
+  }
+}
+
+function isPrivateIPv4(host: string) {
+  const parts = host.split('.').map(Number)
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false
+  const first = parts[0] ?? -1
+  const second = parts[1] ?? -1
+  return first === 10 || first === 127 || first === 0 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168) || (first === 169 && second === 254)
+}
+
+function bridgeBrowserPlan(plan: BrowserPlan) {
+  return {
+    id: randomUUID(),
+    allowedDomains: plan.allowedDomains,
+    steps: plan.steps.map((step) => ({
+      id: randomUUID(),
+      kind: step.kind,
+      ...(step.url ? { url: step.url } : {}),
+      ...(step.selector ? { selector: step.selector } : {}),
+      ...(step.text ? { text: step.text } : {}),
+      ...(step.key ? { key: step.key } : {}),
+      ...(step.artifactName ? { artifactName: step.artifactName } : {}),
+      requiresApproval: step.requiresApproval ?? false,
+      timeoutSeconds: step.timeoutSeconds ?? 30,
+    })),
+    stopOnFailure: plan.stopOnFailure ?? true,
+    maxRepairRounds: plan.maxRepairRounds ?? 3,
+  }
+}
+
+async function runNativeBridge(request: Record<string, unknown>, signal: AbortSignal, approved: boolean): Promise<NativeResponse> {
+  const bridge = process.env.KIMI_NATIVE_BRIDGE?.trim()
+  if (!bridge) throw new Error('KimiNativeBridge is unavailable. Build the native bridge before starting OpenCode.')
+
+  const stateDirectory = process.env.XDG_STATE_HOME ?? path.join(process.cwd(), '.kimi-opencode-state')
+  const artifactsDirectory = path.join(stateDirectory, 'native-artifacts', String(request.requestID))
+  await mkdir(artifactsDirectory, { recursive: true, mode: 0o700 })
+  const payload = JSON.stringify({ ...request, artifactsDirectory })
+  const response = await new Promise<NativeResponse>((resolve, reject) => {
+    const child = spawn(bridge, [], {
+      env: { ...process.env, KIMI_NATIVE_BRIDGE_APPROVED: approved ? '1' : '0' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    const abort = () => child.kill()
+    signal.addEventListener('abort', abort, { once: true })
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.once('error', reject)
+    child.once('exit', (code) => {
+      signal.removeEventListener('abort', abort)
+      if (signal.aborted) return reject(new Error('Native operation cancelled'))
+      if (code !== 0) return reject(new Error(`KimiNativeBridge exited with ${String(code)}: ${stderr.trim()}`))
+      try {
+        resolve(JSON.parse(stdout) as NativeResponse)
+      } catch {
+        reject(new Error(`KimiNativeBridge returned invalid JSON: ${stdout.trim()}`))
+      }
+    })
+    child.stdin.end(payload)
+  })
+  if (!response.ok) throw new Error(response.error || response.output || 'Native operation failed')
+  return response
+}
+
+function toToolResult(response: NativeResponse) {
+  const attachments = response.browserResult?.artifacts.flatMap((artifact) => {
+    if (!artifact.path || !artifact.kind.includes('screenshot')) return []
+    return [{ type: 'file' as const, mime: 'image/png', url: pathToFileURL(artifact.path).href, filename: path.basename(artifact.path) }]
+  })
+  return {
+    title: response.ok ? 'Kimi Native · completed' : 'Kimi Native · failed',
+    output: response.output,
+    metadata: response.metadata,
+    ...(attachments?.length ? { attachments } : {}),
+  }
+}

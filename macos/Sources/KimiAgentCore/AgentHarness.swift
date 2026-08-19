@@ -916,6 +916,14 @@ public actor AgentHarness {
     snapshotValue
   }
 
+  /// Accepts events emitted by an external execution authority such as the
+  /// OpenCode headless server.  The event still passes through the same
+  /// checkpoint, intent, receipt and durable event-store projection as native
+  /// Harness drivers.
+  public func record(_ event: HarnessDriverEvent, operationID: OperationID) async {
+    await receive(event, operationID: operationID)
+  }
+
   /// Rebuilds the in-memory projection from durable Harness events. An open
   /// operation is deliberately restored as suspended; the caller must invoke
   /// resume() to cross the next effect boundary.

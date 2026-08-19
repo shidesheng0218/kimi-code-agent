@@ -1,23 +1,23 @@
 <div align="center">
 
-<img src="media/kimi-readme.svg" alt="Kimi Agent Desktop" width="96" height="96">
+<img src="media/kimi-readme.svg" alt="Kimi Code Agent" width="96" height="96">
 
-# Kimi Agent Desktop
+# Kimi Code Agent
 
-**原生 macOS 的本地优先 Coding Agent 工作台**
+**基于 OpenCode 执行内核、接入 Kimi 与 macOS 原生能力的 Coding Agent 工作台**
 
 自然对话 · Worktree 隔离 · 可审计工具 · MCP / Skills / Hooks · 可恢复执行
 
 <p>
   <img src="https://img.shields.io/badge/platform-macOS%2014%2B-111827?style=flat-square" alt="macOS 14+">
-  <img src="https://img.shields.io/badge/UI-SwiftUI%20%2B%20AppKit-0f766e?style=flat-square" alt="SwiftUI + AppKit">
+  <img src="https://img.shields.io/badge/runtime-Kimi%20SwiftUI%20%2B%20OpenCode%20Headless-0f766e?style=flat-square" alt="Kimi SwiftUI and OpenCode Headless">
   <img src="https://img.shields.io/badge/model-Kimi%20API%20%7C%20Kimi%20Code-2563eb?style=flat-square" alt="Kimi API and Kimi Code">
   <img src="https://img.shields.io/badge/distribution-GitHub%20Releases-181717?style=flat-square&logo=github" alt="GitHub Releases">
 </p>
 
 </div>
 
-> 只维护 macOS 原生版本，不依赖 Electron、VS Code 或用户手动安装 Node。默认在本机和隔离 Worktree 中执行，用户审阅 Diff 后再合并。
+> 当前生产桌面工作台是 Kimi 原生 SwiftUI/AppKit；OpenCode 只作为随机 loopback 端口上的无界面执行基座。用户不需要手动安装 Node/Bun，默认在本机和隔离 Worktree 中执行，审阅 Diff 后再合并。
 
 ## 目录
 
@@ -35,7 +35,7 @@
 
 ## 它解决什么问题
 
-Kimi Agent Desktop 的重点不是把更多按钮塞进界面，而是把一次 Coding Agent 任务变成一条可理解、可暂停、可恢复、可审计的链路：
+Kimi Code Agent 的重点不是把更多按钮塞进界面，而是把一次 Coding Agent 任务变成一条可理解、可暂停、可恢复、可审计的链路：
 
 ```text
 用户消息
@@ -118,7 +118,7 @@ Needs Input → Working → Waiting Approval → Completed
 
 打开 [GitHub Releases](https://github.com/shidesheng0218/kimi-agent-desktop-macos/releases)，下载对应架构的 DMG 或 ZIP。
 
-1. 双击 DMG，将 **Kimi Agent Desktop** 拖入“应用程序”；
+1. 双击 DMG，将 **Kimi Code Agent** 拖入“应用程序”；
 2. 启动应用；
 3. 在“连接设置”里选择 API Key 或 Kimi Code 登录模式；
 4. 选择项目文件夹，创建任务并运行。
@@ -166,34 +166,22 @@ https://api.moonshot.ai/v1
 
 ```mermaid
 flowchart TB
-    UI[SwiftUI / AppKit 工作台]
-    VM[DesktopAppModel<br/>只做 Snapshot Projection]
-    K[AgentKernel<br/>唯一执行入口]
-    H[AgentHarness<br/>Session / Lane / Operation]
-    D[AgentGraphSupervisor<br/>DAG Worker Pool]
-    PR[Provider Layer<br/>Kimi API / ACP / CLI 兼容]
-    TR[ToolExecutionCoordinator<br/>Permission / Hook / Intent / Receipt]
-    RT[Native Tool Runtime]
-    WT[Worktree / Shell / Files]
-    WEB[Swift WebRuntime]
-    MCP[MCP Worker Supervisor]
-    EXT[Skills / Hooks / Plugins]
-    REC[Recovery + Event Store]
+    UI[Kimi 原生 SwiftUI / AppKit]
+    S[OpenCode Session Runtime<br/>Provider / Tool / Permission / MCP]
+    P[Kimi Provider Profile<br/>Keychain → Sidecar Env]
+    NP[Kimi Native Plugin]
+    B[Swift KimiNativeBridge]
+    WEB[Swift WebRuntime<br/>Kimi Formula + Safe Fetch]
+    MAC[WKWebView Browser / Computer Use]
+    OC[OpenCode Store<br/>Session / Artifact / Diff / Terminal]
 
-    UI --> VM --> K
-    K --> H
-    K --> D
-    H --> PR
-    D --> H
-    H --> TR
-    TR --> RT
-    RT --> WT
-    RT --> WEB
-    RT --> MCP
-    TR --> EXT
-    H --> REC
-    D --> REC
-    TR --> REC
+    UI --> S
+    P --> S
+    S --> OC
+    S --> NP
+    NP --> B
+    B --> WEB
+    B --> MAC
 ```
 
 ### Provider 边界
@@ -213,33 +201,42 @@ Kimi API 是默认模型入口。ACP / CLI 只产生模型事件，作为兼容�
 
 ```text
 .
+├── vendor/opencode/                 # OpenCode 1.18.18 执行内核与 Desktop 工作台（MIT）
+│   ├── packages/opencode/            # Session、Tool、Permission、MCP、Skills、Hooks
+│   ├── packages/desktop/             # 仅作为 OpenCode 参考源码，不进入生产包
+│   └── packages/kimi-code-agent-plugin/
+│                                     # Kimi Web / Browser / Computer Use 原生工具
 ├── macos/
-│   ├── Sources/KimiAgentCore/       # Harness、Provider、Tool、权限、MCP、恢复
-│   ├── Sources/KimiAgentDesktop/    # SwiftUI/AppKit 工作台与系统 Adapter
+│   ├── Sources/KimiAgentCore/       # Swift WebRuntime、安全策略、原生 Adapter
+│   ├── Sources/KimiNativeBridge/    # OpenCode ↔ Swift JSON 原生桥接
 │   └── Sources/KimiAgentCoreChecks/ # Swift 原生闭环与故障注入检查
-├── src/                             # GitHub 发布、兼容 Runtime 与 JS 单测
-├── scripts/                         # 原生打包、签名、CLI bundle
+├── src/opencode/                    # Kimi OpenCode 配置与启动环境
+├── scripts/                         # 融合、打包、签名脚本
 ├── docs/GITHUB_RELEASES.md          # GitHub Release / 公证 Runbook
 ├── media/kimi.svg                   # 项目图标
-└── release-native/                  # 本地生成的 DMG / ZIP（不作为源码依赖）
+└── THIRD_PARTY_NOTICES.md            # OpenCode 等第三方许可证说明
 ```
 
 ## 从源码构建
 
-要求：macOS 14+、Xcode Command Line Tools、Swift 6 工具链和 Node.js（只用于仓库校验与兼容 Runtime；发布包自带 Node Runtime）。
+要求：macOS 14+、Xcode Command Line Tools、Swift 6 工具链和 Node.js。发布包自带运行所需组件，最终用户不需要另行安装 Node 或 Bun。
 
 ```bash
 git clone https://github.com/shidesheng0218/kimi-agent-desktop-macos.git
 cd kimi-agent-desktop-macos
 npm install
 
-# TypeScript 检查、JS 单测、Swift CoreChecks
+# 旧项目的 TypeScript 检查、JS 单测、Swift CoreChecks
 npm run verify
 
-# 构建原生桌面 App
-swift build --package-path macos --product KimiAgentDesktop
+# 安装并准备 OpenCode Headless 依赖与 Kimi Profile
+npm run opencode:install
+npm run opencode:prepare
 
-# 生成 DMG / ZIP / SHA256SUMS
+# 编译 Kimi 原生 SwiftUI 应用
+npm run native:build
+
+# 构建 Kimi Code Agent 的 DMG / ZIP
 npm run native:package
 ```
 
@@ -249,6 +246,8 @@ npm run native:package
 npm run check
 npm test
 swift run --package-path macos KimiAgentCoreChecks
+cd vendor/opencode/packages/core && bun test test/tool/network-policy.test.ts
+cd vendor/opencode/packages/kimi-code-agent-plugin && bun test
 git diff --check
 ```
 
@@ -259,10 +258,10 @@ GitHub 分发不是 App Store 分发。正式 Release 需要 Developer ID 签名
 生成包后建议执行：
 
 ```bash
-unzip -t release-native/Kimi-Agent-Desktop-*-arm64.zip
-hdiutil verify release-native/Kimi-Agent-Desktop-*-arm64.dmg
+unzip -t release-native/Kimi-Code-Agent-*.zip
+hdiutil verify release-native/Kimi-Code-Agent-*.dmg
 codesign --verify --deep --strict \
-  "release-native/mac-arm64/Kimi Agent Desktop.app"
+  "release-native/Kimi Code Agent.app"
 ```
 
 发布说明应同时包含 DMG、ZIP、SHA256、迁移说明、已知限制和回滚说明。不要把 API Key、证书、`.p12` 或公证密码提交到仓库。
@@ -296,8 +295,8 @@ codesign --verify --deep --strict \
 
 ## 当前边界
 
-- 只维护 macOS 原生 SwiftUI / AppKit 版本；
-- 默认 Kimi API，保留 ACP / CLI 兼容 Provider；
+- 只维护 macOS 版本；生产桌面 UI 是 Kimi 原生 SwiftUI/AppKit，OpenCode Desktop/Electron 不进入发布包；
+- 默认 Kimi API，保留 OpenCode Provider 协议与兼容 Provider；
 - Browser、Computer Use、MCP、Skills、Hooks、Plugins 的真实能力受本机权限、服务配置和 Worker 状态影响；
 - Computer Use 不是后台静默自动化，高风险动作始终需要用户确认；
 - 本地开发包的签名和公证状态取决于发布环境；
@@ -306,7 +305,7 @@ codesign --verify --deep --strict \
 ## 维护原则
 
 - 以真实任务闭环作为完成标准，不用能力目录冒充实现；
-- UI 只投影 Harness Snapshot，不直接执行工具或修改任务状态；
+- OpenCode Session / Tool Registry 是默认执行链；Swift 旧 Harness 仅保留迁移、原生工具和兼容数据能力；
 - 默认本地执行、Worktree 隔离、人工审阅、人工合并；
 - 低风险公网只读减少重复审批，高风险和越界动作保持明确边界；
 - 所有关键操作都应有事件、Intent、Receipt、Artifact 或明确失败原因。

@@ -19,7 +19,7 @@ describe('ACP desktop protocol adapter', () => {
       method: 'initialize',
       params: {
         protocolVersion: 1,
-        clientInfo: { name: 'kimi-agent-desktop', version: '0.3.0' },
+        clientInfo: { name: 'kimi-code-agent', version: '0.3.0' },
         clientCapabilities: {
           fs: { readTextFile: false, writeTextFile: false },
           terminal: false,

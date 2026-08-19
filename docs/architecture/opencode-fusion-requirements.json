@@ -1,0 +1,62 @@
+{
+  "goal": "Rebase Kimi Code Agent on the OpenCode execution runtime while retaining Kimi as the default provider, the existing macOS distribution channel, local-first storage, Worktree isolation, and human-reviewed merges.",
+  "description": "The product must replace the current fragmented execution paths with one OpenCode-derived local session, tool, permission, plugin and MCP runtime. It needs predictable Supervisor DAG orchestration, independent worker context, durable task recovery, public-read web research without repeated prompts, native macOS adapters for Browser and Computer Use, complete audit trails, and a polished desktop interaction model. Parallel read-only work is allowed, while Worktree writes, Browser, Computer Use, and destructive actions remain serialized and permission-gated.",
+  "tasks": [
+    "Admit durable user inputs and run provider turns through an OpenCode-derived session engine",
+    "Route Kimi API, Kimi Code, and compatible providers through one typed provider boundary",
+    "Execute file, shell, web, MCP, browser, and computer-use tools through one permission and receipt protocol",
+    "Coordinate Explore, Plan, Implement, Test, Review, Debug, Browser, and Research workers with a dependency graph",
+    "Create isolated Worktrees for independent implementation work and inherit them for validation and debugging",
+    "Persist session history, tool intents, receipts, artifacts, usage, and recovery checkpoints locally",
+    "Expose structured activity, approvals, diffs, terminal output, browser artifacts, and final answers in the desktop UI",
+    "Manage Skills, Hooks, MCP servers, and Plugins with capability discovery, isolation, health checks, and recovery",
+    "Enforce local security boundaries for filesystem, shell, network, credentials, and destructive Git actions",
+    "Measure per-stage token usage, latency, quality, retries, and cost budgets"
+  ],
+  "constraints": {
+    "max_response_time": 500,
+    "budget_per_task": 1.0,
+    "quality_threshold": 0.95,
+    "concurrent_tasks": 8,
+    "data_retention_days": 365,
+    "security_level": "high",
+    "platform": "macOS desktop",
+    "execution": "local-first",
+    "merge_policy": "human-reviewed",
+    "license": "MIT notice preservation required"
+  },
+  "team_size": 8,
+  "performance_requirements": {
+    "high_throughput": true,
+    "fault_tolerance": true,
+    "low_latency": true,
+    "scalability": "local multi-session",
+    "availability": 0.99
+  },
+  "safety_requirements": [
+    "Validate tool schema and resource boundaries before permission prompts",
+    "Persist intent before any side effect and receipt after settlement",
+    "Never replay a successful receipt or automatically replay unknown writes",
+    "Reject writes outside the active Worktree",
+    "Allow public read-only web research by task or domain while blocking private targets",
+    "Keep secrets in Keychain or an encrypted local vault and redact logs",
+    "Require explicit approval for shell, destructive Git, Browser writes, and Computer Use",
+    "Maintain auditable event history and explicit user-driven recovery"
+  ],
+  "integration_requirements": [
+    "OpenCode session, provider, tool, MCP, skill, hook, plugin and server semantics",
+    "Kimi API and Kimi Code authentication and model selection",
+    "Existing Swift Browser Verification and Computer Use adapters",
+    "Git Worktree, Diff Review, Terminal PTY, GitHub and GitLab workflows",
+    "Kimi SwiftUI/AppKit shell as the only production UI; OpenCode runs headlessly on loopback only",
+    "DMG and ZIP GitHub Release distribution with signatures and checksums"
+  ],
+  "scale_requirements": {
+    "initial_users": 1,
+    "peak_concurrent_users": 1,
+    "data_volume_gb": 20,
+    "requests_per_hour": 500,
+    "geographic_regions": ["local macOS"],
+    "growth_projection": "local-first desktop"
+  }
+}

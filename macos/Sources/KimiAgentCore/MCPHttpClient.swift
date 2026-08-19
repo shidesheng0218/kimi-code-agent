@@ -36,7 +36,7 @@ public final class MCPHttpClient: @unchecked Sendable {
     }
     let response = try request(method: "initialize", params: [
       "protocolVersion": "2024-11-05",
-      "clientInfo": ["name": "KimiAgentDesktop", "version": "0.3.0"],
+      "clientInfo": ["name": "KimiCodeAgent", "version": "0.3.0"],
       "capabilities": ["tools": [:], "resources": [:], "prompts": [:], "elicitation": [:]]
     ])
     let protocolVersion = response["protocolVersion"] as? String ?? "2024-11-05"

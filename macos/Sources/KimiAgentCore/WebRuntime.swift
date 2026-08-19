@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 
@@ -46,13 +47,8 @@ public struct WebSource: Codable, Equatable, Identifiable, Sendable {
   }
 
   public static func stableID(for url: String) -> String {
-    let data = Data(url.lowercased().utf8)
-    return data.base64EncodedString()
-      .replacingOccurrences(of: "/", with: "_")
-      .replacingOccurrences(of: "+", with: "-")
-      .replacingOccurrences(of: "=", with: "")
-      .prefix(40)
-      .description
+    let digest = SHA256.hash(data: Data(url.lowercased().utf8))
+    return digest.map { String(format: "%02x", $0) }.joined()
   }
 }
 
@@ -340,7 +336,7 @@ public final class HTTPWebFetchProvider: NSObject, WebFetchExecutingProvider, @u
     public let maxResponseBytes: Int
     public let userAgent: String
 
-    public init(timeout: TimeInterval = 10, maxRedirects: Int = 5, maxResponseBytes: Int = 5_000_000, userAgent: String = "KimiAgentDesktop/0.3.0") {
+    public init(timeout: TimeInterval = 10, maxRedirects: Int = 5, maxResponseBytes: Int = 5_000_000, userAgent: String = "KimiCodeAgent/0.3.0") {
       self.timeout = min(max(timeout, 1), 60)
       self.maxRedirects = min(max(maxRedirects, 0), 10)
       self.maxResponseBytes = min(max(maxResponseBytes, 1_024), 5_000_000)
@@ -552,57 +548,88 @@ public final class KimiOfficialWebProvider: WebSearchExecutingProvider, @uncheck
     let limit = min(request.maxResults, maxResults)
     let system = [
       "你是桌面应用的联网研究工具。",
-      "必须调用提供的 web_search 工具查询用户问题。",
-      "工具结果返回后，只返回 JSON：{\"sources\":[{\"title\":\"\",\"url\":\"https://...\",\"snippet\":\"\",\"date\":\"\"}]}。",
-      "只返回可验证的公开 URL，最多 \(limit) 条。"
+      "在尚未获得搜索结果时，必须调用提供的 web_search 工具查询用户问题。",
+      "获得工具结果后，不得再调用工具；只返回 JSON：{\"sources\":[{\"title\":\"\",\"url\":\"https://...\",\"snippet\":\"\",\"date\":\"\"}]}。",
+      "只返回可验证的公开 URL，最多 \(limit) 条。",
+      "没有可靠来源时返回 {\"sources\":[]}。"
     ].joined(separator: "\n")
-    var messages: [[String: Any]] = [
+    let initialMessages: [[String: Any]] = [
       ["role": "system", "content": system],
       ["role": "user", "content": request.query]
     ]
     var inputTokens = 0
     var outputTokens = 0
-    var toolCallCount = 0
-
-    for _ in 0..<maxRounds {
-      let completion = try await chatCompletion(messages: messages, tools: tools)
-      let usage = dictionary(completion["usage"])
-      inputTokens += integer(usage["prompt_tokens"])
-      outputTokens += integer(usage["completion_tokens"])
-      let choice = (completion["choices"] as? [[String: Any]])?.first ?? [:]
-      let assistant = dictionary(choice["message"])
-      guard !assistant.isEmpty else { throw WebRuntimeError.invalidResponse }
-      let calls = assistant["tool_calls"] as? [[String: Any]] ?? []
-      if calls.isEmpty {
-        let sources = parseSources(string(assistant["content"]))
-        guard !sources.isEmpty else { throw WebRuntimeError.providerFailure("Kimi 官方联网没有返回可验证来源") }
-        return WebSearchResult(
-          providerID: id,
-          sources: Array(sources.prefix(limit)),
-          elapsedMilliseconds: Int(Date().timeIntervalSince(startedAt) * 1_000)
-        )
+    var sawToolCall = false
+    let maximumAttempts = 3
+    for attempt in 0..<maximumAttempts {
+      // A bounded retry starts a fresh Formula conversation. This avoids
+      // repeatedly asking a reasoning model to repair an empty JSON answer in
+      // the same context while keeping every request auditable and finite.
+      var messages = initialMessages
+      if attempt > 0 {
+        messages.append([
+          "role": "user",
+          "content": "上一次检索没有返回可验证来源。请换一种关键词重新搜索，并继续使用 web_search；最终只返回包含真实 URL 的 JSON。"
+        ])
       }
 
-      messages.append(compactAssistant(assistant))
-      for call in calls {
-        let function = dictionary(call["function"])
-        guard string(function["name"]) == "web_search" else {
-          throw WebRuntimeError.providerFailure("Kimi 官方联网返回了不支持的工具：\(string(function["name"]))")
+      for _ in 0..<maxRounds {
+        // Formula keeps its complete tool declaration on every model turn. The
+        // assistant message and Fiber result determine whether the model calls
+        // it again; removing the schema after the first Fiber violates Kimi's
+        // protocol and breaks real multi-turn search finalization.
+        let completion = try await chatCompletion(messages: messages, tools: tools)
+        let usage = dictionary(completion["usage"])
+        inputTokens += integer(usage["prompt_tokens"])
+        outputTokens += integer(usage["completion_tokens"])
+        let choice = (completion["choices"] as? [[String: Any]])?.first ?? [:]
+        let assistant = dictionary(choice["message"])
+        guard !assistant.isEmpty else { throw WebRuntimeError.invalidResponse }
+        let calls = assistant["tool_calls"] as? [[String: Any]] ?? []
+        if calls.isEmpty {
+          if !sawToolCall && attempt == 0 {
+            throw WebRuntimeError.providerFailure("Kimi 官方联网未触发 web_search 工具调用")
+          }
+          let sources = parseSources(string(assistant["content"]))
+          if !sources.isEmpty {
+            return WebSearchResult(
+              providerID: id,
+              sources: Array(sources.prefix(limit)),
+              elapsedMilliseconds: Int(Date().timeIntervalSince(startedAt) * 1_000)
+            )
+          }
+          break
         }
-        let arguments = string(function["arguments"]).nonEmpty ?? "{}"
-        let fiber = try await invokeFiber(name: "web_search", arguments: arguments)
-        let context = dictionary(fiber["context"])
-        let output = string(context["output"]).nonEmpty ?? string(context["encrypted_output"]).nonEmpty
-        guard let output else { throw WebRuntimeError.providerFailure("Kimi 官方 Web Search 工具没有返回内容") }
-        messages.append([
-          "role": "tool",
-          "tool_call_id": string(call["id"]),
-          "content": output
-        ])
-        toolCallCount += 1
+
+        sawToolCall = true
+        messages.append(compactAssistant(assistant))
+        for call in calls {
+          let function = dictionary(call["function"])
+          guard string(function["name"]) == "web_search" else {
+            throw WebRuntimeError.providerFailure("Kimi 官方联网返回了不支持的工具：\(string(function["name"]))")
+          }
+          let arguments = string(function["arguments"]).nonEmpty ?? "{}"
+          let fiber = try await invokeFiber(name: "web_search", arguments: arguments)
+          let context = dictionary(fiber["context"])
+          let output = string(context["output"]).nonEmpty ?? string(context["encrypted_output"]).nonEmpty
+          guard let output else { throw WebRuntimeError.providerFailure("Kimi 官方 Web Search 工具没有返回内容") }
+          let sources = parseSources(output)
+          if !sources.isEmpty {
+            return WebSearchResult(
+              providerID: id,
+              sources: Array(sources.prefix(limit)),
+              elapsedMilliseconds: Int(Date().timeIntervalSince(startedAt) * 1_000)
+            )
+          }
+          messages.append([
+            "role": "tool",
+            "tool_call_id": string(call["id"]),
+            "content": output
+          ])
+        }
       }
     }
-    throw WebRuntimeError.providerFailure("Kimi 官方联网超过 \(maxRounds) 轮仍未返回来源")
+    throw WebRuntimeError.providerFailure("Kimi 官方联网已执行搜索，但没有返回可验证来源。请稍后重试或更换关键词。")
   }
 
   private func formulaTools() async throws -> [[String: Any]] {

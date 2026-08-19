@@ -52,7 +52,7 @@ public enum GitWorktreeManager {
     try runGit(["add", "-A"], in: worktree.path)
     try runGit([
       "-c", "user.email=kimi-agent@localhost",
-      "-c", "user.name=Kimi Agent Desktop",
+      "-c", "user.name=Kimi Code Agent",
       "commit", "-m", message
     ], in: worktree.path)
     try runGit(["merge", "--no-ff", worktree.branch, "-m", message], in: repository)

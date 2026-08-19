@@ -1,6 +1,17 @@
 import Foundation
 
 public enum ManagedRuntimeLocator {
+  public static func bunPath(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    candidates: [String] = ["/opt/homebrew/bin/bun", "/usr/local/bin/bun", "/usr/bin/bun"],
+    fileManager: FileManager = .default
+  ) -> String? {
+    if let configured = environment["KIMI_BUN_PATH"], fileManager.isExecutableFile(atPath: configured) {
+      return configured
+    }
+    return candidates.first { fileManager.isExecutableFile(atPath: $0) }
+  }
+
   public static func nodePath(
     environment: [String: String] = ProcessInfo.processInfo.environment,
     candidates: [String] = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"],

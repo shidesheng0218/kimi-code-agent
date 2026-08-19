@@ -1,5 +1,5 @@
 {
-  "goal": "Upgrade Kimi Agent Desktop from a native CLI wrapper into a complete macOS coding-agent workbench with trustworthy diff review, parallel task orchestration, and automatic browser/test verification",
+  "goal": "Upgrade Kimi Code Agent from a native CLI wrapper into a complete macOS coding-agent workbench with trustworthy diff review, parallel task orchestration, and automatic browser/test verification",
   "description": "The current SwiftUI app streams Kimi output and persists tasks, but it still has three major gaps versus mature coding-agent desktop products: no structured diff review, no multi-agent/worktree orchestration, and no end-to-end verification loop. The design must preserve local-first execution, explicit user approval, low UI latency, and a native macOS experience.",
   "tasks": [
     "Capture structured file, command, test, permission, and lifecycle events from Kimi Runtime",

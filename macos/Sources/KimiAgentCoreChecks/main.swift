@@ -235,6 +235,35 @@ final class MockURLProtocol: URLProtocol {
   override func stopLoading() {}
 }
 
+final class IdleOpenCodeSessionClient: OpenCodeSessionClient, @unchecked Sendable {
+  private let promptCounter = InvocationCounter()
+
+  var promptCount: Int { promptCounter.count }
+
+  func createSession(_ input: CreateSessionInput) async throws -> OpenCodeSession {
+    OpenCodeSession(id: "session-idle")
+  }
+
+  func prompt(_ input: OpenCodePromptInput) async throws {
+    promptCounter.increment()
+  }
+
+  func steer(_ input: OpenCodeSteerInput) async throws {}
+  func abort(sessionID: String) async throws {}
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [OpenCodeSession] { [] }
+
+  func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<OpenCodeEvent, Error> {
+    AsyncThrowingStream { continuation in
+      Task {
+        try? await Task.sleep(for: .milliseconds(20))
+        continuation.yield(OpenCodeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.finish()
+      }
+    }
+  }
+}
+
 final class ProcessOutputCollector: @unchecked Sendable {
   private let lock = NSLock()
   private var value = ""
@@ -279,7 +308,7 @@ final class CountingCredentialVault: CredentialVault, @unchecked Sendable {
 }
 
 let planCommand = KimiCommandBuilder.makeCommand(
-  runtimePath: "/Applications/Kimi Agent Desktop.app/Contents/Resources/kimi.mjs",
+  runtimePath: "/Applications/Kimi Code Agent.app/Contents/Resources/kimi.mjs",
   prompt: "分析登录失败原因",
   mode: .plan
 )
@@ -288,7 +317,7 @@ expect(planCommand.executableURL.path == "/usr/bin/env", "Plan 任务必须经�
 expect(
   planCommand.arguments == [
     "node",
-    "/Applications/Kimi Agent Desktop.app/Contents/Resources/kimi.mjs",
+    "/Applications/Kimi Code Agent.app/Contents/Resources/kimi.mjs",
     "--prompt",
     "分析登录失败原因",
     "--output-format",
@@ -382,6 +411,11 @@ let temporaryDirectory = FileManager.default.temporaryDirectory
   .appendingPathComponent("kimi-agent-core-checks-\(UUID().uuidString)", isDirectory: true)
 try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
 defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+
+expect(
+  KimiCodeAgentBranding.keychainServices == ["com.kimicode.agent.native"],
+  "Kimi Code Agent 只能读取自己的 Keychain 服务，旧凭据不得再影响新版本"
+)
 
 let stateURL = temporaryDirectory.appendingPathComponent("state.json")
 let repository = TaskRepository(fileURL: stateURL)
@@ -924,7 +958,7 @@ let citationTaskData = try JSONEncoder().encode(citationTask)
 let restoredCitationTask = try JSONDecoder().decode(AgentTask.self, from: citationTaskData)
 expect(restoredCitationTask.webResearchCitationStatus == .needsReview, "引用待审阅状态必须在重启后恢复")
 
-let resourceDirectory = temporaryDirectory.appendingPathComponent("KimiAgentDesktop.bundle", isDirectory: true)
+let resourceDirectory = temporaryDirectory.appendingPathComponent("KimiCodeAgent.bundle", isDirectory: true)
 let resourceContentsDirectory = resourceDirectory.appendingPathComponent("Resources", isDirectory: true)
 try FileManager.default.createDirectory(at: resourceContentsDirectory, withIntermediateDirectories: true)
 let runtimeURL = resourceContentsDirectory.appendingPathComponent("kimi.mjs")
@@ -2304,9 +2338,11 @@ expect(failingHostResult.standardError.contains("unknown option '--work-dir'"), 
 let gitRepository = temporaryDirectory.appendingPathComponent("repo", isDirectory: true)
 try FileManager.default.createDirectory(at: gitRepository, withIntermediateDirectories: true)
 try runCheckCommand("git", ["init", "-q"], in: gitRepository)
+try runCheckCommand("git", ["config", "user.email", "checks@example.com"], in: gitRepository)
+try runCheckCommand("git", ["config", "user.name", "Kimi Agent Core Checks"], in: gitRepository)
 try "before\n".write(to: gitRepository.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
 try runCheckCommand("git", ["add", "README.md"], in: gitRepository)
-try runCheckCommand("git", ["-c", "user.email=checks@example.com", "-c", "user.name=Checks", "commit", "-qm", "initial"], in: gitRepository)
+try runCheckCommand("git", ["commit", "-qm", "initial"], in: gitRepository)
 let worktree = try GitWorktreeManager.create(for: gitRepository, taskID: persistedTask.id)
 try "after\n".write(to: worktree.path.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
 let diffSnapshot = try DiffEngine.snapshot(baseDirectory: worktree.path)
@@ -2316,7 +2352,7 @@ try GitWorktreeManager.restoreFile("README.md", in: worktree, baseCommit: worktr
 let restoredDiff = try DiffEngine.snapshot(baseDirectory: worktree.path)
 expect(restoredDiff.files.isEmpty, "拒绝文件变更后 Worktree 必须恢复到基线")
 try "after\n".write(to: worktree.path.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
-try GitWorktreeManager.merge(worktree, into: gitRepository, message: "Kimi Agent Desktop test merge")
+try GitWorktreeManager.merge(worktree, into: gitRepository, message: "Kimi Code Agent test merge")
 let mergedContent = try String(contentsOf: gitRepository.appendingPathComponent("README.md"), encoding: .utf8)
 expect(mergedContent == "after\n", "人工确认后 Worktree 变更必须可以合并回主工作区")
 try GitWorktreeManager.remove(worktree)
@@ -4561,6 +4597,112 @@ expect(formulaSearch.sources.first?.url == "https://platform.kimi.com/docs", "Sw
 expect(formulaSearch.providerID == "kimi_official" && formulaRequests.contains(where: { $0.hasSuffix("/fibers") }), "Swift Kimi Formula Provider 必须实际读取 Formula 工具并执行 Fiber")
 MockURLProtocol.requestHandler = nil
 
+var fiberOnlyCompletionCount = 0
+MockURLProtocol.requestHandler = { request in
+  let path = request.url?.path ?? ""
+  let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+  if path.hasSuffix("/tools") {
+    return (response, try JSONSerialization.data(withJSONObject: ["tools": [["type": "function", "function": ["name": "web_search", "description": "Search", "parameters": ["type": "object"]]]]]))
+  }
+  if path.hasSuffix("/fibers") {
+    return (response, try JSONSerialization.data(withJSONObject: ["context": ["output": #"{"results":[{"title":"Fiber Result","url":"https://platform.kimi.com/fiber","snippet":"直接 Fiber 结果"}]}"#]]))
+  }
+  if path.hasSuffix("/chat/completions") {
+    fiberOnlyCompletionCount += 1
+    return (response, try JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": "", "tool_calls": [["id": "formula-fiber-only", "function": ["name": "web_search", "arguments": "{\"query\":\"Kimi docs\"}"]]]]]], "usage": ["prompt_tokens": 12, "completion_tokens": 3]]))
+  }
+  throw NSError(domain: "FiberOnlyMock", code: 404, userInfo: [NSLocalizedDescriptionKey: path])
+}
+let fiberOnlyProvider = KimiOfficialWebProvider(
+  apiKey: "kimi-formula-test-key",
+  baseURL: URL(string: "https://api.moonshot.cn/v1")!,
+  modelID: "kimi-k3",
+  session: formulaSession,
+  maxRounds: 1
+)
+let fiberOnlySearch = try awaitValue { try await fiberOnlyProvider.search(WebSearchRequest(query: "Kimi docs")) }
+expect(fiberOnlySearch.sources.first?.url == "https://platform.kimi.com/fiber", "Kimi Formula Provider 必须在 Fiber 已返回结构化来源时立即结算，不能无谓耗尽模型轮次")
+MockURLProtocol.requestHandler = nil
+
+var finalizationToolsByCompletion: [Bool] = []
+var finalizationCompletionCount = 0
+MockURLProtocol.requestHandler = { request in
+  let path = request.url?.path ?? ""
+  let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+  if path.hasSuffix("/tools") {
+    return (response, try JSONSerialization.data(withJSONObject: ["tools": [["type": "function", "function": ["name": "web_search", "description": "Search", "parameters": ["type": "object"]]]]]))
+  }
+  if path.hasSuffix("/fibers") {
+    return (response, try JSONSerialization.data(withJSONObject: ["context": ["output": "Kimi 文档搜索结果已返回，请整理来源。"]]))
+  }
+  if path.hasSuffix("/chat/completions") {
+    finalizationCompletionCount += 1
+    let body = (try? JSONSerialization.jsonObject(with: requestBodyData(request))) as? [String: Any] ?? [:]
+    let hasTools = ((body["tools"] as? [[String: Any]])?.isEmpty == false)
+    finalizationToolsByCompletion.append(hasTools)
+    if finalizationCompletionCount == 1 {
+      return (response, try JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": "", "tool_calls": [["id": "formula-finalize", "function": ["name": "web_search", "arguments": "{\"query\":\"Kimi docs\"}"]]]]]], "usage": ["prompt_tokens": 12, "completion_tokens": 3]]))
+    }
+    return (response, try JSONSerialization.data(withJSONObject: ["choices": [["message": ["content": "{\"sources\":[{\"title\":\"Finalized Source\",\"url\":\"https:\\/\\/platform.kimi.com\\/finalized\",\"snippet\":\"收回工具后的最终来源\"}]}" ]]], "usage": ["prompt_tokens": 9, "completion_tokens": 4]]))
+  }
+  throw NSError(domain: "FormulaFinalizationMock", code: 404, userInfo: [NSLocalizedDescriptionKey: path])
+}
+let finalizationProvider = KimiOfficialWebProvider(
+  apiKey: "kimi-formula-test-key",
+  baseURL: URL(string: "https://api.moonshot.cn/v1")!,
+  modelID: "kimi-k3",
+  session: formulaSession,
+  maxRounds: 2
+)
+let finalizationSearch = try awaitValue { try await finalizationProvider.search(WebSearchRequest(query: "Kimi docs")) }
+expect(finalizationSearch.sources.first?.url == "https://platform.kimi.com/finalized", "Kimi Formula Provider 必须在获取工具结果后完成来源整理")
+expect(finalizationToolsByCompletion == [true, true], "Kimi Formula Provider 每轮 Chat Completion 都必须保留完整工具声明，符合官方 Formula 协议")
+MockURLProtocol.requestHandler = nil
+
+var retryCompletionCount = 0
+var retryFiberCount = 0
+MockURLProtocol.requestHandler = { request in
+  let path = request.url?.path ?? ""
+  let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
+  if path.hasSuffix("/tools") {
+    return (response, try JSONSerialization.data(withJSONObject: ["tools": [["type": "function", "function": ["name": "web_search", "description": "Search", "parameters": ["type": "object"]]]]]))
+  }
+  if path.hasSuffix("/fibers") {
+    retryFiberCount += 1
+    return (response, try JSONSerialization.data(withJSONObject: ["context": ["encrypted_output": "retry-receipt-\(retryFiberCount)"]]))
+  }
+  if path.hasSuffix("/chat/completions") {
+    retryCompletionCount += 1
+    switch retryCompletionCount {
+    case 1, 3, 5:
+      let call: [String: Any] = [
+        "id": "retry-call-\(retryCompletionCount)",
+        "function": ["name": "web_search", "arguments": #"{"query":"Kimi docs"}"#]
+      ]
+      let message: [String: Any] = ["content": "", "tool_calls": [call]]
+      return (response, try JSONSerialization.data(withJSONObject: ["choices": [["message": message]], "usage": ["prompt_tokens": 12, "completion_tokens": 3]]))
+    case 2, 4:
+      let message: [String: Any] = ["content": #"{"sources":[]}"#]
+      return (response, try JSONSerialization.data(withJSONObject: ["choices": [["message": message]], "usage": ["prompt_tokens": 9, "completion_tokens": 4]]))
+    default:
+      let message: [String: Any] = ["content": #"{"sources":[{"title":"Retry Source","url":"https://platform.kimi.com/retry","snippet":"重试成功"}]}"#]
+      return (response, try JSONSerialization.data(withJSONObject: ["choices": [["message": message]], "usage": ["prompt_tokens": 9, "completion_tokens": 4]]))
+    }
+  }
+  throw NSError(domain: "FormulaRetryMock", code: 404, userInfo: [NSLocalizedDescriptionKey: path])
+}
+let retryProvider = KimiOfficialWebProvider(
+  apiKey: "kimi-formula-test-key",
+  baseURL: URL(string: "https://api.moonshot.cn/v1")!,
+  modelID: "kimi-k3",
+  session: formulaSession,
+  maxRounds: 2
+)
+let retrySearch = try awaitValue { try await retryProvider.search(WebSearchRequest(query: "Kimi docs")) }
+expect(retrySearch.sources.first?.url == "https://platform.kimi.com/retry", "Kimi Formula Provider 在空来源后必须开启新的有界搜索轮次")
+expect(retryCompletionCount == 6 && retryFiberCount == 3, "Kimi Formula Provider 重试必须保持工具声明、Fiber 和请求次数可审计")
+MockURLProtocol.requestHandler = nil
+
 let nativeToolWorkspace = temporaryDirectory.appendingPathComponent("native-tool-workspace", isDirectory: true)
 try FileManager.default.createDirectory(at: nativeToolWorkspace, withIntermediateDirectories: true)
 try "hello harness".write(to: nativeToolWorkspace.appendingPathComponent("hello.txt"), atomically: true, encoding: .utf8)
@@ -5035,6 +5177,78 @@ let envelope = ToolCallEnvelope(
 )
 expect(envelope.idempotencyKey == "call-1", "ToolCallEnvelope 必须提供稳定幂等键")
 
+let nativeBridgePlan = BrowserVerificationPlan(
+  allowedDomains: ["example.com"],
+  steps: [BrowserVerificationStep(kind: .open, url: URL(string: "https://example.com")!)]
+)
+let nativeBridgeRequest = OpenCodeNativeBridgeRequest(
+  requestID: "browser-1",
+  operation: .browserVerify,
+  browserPlan: nativeBridgePlan
+)
+try nativeBridgeRequest.validate()
+let restoredNativeBridgeRequest = try JSONDecoder().decode(
+  OpenCodeNativeBridgeRequest.self,
+  from: JSONEncoder().encode(nativeBridgeRequest)
+)
+expect(restoredNativeBridgeRequest == nativeBridgeRequest, "OpenCode 原生桥接请求必须可持久化并保持浏览器计划")
+let incompleteClickRequest = OpenCodeNativeBridgeRequest(requestID: "click-1", operation: .computerClick, x: 12)
+let clickValidationRejected: Bool
+do {
+  try incompleteClickRequest.validate()
+  clickValidationRejected = false
+} catch OpenCodeNativeBridgeValidationError.missingCoordinates {
+  clickValidationRejected = true
+} catch {
+  clickValidationRejected = false
+}
+expect(clickValidationRejected, "Computer Use 点击请求缺少坐标时不得启动原生副作用")
+
+let nativeWebSearchRequest = OpenCodeNativeBridgeRequest(
+  requestID: "web-search-1",
+  operation: .webSearch,
+  query: "Kimi Code Agent",
+  maxResults: 99
+)
+try nativeWebSearchRequest.validate()
+let restoredNativeWebSearchRequest = try JSONDecoder().decode(
+  OpenCodeNativeBridgeRequest.self,
+  from: JSONEncoder().encode(nativeWebSearchRequest)
+)
+expect(restoredNativeWebSearchRequest == nativeWebSearchRequest, "OpenCode 原生桥接必须持久化 Web Search 请求")
+let nativeBridgeFailure = OpenCodeNativeBridgeResponse.failure(requestID: nativeWebSearchRequest.requestID, error: "测试失败")
+expect(nativeBridgeFailure.requestID == nativeWebSearchRequest.requestID && !nativeBridgeFailure.ok, "OpenCode 原生桥接失败必须保留原始 requestID")
+let incompleteWebFetchRequest = OpenCodeNativeBridgeRequest(requestID: "web-fetch-1", operation: .webFetch)
+let webFetchValidationRejected: Bool
+do {
+  try incompleteWebFetchRequest.validate()
+  webFetchValidationRejected = false
+} catch OpenCodeNativeBridgeValidationError.missingURL {
+  webFetchValidationRejected = true
+} catch {
+  webFetchValidationRejected = false
+}
+expect(webFetchValidationRejected, "Web Fetch 请求缺少 URL 时不得启动原生联网副作用")
+
+let webSourceStoreDirectory = FileManager.default.temporaryDirectory
+  .appendingPathComponent("kimi-web-source-store-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: webSourceStoreDirectory) }
+let webSourceStore = WebSourceReceiptStore(directory: webSourceStoreDirectory, sourceTTL: 60)
+let storedWebSource = WebSource(title: "Kimi Docs", url: "https://platform.kimi.com/docs")
+try webSourceStore.record([storedWebSource])
+try webSourceStore.validate(sourceID: storedWebSource.id, url: storedWebSource.url)
+let mismatchedSourceRejected: Bool
+do {
+  try webSourceStore.validate(sourceID: storedWebSource.id, url: "https://example.com/other")
+  mismatchedSourceRejected = false
+} catch {
+  mismatchedSourceRejected = true
+}
+expect(mismatchedSourceRejected, "持久化 Web sourceID 不得被重定向到另一 URL")
+let sharedPrefixSourceA = WebSource(title: "Kimi Work", url: "https://www.kimi.com/resources/kimi-work-introduction")
+let sharedPrefixSourceB = WebSource(title: "Desktop Automation", url: "https://www.kimi.com/resources/desktop-automation")
+expect(sharedPrefixSourceA.id != sharedPrefixSourceB.id, "Web sourceID 必须覆盖完整 URL，不能因公共路径前缀碰撞")
+
 let traceRecorder = ProviderTraceRecorder()
 let traceID = try awaitValue {
   await traceRecorder.start(
@@ -5090,6 +5304,21 @@ private func runCheckCommand(_ executable: String, _ arguments: [String], in dir
     throw NSError(domain: "KimiAgentCoreChecks", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: text])
   }
   return text
+}
+
+private func requestBodyData(_ request: URLRequest) -> Data {
+  if let data = request.httpBody { return data }
+  guard let stream = request.httpBodyStream else { return Data() }
+  stream.open()
+  defer { stream.close() }
+  var output = Data()
+  var buffer = [UInt8](repeating: 0, count: 4_096)
+  while stream.hasBytesAvailable {
+    let count = stream.read(&buffer, maxLength: buffer.count)
+    guard count > 0 else { break }
+    output.append(buffer, count: count)
+  }
+  return output
 }
 
 final class AgentHostCollector: @unchecked Sendable {
@@ -5193,4 +5422,151 @@ final class LockedStringCollector: @unchecked Sendable {
     defer { lock.unlock() }
     return storage
   }
+}
+
+// Native Kimi UI / App Kernel contract tests. These are intentionally written
+// before the implementation so the first run proves the new boundary is not
+// accidentally satisfied by an existing OpenCode/Electron path.
+let nativePrompt = PromptInput(text: "检查登录问题")
+let nativeCommand = KimiAppCommand.prompt(nativePrompt)
+expect(nativeCommand.kind == .prompt, "原生 App Command 必须保留 prompt 类型")
+let initialUIState = KimiUIState()
+expect(initialUIState.activePane == .conversation, "原生工作台默认打开会话 Pane")
+expect(initialUIState.terminalPlacement == .right, "原生工作台终端必须固定在右侧")
+let displayEvent = KimiEvent.assistantText("你好")
+expect(displayEvent.displayText == "你好", "Kimi Event 必须提供稳定的 UI 展示文本")
+
+let endpoint = OpenCodeRuntimeEndpoint(host: "127.0.0.1", port: 43127, token: "test-token")
+expect(endpoint.baseURL.absoluteString == "http://127.0.0.1:43127", "Headless Runtime 必须只生成 loopback endpoint")
+expect(endpoint.authorizationHeader.hasPrefix("Basic "), "OpenCode Headless 必须使用 Basic opencode:token 认证")
+let headlessFactoryConfiguration = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: temporaryDirectory.appendingPathComponent("support", isDirectory: true),
+  environment: [
+    "KIMI_OPENCODE_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_OPENCODE_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+  ]
+)
+let headlessFactoryConfigJSON = headlessFactoryConfiguration?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
+let headlessFactoryConfig = (try? JSONSerialization.jsonObject(with: Data(headlessFactoryConfigJSON.utf8)) as? [String: Any]) ?? [:]
+let configuredPlugin = headlessFactoryConfiguration?.environment["KIMI_OPENCODE_PLUGIN"] ?? ""
+expect(configuredPlugin.hasPrefix("file://"), "Swift Headless Factory 必须把本地插件环境变量写成 file:// URL，OpenCode 虚拟配置才能加载插件")
+expect((headlessFactoryConfig["tool_output"] as? [String: Any])?["max_bytes"] as? Int == 51_200, "Swift Headless Factory 必须与 Kimi OpenCode Profile 使用一致的工具输出上限")
+expect((headlessFactoryConfig["compaction"] as? [String: Any])?["tail_turns"] as? Int == 8, "Swift Headless Factory 必须与 Kimi OpenCode Profile 使用一致的压缩策略")
+let idleClient = IdleOpenCodeSessionClient()
+let idleDriver = OpenCodeOperationDriver(client: idleClient)
+let idleDriverTrace = ThreadSafeStringTrace()
+try! awaitValue { await idleDriver.setSession("session-idle"); return () }
+try! awaitValue {
+  try await idleDriver.run(
+    context: HarnessOperationContext(sessionID: UUID(), operationID: UUID(), lane: .main, prompt: PromptInput(text: "等待 idle")),
+    sink: { event in
+      switch event {
+      case .turnEnded: idleDriverTrace.append("turn-ended")
+      case .stepEnded: idleDriverTrace.append("step-ended")
+      default: break
+      }
+    }
+  )
+  return ()
+}
+expect(idleClient.promptCount == 1 && idleDriverTrace.snapshot.contains("turn-ended"), "OpenCode Operation Driver 必须等待 session.idle 后才结束 Harness turn")
+let crashOnlyRuntime = OpenCodeRuntimeSupervisor(configuration: OpenCodeRuntimeConfiguration(
+  executableURL: URL(fileURLWithPath: "/bin/sh"),
+  arguments: ["-c", "exit 0"],
+  endpoint: OpenCodeRuntimeEndpoint(port: 43128, token: "restart-test"),
+  restartLimit: 1,
+  restartDelay: 0.02
+))
+_ = try! awaitValue { try await crashOnlyRuntime.start() }
+try? await Task.sleep(for: .milliseconds(180))
+let restartCount = try! awaitValue { await crashOnlyRuntime.unexpectedExitRestartCount() }
+expect(restartCount == 1, "Headless Sidecar 意外退出后必须在限定次数内自动重启")
+try! awaitValue { await crashOnlyRuntime.stop(); return () }
+let bridged = OpenCodeEventBridge.map(
+  OpenCodeEvent(sessionID: "session-1", kind: .assistantText, text: "桥接成功")
+)
+expect(bridged.contains(where: { $0.displayText == "桥接成功" }), "OpenCode assistant event 必须映射为 Kimi Event")
+let toolWireEvent = Data(#"{"type":"message.part.updated","properties":{"sessionID":"session-1","part":{"type":"tool","callID":"call-1","tool":"read","state":{"status":"running","input":{"path":"README.md"}}}}}"#.utf8)
+let decodedToolWireEvent = OpenCodeEventBridge.decodeSSEData(toolWireEvent, sessionID: "session-1")
+expect(decodedToolWireEvent?.kind == .toolCall && decodedToolWireEvent?.toolCallID == "call-1" && decodedToolWireEvent?.toolID == "read", "OpenCode message.part.updated 工具事件必须解析嵌套 part")
+let textDeltaEvent = OpenCodeEventBridge.decodeSSEData(Data(#"{"type":"session.next.text.delta","properties":{"sessionID":"session-1","delta":"增量"}}"#.utf8), sessionID: "session-1")
+expect(textDeltaEvent?.kind == .assistantText && textDeltaEvent?.text == "增量", "OpenCode text delta 必须映射为助手增量文本")
+let permissionWireEvent = OpenCodeEventBridge.decodeSSEData(Data(#"{"type":"permission.asked","properties":{"id":"perm-42","sessionID":"session-1","permission":"execute","patterns":["npm test"]}}"#.utf8), sessionID: "session-1")
+let bridgedPermission = permissionWireEvent.flatMap { OpenCodeEventBridge.map($0).compactMap { event -> KimiPermissionRequest? in
+  if case let .permission(value) = event { return value }
+  return nil
+}.first }
+expect(bridgedPermission?.runtimeID == "perm-42", "Permission Card 必须保留 OpenCode 原始 request ID，回复时不能把本地 UUID 发回服务端")
+let nativeAppKernel = KimiAppKernel()
+let kernelState = try! awaitValue { await nativeAppKernel.snapshot() }
+expect(kernelState.terminalPlacement == .right, "KimiAppKernel 必须以右侧终端布局初始化")
+
+let persistedUIURL = temporaryDirectory.appendingPathComponent("ui-state.json")
+let persistedStore = KimiAppStateStore(fileURL: persistedUIURL)
+var persistedUI = KimiUIState()
+persistedUI.sessions = [KimiSessionSummary(runtimeID: "ses_persisted", title: "可恢复会话")]
+persistedUI.activeSessionID = persistedUI.sessions.first?.id
+let persistedHarnessID = UUID()
+try persistedStore.save(KimiPersistedAppState(harnessSessionID: persistedHarnessID, uiState: persistedUI))
+let restoredUI = try persistedStore.load()
+expect(restoredUI.harnessSessionID == persistedHarnessID, "App 重启必须恢复稳定的 Harness Session ID")
+expect(restoredUI.uiState.sessions.first?.runtimeID == "ses_persisted", "App 重启必须恢复 Kimi 会话列表")
+let restoredKernel = KimiAppKernel(sessionID: UUID(), persistence: persistedStore)
+let restoredKernelState = try! awaitValue { await restoredKernel.snapshot() }
+expect(restoredKernelState.sessions.first?.title == "可恢复会话", "KimiAppKernel 必须从磁盘状态恢复主界面投影")
+
+let terminalController = KimiTerminalController()
+let terminalID = try awaitValue { try await terminalController.open(cwd: temporaryDirectory) }
+try awaitValue { try await terminalController.write("printf 'terminal-loop-ok\\n'\n", to: terminalID); return () }
+let terminalOutput = try awaitValue { await terminalController.waitForOutput(contains: "terminal-loop-ok", in: terminalID, timeout: 2) }
+expect(terminalOutput, "右侧终端控制器必须能创建 PTY、写入命令并读取输出")
+try! awaitValue { await terminalController.close(terminalID); return () }
+
+let externalHarness = AgentHarness(sessionID: UUID())
+let externalOperation = try! awaitValue { try await externalHarness.prompt(PromptInput(text: "外部事件")) }
+let externalEffect = HarnessEffectIntent(operationID: externalOperation, kind: .tool, subject: "read", risk: .low)
+try! awaitValue {
+  await externalHarness.record(.effectIntentWritten(externalEffect), operationID: externalOperation)
+  return ()
+}
+let externalSnapshot = try! awaitValue { await externalHarness.snapshot() }
+expect(externalSnapshot.intents[externalEffect.effectID] == externalEffect, "OpenCode 外部工具事件必须能够回流 Harness 并建立 Effect Intent")
+
+let openCodeRequestTrace = ThreadSafeStringTrace()
+MockURLProtocol.requestHandler = { request in
+  let path = request.url?.path ?? ""
+  let requestBody = String(data: requestBodyData(request), encoding: .utf8) ?? ""
+  openCodeRequestTrace.append("\(request.httpMethod ?? "GET") \(path) \(requestBody)")
+  let body: Data
+  switch path {
+  case "/session":
+    body = Data("{\"id\":\"session-1\",\"title\":\"测试会话\"}".utf8)
+  default:
+    body = Data("{}".utf8)
+  }
+  return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!, body)
+}
+let mockConfiguration = URLSessionConfiguration.ephemeral
+mockConfiguration.protocolClasses = [MockURLProtocol.self]
+let mockClient = URLSessionOpenCodeSessionClient(
+  endpoint: OpenCodeRuntimeEndpoint(port: 43210, token: "test"),
+  session: URLSession(configuration: mockConfiguration)
+)
+let mockedSession = try! awaitValue { try await mockClient.createSession(CreateSessionInput(title: "测试会话")) }
+expect(mockedSession.id == "session-1", "OpenCode Session Client 必须解析创建会话响应")
+try! awaitValue { try await mockClient.prompt(OpenCodePromptInput(sessionID: "session-1", text: "测试消息")); return () }
+try! awaitValue { try await mockClient.respondPermission(PermissionResponse(sessionID: "session-1", requestID: "perm-1", reply: "once")); return () }
+expect(openCodeRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/prompt_async") }), "OpenCode Prompt 必须使用异步 /session/{id}/prompt_async 协议，避免同步请求阻塞 UI")
+expect(openCodeRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/permissions/perm-1") && $0.contains("\"response\":\"once\"") }), "OpenCode Permission 回复必须携带 runtime request ID 和 response 字段")
+
+if let rawPort = ProcessInfo.processInfo.environment["KIMI_HEADLESS_PORT"],
+   let headlessPort = Int(rawPort),
+   let headlessToken = ProcessInfo.processInfo.environment["KIMI_HEADLESS_TOKEN"] {
+  let liveClient = URLSessionOpenCodeSessionClient(
+    endpoint: OpenCodeRuntimeEndpoint(port: headlessPort, token: headlessToken)
+  )
+  let liveSessions = try! awaitValue { try await liveClient.listSessions(directory: nil) }
+  expect(liveSessions.count >= 0, "真实 Headless Session API 必须可访问")
 }

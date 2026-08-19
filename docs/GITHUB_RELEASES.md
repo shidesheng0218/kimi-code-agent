@@ -1,6 +1,6 @@
 # GitHub Release Runbook
 
-Kimi Agent Desktop is distributed directly from GitHub Releases, not the Mac App Store.
+Kimi Code Agent is distributed directly from GitHub Releases, not the Mac App Store.
 
 ## Required GitHub Secrets
 
@@ -20,7 +20,7 @@ Never place API keys, `.p12` files, private signing keys, or notarization passwo
 
 1. Update release notes and verify `npm run verify` locally.
 2. Create and push a semantic tag, for example `v1.4.0`.
-3. The **Release macOS** workflow builds a universal app, signs it, submits it to Apple notarization, staples the app ticket, validates the DMG/ZIP, and creates a GitHub Release.
+3. The **Release macOS** workflow builds the native SwiftUI app for the runner architecture, embeds the OpenCode headless runtime, signs it, submits it to Apple notarization, staples the app ticket, validates the DMG/ZIP, and creates a GitHub Release.
 4. Verify the published Release contains the DMG, ZIP, and `SHA256SUMS` file.
 5. Download the asset on a clean macOS account and confirm: launch, API setup, a local terminal command, a Browser task, and app restart recovery.
 

@@ -40,7 +40,7 @@ public enum PluginWorkerProtocol {
       "method": "initialize",
       "params": [
         "protocolVersion": protocolVersion,
-        "host": ["name": "KimiAgentDesktop", "version": hostVersion],
+        "host": ["name": "KimiCodeAgent", "version": hostVersion],
         "capabilities": ["tools": true, "hooks": true, "skills": true, "mcp": true]
       ]
     ]
