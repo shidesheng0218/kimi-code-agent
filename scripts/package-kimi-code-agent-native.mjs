@@ -108,6 +108,12 @@ run("hdiutil", ["create", "-volname", "Kimi Code Agent", "-srcfolder", appRoot, 
 console.log(`Native package created: ${zip}`)
 console.log(`Native package created: ${dmg}`)
 
+// Always emit SHA256SUMS next to the artifacts so a release never ships without
+// checksums (the release-native dir is wiped at the start of every run).
+const shaOutput = execFileSync("shasum", ["-a", "256", path.basename(zip), path.basename(dmg)], { cwd: outRoot, encoding: "utf8" })
+await writeFile(path.join(outRoot, "SHA256SUMS.txt"), shaOutput, "utf8")
+console.log(`SHA256 written: ${path.join(outRoot, "SHA256SUMS.txt")}`)
+
 // Sparkle EdDSA signature for the ZIP. sign_update reads the private key from
 // the release machine's Keychain and prints sparkle:edSignature / length.
 if (existsSync(signUpdateTool)) {
