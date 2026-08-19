@@ -53,6 +53,10 @@ run("npx", ["--yes", "bun@1.3.14", "build", pluginSource, "--outfile", pluginBun
 await cp(path.join(binDirectory, "KimiCodeAgent"), path.join(macos, "KimiCodeAgent"))
 await cp(path.join(binDirectory, "KimiNativeBridge"), path.join(resources, "native/KimiNativeBridge"))
 await cp(openCodeBinary, path.join(resources, "runtime/opencode"))
+// App icon rendered from media/kimi-readme.svg via scripts/generate-icon.sh.
+const iconSource = path.join(root, "media/AppIcon.icns")
+if (!existsSync(iconSource)) throw new Error(`App icon missing: ${iconSource}. Run scripts/generate-icon.sh first.`)
+await cp(iconSource, path.join(resources, "AppIcon.icns"))
 // Sparkle ships as Sparkle.framework (with bundled XPC services inside its
 // Resources). Embed it so the packaged app can self-update without extra
 // installs; the executable's rpath points at ../Frameworks.
@@ -73,6 +77,7 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>${version}</string>
 <key>CFBundleVersion</key><string>${version}</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>Kimi Code Agent</string><key>CFBundleURLSchemes</key><array><string>kimi-code-agent</string></array></dict></array>
 <key>SUFeedURL</key><string>${sparkleFeedURL}</string>
