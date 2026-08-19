@@ -11,7 +11,7 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "native:check": "cd macos && swift run KimiAgentCoreChecks",
+    "native:check": "cd macos && swift build --product KimiAgentCoreChecks -Xswiftc -disable-batch-mode --jobs 1 && \"$(swift build --show-bin-path)/KimiAgentCoreChecks\"",
     "native:build": "swift build --package-path macos --product KimiCodeAgent",
     "native:package": "npm run build && node scripts/package-kimi-code-agent-native.mjs",
     "opencode:install": "npm run build && node scripts/opencode-fusion.mjs install",

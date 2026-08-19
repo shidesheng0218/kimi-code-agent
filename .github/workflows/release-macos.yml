@@ -91,6 +91,12 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      # The OpenCode build inside the packaging script links against
+      # vendor/opencode workspace packages; those node_modules are gitignored
+      # and must be installed first on a fresh checkout.
+      - name: Install OpenCode headless dependencies
+        run: npm run opencode:install
+
       # Distribution is GitHub-Releases-only with ad-hoc signing. Developer ID
       # certificate import and notarization are skipped unless the optional
       # secrets are configured.
