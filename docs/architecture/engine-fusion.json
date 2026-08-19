@@ -2285,7 +2285,7 @@
   },
   "metadata": {
     "generated_by": "agent_planner.py",
-    "requirements_file": "docs/architecture/opencode-fusion-requirements.json",
+    "requirements_file": "docs/architecture/engine-fusion-requirements.json",
     "architecture_pattern": "swarm",
     "agent_count": 8
   }

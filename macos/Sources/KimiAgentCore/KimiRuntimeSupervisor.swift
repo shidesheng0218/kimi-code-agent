@@ -1,6 +1,39 @@
 import Foundation
 
-public struct OpenCodeRuntimeEndpoint: Codable, Equatable, Sendable {
+/// Actor-free registry of live engine process handles. During
+/// `applicationWillTerminate` the run loop is already draining, so awaiting an
+/// actor to reach `KimiRuntimeSupervisor.stop()` is unreliable; the app
+/// delegate instead calls `terminateAll()` here, which SIGTERMs every live
+/// engine synchronously.
+public final class KimiEngineTerminationRegistry: @unchecked Sendable {
+  public static let shared = KimiEngineTerminationRegistry()
+
+  private let lock = NSLock()
+  private var handles: [Int32: KimiProcessHandle] = [:]
+
+  public func register(_ handle: KimiProcessHandle) {
+    lock.lock()
+    handles[handle.processIdentifier] = handle
+    lock.unlock()
+  }
+
+  public func unregister(processIdentifier: Int32) {
+    lock.lock()
+    handles.removeValue(forKey: processIdentifier)
+    lock.unlock()
+  }
+
+  public func terminateAll() {
+    lock.lock()
+    let live = Array(handles.values)
+    lock.unlock()
+    for handle in live where handle.isRunning {
+      handle.terminate()
+    }
+  }
+}
+
+public struct KimiRuntimeEndpoint: Codable, Equatable, Sendable {
   public let host: String
   public let port: Int
   public let token: String
@@ -17,17 +50,17 @@ public struct OpenCodeRuntimeEndpoint: Codable, Equatable, Sendable {
   }
 
   public var authorizationHeader: String {
-    let credentials = Data("opencode:\(token)".utf8).base64EncodedString()
+    let credentials = Data("kimi:\(token)".utf8).base64EncodedString()
     return "Basic \(credentials)"
   }
 }
 
-public struct OpenCodeRuntimeConfiguration: Sendable {
+public struct KimiRuntimeConfiguration: Sendable {
   public let executableURL: URL
   public let arguments: [String]
   public let workingDirectory: URL?
   public let environment: [String: String]
-  public let endpoint: OpenCodeRuntimeEndpoint
+  public let endpoint: KimiRuntimeEndpoint
   public let healthTimeout: TimeInterval
   public let restartLimit: Int
   public let restartDelay: TimeInterval
@@ -37,7 +70,7 @@ public struct OpenCodeRuntimeConfiguration: Sendable {
     arguments: [String],
     workingDirectory: URL? = nil,
     environment: [String: String] = [:],
-    endpoint: OpenCodeRuntimeEndpoint,
+    endpoint: KimiRuntimeEndpoint,
     healthTimeout: TimeInterval = 30,
     restartLimit: Int = 3,
     restartDelay: TimeInterval = 0.5
@@ -53,7 +86,7 @@ public struct OpenCodeRuntimeConfiguration: Sendable {
   }
 }
 
-public enum OpenCodeRuntimeError: LocalizedError, Equatable, Sendable {
+public enum KimiRuntimeError: LocalizedError, Equatable, Sendable {
   case alreadyRunning
   case notRunning
   case healthTimeout(URL)
@@ -62,35 +95,35 @@ public enum OpenCodeRuntimeError: LocalizedError, Equatable, Sendable {
 
   public var errorDescription: String? {
     switch self {
-    case .alreadyRunning: "OpenCode 后台运行时已经在运行。"
-    case .notRunning: "OpenCode 后台运行时尚未启动。"
-    case let .healthTimeout(url): "OpenCode 后台运行时未在规定时间内就绪：\(url.absoluteString)"
-    case .invalidResponse: "OpenCode 后台运行时返回了无效响应。"
+    case .alreadyRunning: "后台执行引擎已在运行。"
+    case .notRunning: "后台执行引擎尚未启动。"
+    case let .healthTimeout(url): "后台执行引擎未在规定时间内就绪：\(url.absoluteString)"
+    case .invalidResponse: "后台执行引擎返回了无效响应。"
     case let .requestFailed(message): message
     }
   }
 }
 
-/// Owns the OpenCode server process without exposing Process management to the
+/// Owns the embedded engine server process without exposing Process management to the
 /// SwiftUI layer. The production bundle supplies the executable and runtime;
 /// development may point this at a local Bun/Node command.
-public actor OpenCodeRuntimeSupervisor {
-  private let configuration: OpenCodeRuntimeConfiguration
+public actor KimiRuntimeSupervisor {
+  private let configuration: KimiRuntimeConfiguration
   private var process: KimiProcessHandle?
   private var state: KimiRuntimeState = .stopped
   private var monitorTask: Task<Void, Never>?
   private var intentionalStop = false
   private var unexpectedExitRestarts = 0
 
-  public init(configuration: OpenCodeRuntimeConfiguration) {
+  public init(configuration: KimiRuntimeConfiguration) {
     self.configuration = configuration
   }
 
-  public func snapshot() -> (state: KimiRuntimeState, endpoint: OpenCodeRuntimeEndpoint) {
+  public func snapshot() -> (state: KimiRuntimeState, endpoint: KimiRuntimeEndpoint) {
     (state, configuration.endpoint)
   }
 
-  public func start() throws -> OpenCodeRuntimeEndpoint {
+  public func start() throws -> KimiRuntimeEndpoint {
     try launch(resetRestartCount: true)
   }
 
@@ -98,8 +131,8 @@ public actor OpenCodeRuntimeSupervisor {
     unexpectedExitRestarts
   }
 
-  private func launch(resetRestartCount: Bool) throws -> OpenCodeRuntimeEndpoint {
-    guard process?.isRunning != true else { throw OpenCodeRuntimeError.alreadyRunning }
+  private func launch(resetRestartCount: Bool) throws -> KimiRuntimeEndpoint {
+    guard process?.isRunning != true else { throw KimiRuntimeError.alreadyRunning }
     if resetRestartCount { unexpectedExitRestarts = 0 }
     intentionalStop = false
     state = .starting
@@ -110,7 +143,10 @@ public actor OpenCodeRuntimeSupervisor {
         workingDirectory: configuration.workingDirectory,
         environment: configuration.environment
       )
-      if let process { beginMonitoring(process) }
+      if let process {
+        KimiEngineTerminationRegistry.shared.register(process)
+        beginMonitoring(process)
+      }
       return configuration.endpoint
     } catch {
       state = .failed
@@ -137,18 +173,19 @@ public actor OpenCodeRuntimeSupervisor {
       return
     }
     state = .stopping
+    KimiEngineTerminationRegistry.shared.unregister(processIdentifier: process.processIdentifier)
     process.terminate()
     self.process = nil
     state = .stopped
   }
 
-  public func restart() throws -> OpenCodeRuntimeEndpoint {
+  public func restart() throws -> KimiRuntimeEndpoint {
     stop()
     return try start()
   }
 
   public func waitUntilReady() async throws {
-    guard process?.isRunning == true else { throw OpenCodeRuntimeError.notRunning }
+    guard process?.isRunning == true else { throw KimiRuntimeError.notRunning }
     let deadline = Date().addingTimeInterval(configuration.healthTimeout)
     while Date() < deadline {
       if await Self.isHealthy(configuration.endpoint) {
@@ -158,10 +195,10 @@ public actor OpenCodeRuntimeSupervisor {
       try? await Task.sleep(for: .milliseconds(200))
     }
     state = .degraded
-    throw OpenCodeRuntimeError.healthTimeout(configuration.endpoint.baseURL)
+    throw KimiRuntimeError.healthTimeout(configuration.endpoint.baseURL)
   }
 
-  private static func isHealthy(_ endpoint: OpenCodeRuntimeEndpoint) async -> Bool {
+  private static func isHealthy(_ endpoint: KimiRuntimeEndpoint) async -> Bool {
     for path in ["/global/health", "/api/health"] {
       guard let url = URL(string: path, relativeTo: endpoint.baseURL)?.absoluteURL else { continue }
       var request = URLRequest(url: url)
@@ -193,6 +230,7 @@ public actor OpenCodeRuntimeSupervisor {
       guard let current = process, current.processIdentifier == processID else { return }
       guard !current.isRunning else { continue }
       guard !intentionalStop else { return }
+      KimiEngineTerminationRegistry.shared.unregister(processIdentifier: processID)
       guard unexpectedExitRestarts < configuration.restartLimit else {
         state = .failed
         return

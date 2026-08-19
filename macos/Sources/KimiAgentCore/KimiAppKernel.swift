@@ -1,10 +1,10 @@
 import Foundation
 
-public actor OpenCodeOperationDriver {
-  private let client: any OpenCodeSessionClient
+public actor KimiRuntimeOperationDriver {
+  private let client: any KimiRuntimeSessionClient
   private var sessionID: String?
 
-  public init(client: any OpenCodeSessionClient) {
+  public init(client: any KimiRuntimeSessionClient) {
     self.client = client
   }
 
@@ -17,20 +17,20 @@ public actor OpenCodeOperationDriver {
     sink: @escaping AgentHarness.DriverEventSink
   ) async throws {
     guard let sessionID else {
-      throw OpenCodeRuntimeError.requestFailed("当前没有可用的 OpenCode Session。")
+      throw KimiRuntimeError.requestFailed("当前没有可用的执行会话。")
     }
     let turnID = UUID()
     await sink(.turnStarted(HarnessTurnRecord(turnID: turnID, modelID: "kimi-k2.7-code")))
     await sink(.stepStarted(HarnessStepRecord(turnID: turnID, step: 1)))
     let events = try await client.subscribeEvents(sessionID: sessionID)
-    try await client.prompt(OpenCodePromptInput(sessionID: sessionID, text: context.prompt.text))
+    try await client.prompt(KimiRuntimePromptInput(sessionID: sessionID, text: context.prompt.text))
     try await Self.waitForCompletion(events)
     await sink(.stepEnded(HarnessStepRecord(turnID: turnID, step: 1, status: .completed)))
     await sink(.turnEnded(HarnessTurnRecord(turnID: turnID, modelID: "kimi-k2.7-code", status: .completed)))
   }
 
   private static func waitForCompletion(
-    _ events: AsyncThrowingStream<OpenCodeEvent, Error>,
+    _ events: AsyncThrowingStream<KimiRuntimeEvent, Error>,
     timeout: Duration = .seconds(300)
   ) async throws {
     try await withThrowingTaskGroup(of: Void.self) { group in
@@ -40,16 +40,16 @@ public actor OpenCodeOperationDriver {
           case .sessionIdle:
             return
           case .error:
-            throw OpenCodeRuntimeError.requestFailed(event.text ?? "OpenCode Session 执行失败。")
+            throw KimiRuntimeError.requestFailed(event.text ?? "执行会话失败。")
           default:
             continue
           }
         }
-        throw OpenCodeRuntimeError.requestFailed("OpenCode Session 事件流在完成前中断。")
+        throw KimiRuntimeError.requestFailed("执行会话事件流在完成前中断。")
       }
       group.addTask {
         try await Task.sleep(for: timeout)
-        throw OpenCodeRuntimeError.requestFailed("OpenCode Session 在规定时间内没有进入 idle。")
+        throw KimiRuntimeError.requestFailed("执行会话在规定时间内没有进入空闲。")
       }
       defer { group.cancelAll() }
       _ = try await group.next()
@@ -58,12 +58,12 @@ public actor OpenCodeOperationDriver {
 }
 
 /// The native application owns the UI projection and sends all user intent
-/// through this actor. OpenCode remains the headless execution service; the
+/// through this actor. The embedded engine remains the headless execution service; the
 /// Harness records the operation boundary and provides recovery semantics.
 public actor KimiAppKernel {
-  private let sessionClient: any OpenCodeSessionClient
-  private let runtimeSupervisor: OpenCodeRuntimeSupervisor?
-  private let operationDriver: OpenCodeOperationDriver
+  private let sessionClient: any KimiRuntimeSessionClient
+  private let runtimeSupervisor: KimiRuntimeSupervisor?
+  private let operationDriver: KimiRuntimeOperationDriver
   private let harness: AgentHarness
   private let stateStore: KimiAppStateStore?
   private let harnessSessionID: UUID
@@ -76,8 +76,8 @@ public actor KimiAppKernel {
   private var continuations: [UUID: AsyncStream<KimiEvent>.Continuation] = [:]
 
   public init(
-    sessionClient: any OpenCodeSessionClient = UnavailableOpenCodeSessionClient(),
-    runtimeSupervisor: OpenCodeRuntimeSupervisor? = nil,
+    sessionClient: any KimiRuntimeSessionClient = UnavailableKimiRuntimeSessionClient(),
+    runtimeSupervisor: KimiRuntimeSupervisor? = nil,
     sessionID: UUID = UUID(),
     persistence: KimiAppStateStore? = nil,
     harnessStore: HarnessEventStore? = nil
@@ -88,7 +88,7 @@ public actor KimiAppKernel {
     let restored = persistence.flatMap { try? $0.load() }
     let resolvedHarnessSessionID = restored?.harnessSessionID ?? sessionID
     self.harnessSessionID = resolvedHarnessSessionID
-    let driver = OpenCodeOperationDriver(client: sessionClient)
+    let driver = KimiRuntimeOperationDriver(client: sessionClient)
     self.operationDriver = driver
     self.harness = AgentHarness(
       sessionID: resolvedHarnessSessionID,
@@ -118,9 +118,9 @@ public actor KimiAppKernel {
     try? await harness.restore()
     guard let runtimeSupervisor else {
       state.runtimeState = .degraded
-      state.lastError = "OpenCode Headless Runtime 尚未打包或未配置。"
+      state.lastError = "后台执行引擎尚未打包或未配置。"
       publish(.runtimeChanged(.degraded))
-      publish(.error(state.lastError ?? "OpenCode Headless Runtime 尚未连接。"))
+      publish(.error(state.lastError ?? "后台执行引擎尚未连接。"))
       persistState()
       return
     }
@@ -128,6 +128,7 @@ public actor KimiAppKernel {
       _ = try await runtimeSupervisor.start()
       try await runtimeSupervisor.waitUntilReady()
       state.runtimeState = .ready
+      state.lastError = nil
       publish(.runtimeChanged(.ready))
       await restoreRuntimeSessions()
       if let activeID = state.activeSessionID,
@@ -172,6 +173,7 @@ public actor KimiAppKernel {
       operationSessions[operationID] = session.id
       sessionOperations[session.id] = operationID
       state.runtimeState = .ready
+      state.lastError = nil
 
     case let .steer(input):
       try await harness.steer(input, lane: .main)
@@ -218,15 +220,16 @@ public actor KimiAppKernel {
         try await runtimeSupervisor.waitUntilReady()
       }
       state.runtimeState = .ready
+      state.lastError = nil
       publish(.runtimeChanged(.ready))
     }
     persistState()
   }
 
-  private func ensureActiveSession() async throws -> OpenCodeSession {
+  private func ensureActiveSession() async throws -> KimiRuntimeSession {
     if let activeID = state.activeSessionID,
        let existing = state.sessions.first(where: { $0.id == activeID }) {
-      return OpenCodeSession(id: existing.runtimeID ?? existing.id.uuidString, title: existing.title, directory: existing.projectPath)
+      return KimiRuntimeSession(id: existing.runtimeID ?? existing.id.uuidString, title: existing.title, directory: existing.projectPath)
     }
     let created = try await sessionClient.createSession(CreateSessionInput())
     let summary = KimiSessionSummary(id: UUID(), runtimeID: created.id, title: created.title ?? "新会话", projectPath: created.directory)
@@ -264,14 +267,14 @@ public actor KimiAppKernel {
           await self?.ingest(event)
         }
       } catch {
-        await self?.ingest(OpenCodeEvent(sessionID: sessionID, kind: .error, text: error.localizedDescription))
+        await self?.ingest(KimiRuntimeEvent(sessionID: sessionID, kind: .error, text: error.localizedDescription))
       }
     }
   }
 
-  private func ingest(_ event: OpenCodeEvent) async {
-    await recordOpenCodeEvent(event)
-    for mapped in OpenCodeEventBridge.map(event) {
+  private func ingest(_ event: KimiRuntimeEvent) async {
+    await recordKimiRuntimeEvent(event)
+    for mapped in KimiRuntimeEventBridge.map(event) {
       apply(mapped)
       publish(mapped)
     }
@@ -307,7 +310,7 @@ public actor KimiAppKernel {
   private func respondToPermission(_ id: UUID, reply: String) async throws {
     guard let permission = state.pendingPermissions.first(where: { $0.id == id }) else { return }
     guard let operationID = permissionOperations[id], let sessionID = operationSessions[operationID] else {
-      throw OpenCodeRuntimeError.requestFailed("找不到该权限请求对应的 OpenCode Session。")
+      throw KimiRuntimeError.requestFailed("找不到该权限请求对应的执行会话。")
     }
     try await sessionClient.respondPermission(PermissionResponse(
       sessionID: sessionID,
@@ -329,7 +332,7 @@ public actor KimiAppKernel {
     persistState()
   }
 
-  private func recordOpenCodeEvent(_ event: OpenCodeEvent) async {
+  private func recordKimiRuntimeEvent(_ event: KimiRuntimeEvent) async {
     guard let operationID = sessionOperations[event.sessionID] else { return }
     let snapshot = await harness.snapshot()
     let checkpoint = snapshot.checkpoints[operationID]
@@ -405,17 +408,17 @@ public actor KimiAppKernel {
   }
 }
 
-public final class UnavailableOpenCodeSessionClient: OpenCodeSessionClient, @unchecked Sendable {
+public final class UnavailableKimiRuntimeSessionClient: KimiRuntimeSessionClient, @unchecked Sendable {
   public init() {}
 
-  public func createSession(_ input: CreateSessionInput) async throws -> OpenCodeSession {
-    throw OpenCodeRuntimeError.requestFailed("OpenCode Headless Runtime 尚未连接。")
+  public func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。")
   }
 
-  public func prompt(_ input: OpenCodePromptInput) async throws { throw OpenCodeRuntimeError.requestFailed("OpenCode Headless Runtime 尚未连接。") }
-  public func steer(_ input: OpenCodeSteerInput) async throws { throw OpenCodeRuntimeError.requestFailed("OpenCode Headless Runtime 尚未连接。") }
-  public func abort(sessionID: String) async throws { throw OpenCodeRuntimeError.requestFailed("OpenCode Headless Runtime 尚未连接。") }
-  public func respondPermission(_ input: PermissionResponse) async throws { throw OpenCodeRuntimeError.requestFailed("OpenCode Headless Runtime 尚未连接。") }
-  public func listSessions(directory: String?) async throws -> [OpenCodeSession] { throw OpenCodeRuntimeError.requestFailed("OpenCode Headless Runtime 尚未连接。") }
-  public func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<OpenCodeEvent, Error> { throw OpenCodeRuntimeError.requestFailed("OpenCode Headless Runtime 尚未连接。") }
+  public func prompt(_ input: KimiRuntimePromptInput) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
+  public func steer(_ input: KimiRuntimeSteerInput) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
+  public func abort(sessionID: String) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
+  public func respondPermission(_ input: PermissionResponse) async throws { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
+  public func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
+  public func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> { throw KimiRuntimeError.requestFailed("后台执行引擎尚未连接。") }
 }

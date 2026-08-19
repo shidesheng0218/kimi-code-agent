@@ -2,8 +2,19 @@ import SwiftUI
 import KimiAgentCore
 import Sparkle
 
+final class KimiAppDelegate: NSObject, NSApplicationDelegate {
+  func applicationWillTerminate(_ notification: Notification) {
+    // A normal quit (⌘Q, menu, Dock) must also stop the embedded engine;
+    // otherwise the runtime process survives as an orphan holding the data
+    // directory and a loopback port. The registry is actor-free and
+    // synchronous, which is all the draining run loop can rely on here.
+    KimiEngineTerminationRegistry.shared.terminateAll()
+  }
+}
+
 @main
 struct KimiCodeAgentApp: App {
+  @NSApplicationDelegateAdaptor(KimiAppDelegate.self) private var appDelegate
   @StateObject private var model = KimiAppViewModel()
   private let updaterController: SPUStandardUpdaterController
 
@@ -64,14 +75,15 @@ final class KimiAppViewModel: ObservableObject {
     let resources = Bundle.main.resourceURL ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
     let support = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support/Kimi Code Agent", isDirectory: true)
+    KimiRuntimeDataMigrator.migrateIfNeeded(applicationSupportDirectory: support)
     guard let configuration = KimiHeadlessRuntimeFactory.makeConfiguration(
       resourcesDirectory: resources,
       applicationSupportDirectory: support
     ) else {
       return KimiAppKernel()
     }
-    let supervisor = OpenCodeRuntimeSupervisor(configuration: configuration)
-    let client = URLSessionOpenCodeSessionClient(endpoint: configuration.endpoint)
+    let supervisor = KimiRuntimeSupervisor(configuration: configuration)
+    let client = URLSessionRuntimeClient(endpoint: configuration.endpoint)
     let stateStore = KimiAppStateStore(fileURL: support.appendingPathComponent("settings/ui-state.json"))
     let harnessStore = HarnessEventStore(fileURL: support.appendingPathComponent("harness/events.jsonl"))
     return KimiAppKernel(

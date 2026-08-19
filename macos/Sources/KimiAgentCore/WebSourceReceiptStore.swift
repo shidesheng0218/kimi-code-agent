@@ -1,7 +1,7 @@
 import Foundation
 
 /// Persists the source-to-URL relationship across one-shot native bridge
-/// processes. The OpenCode session owns the actual Tool receipt; this small
+/// processes. The runtime session owns the actual Tool receipt; this small
 /// local cache only prevents a later `web.fetch` call from substituting a
 /// different URL for a source ID returned by `web.search`.
 public final class WebSourceReceiptStore: @unchecked Sendable {

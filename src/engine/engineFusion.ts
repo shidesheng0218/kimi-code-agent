@@ -1,13 +1,13 @@
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-export type KimiOpenCodeProfileInput = {
+export type KimiEngineProfileInput = {
   baseURL?: string;
   modelID: string;
 };
 
-export type KimiOpenCodeConfig = {
-  $schema: string;
+export type KimiEngineConfig = {
+  $schema?: string;
   model: string;
   small_model: string;
   plugin: string[];
@@ -42,19 +42,19 @@ const kimiHosts = new Set([
 const defaultBaseURL = 'https://api.moonshot.cn/v1';
 export const kimiCodeAgentApplicationSupportName = 'Kimi Code Agent';
 
-export function resolveOpenCodeFoundationPaths(projectDirectory: string) {
-  const foundationDirectory = path.join(projectDirectory, 'vendor', 'opencode');
+export function resolveEngineFoundationPaths(projectDirectory: string) {
+  const foundationDirectory = path.join(projectDirectory, 'vendor', 'engine');
   return {
     foundationDirectory,
     nativePluginFile: path.join(foundationDirectory, 'packages', 'kimi-code-agent-plugin', 'src', 'index.ts')
   };
 }
 
-export function resolveOpenCodeFusionPaths(applicationSupportDirectory: string) {
-  const configDirectory = path.join(applicationSupportDirectory, 'opencode');
+export function resolveEngineFusionPaths(applicationSupportDirectory: string) {
+  const configDirectory = path.join(applicationSupportDirectory, 'engine');
   return {
     configDirectory,
-    configFile: path.join(configDirectory, 'opencode.json'),
+    configFile: path.join(configDirectory, 'engine.json'),
     stateDirectory: path.join(configDirectory, 'state')
   };
 }
@@ -79,16 +79,15 @@ export function validateKimiEndpoint(value: string = defaultBaseURL): string {
   return endpoint.toString().replace(/\/$/, '');
 }
 
-export function createKimiOpenCodeConfig(input: KimiOpenCodeProfileInput): KimiOpenCodeConfig {
+export function createKimiEngineConfig(input: KimiEngineProfileInput): KimiEngineConfig {
   const modelID = input.modelID.trim();
   if (!modelID) throw new Error('Kimi 模型 ID 不能为空。');
 
   const baseURL = validateKimiEndpoint(input.baseURL);
   return {
-    $schema: 'https://opencode.ai/config.json',
     model: `moonshotai-cn/${modelID}`,
     small_model: `moonshotai-cn/${modelID}`,
-    plugin: ['{env:KIMI_OPENCODE_PLUGIN}'],
+    plugin: ['{env:KIMI_RUNTIME_PLUGIN}'],
     provider: {
       'moonshotai-cn': {
         name: 'Kimi / Moonshot AI',
@@ -142,11 +141,11 @@ export function createKimiOpenCodeConfig(input: KimiOpenCodeProfileInput): KimiO
   };
 }
 
-export function createOpenCodeLaunchEnvironment(
+export function createEngineLaunchEnvironment(
   environment: NodeJS.ProcessEnv,
   applicationSupportDirectory = path.join(environment.HOME ?? homedir(), 'Library', 'Application Support', kimiCodeAgentApplicationSupportName)
 ): NodeJS.ProcessEnv {
-  const paths = resolveOpenCodeFusionPaths(applicationSupportDirectory);
+  const paths = resolveEngineFusionPaths(applicationSupportDirectory);
   return {
     ...environment,
     OPENCODE_CLIENT: 'kimi-code-agent',

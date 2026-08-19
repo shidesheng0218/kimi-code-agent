@@ -235,29 +235,29 @@ final class MockURLProtocol: URLProtocol {
   override func stopLoading() {}
 }
 
-final class IdleOpenCodeSessionClient: OpenCodeSessionClient, @unchecked Sendable {
+final class IdleKimiRuntimeSessionClient: KimiRuntimeSessionClient, @unchecked Sendable {
   private let promptCounter = InvocationCounter()
 
   var promptCount: Int { promptCounter.count }
 
-  func createSession(_ input: CreateSessionInput) async throws -> OpenCodeSession {
-    OpenCodeSession(id: "session-idle")
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "session-idle")
   }
 
-  func prompt(_ input: OpenCodePromptInput) async throws {
+  func prompt(_ input: KimiRuntimePromptInput) async throws {
     promptCounter.increment()
   }
 
-  func steer(_ input: OpenCodeSteerInput) async throws {}
+  func steer(_ input: KimiRuntimeSteerInput) async throws {}
   func abort(sessionID: String) async throws {}
   func respondPermission(_ input: PermissionResponse) async throws {}
-  func listSessions(directory: String?) async throws -> [OpenCodeSession] { [] }
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
 
-  func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<OpenCodeEvent, Error> {
+  func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
     AsyncThrowingStream { continuation in
       Task {
         try? await Task.sleep(for: .milliseconds(20))
-        continuation.yield(OpenCodeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
         continuation.finish()
       }
     }
@@ -5181,30 +5181,30 @@ let nativeBridgePlan = BrowserVerificationPlan(
   allowedDomains: ["example.com"],
   steps: [BrowserVerificationStep(kind: .open, url: URL(string: "https://example.com")!)]
 )
-let nativeBridgeRequest = OpenCodeNativeBridgeRequest(
+let nativeBridgeRequest = KimiNativeBridgeRequest(
   requestID: "browser-1",
   operation: .browserVerify,
   browserPlan: nativeBridgePlan
 )
 try nativeBridgeRequest.validate()
 let restoredNativeBridgeRequest = try JSONDecoder().decode(
-  OpenCodeNativeBridgeRequest.self,
+  KimiNativeBridgeRequest.self,
   from: JSONEncoder().encode(nativeBridgeRequest)
 )
-expect(restoredNativeBridgeRequest == nativeBridgeRequest, "OpenCode 原生桥接请求必须可持久化并保持浏览器计划")
-let incompleteClickRequest = OpenCodeNativeBridgeRequest(requestID: "click-1", operation: .computerClick, x: 12)
+expect(restoredNativeBridgeRequest == nativeBridgeRequest, "原生桥接请求必须可持久化并保持浏览器计划")
+let incompleteClickRequest = KimiNativeBridgeRequest(requestID: "click-1", operation: .computerClick, x: 12)
 let clickValidationRejected: Bool
 do {
   try incompleteClickRequest.validate()
   clickValidationRejected = false
-} catch OpenCodeNativeBridgeValidationError.missingCoordinates {
+} catch KimiNativeBridgeValidationError.missingCoordinates {
   clickValidationRejected = true
 } catch {
   clickValidationRejected = false
 }
 expect(clickValidationRejected, "Computer Use 点击请求缺少坐标时不得启动原生副作用")
 
-let nativeWebSearchRequest = OpenCodeNativeBridgeRequest(
+let nativeWebSearchRequest = KimiNativeBridgeRequest(
   requestID: "web-search-1",
   operation: .webSearch,
   query: "Kimi Code Agent",
@@ -5212,18 +5212,18 @@ let nativeWebSearchRequest = OpenCodeNativeBridgeRequest(
 )
 try nativeWebSearchRequest.validate()
 let restoredNativeWebSearchRequest = try JSONDecoder().decode(
-  OpenCodeNativeBridgeRequest.self,
+  KimiNativeBridgeRequest.self,
   from: JSONEncoder().encode(nativeWebSearchRequest)
 )
-expect(restoredNativeWebSearchRequest == nativeWebSearchRequest, "OpenCode 原生桥接必须持久化 Web Search 请求")
-let nativeBridgeFailure = OpenCodeNativeBridgeResponse.failure(requestID: nativeWebSearchRequest.requestID, error: "测试失败")
-expect(nativeBridgeFailure.requestID == nativeWebSearchRequest.requestID && !nativeBridgeFailure.ok, "OpenCode 原生桥接失败必须保留原始 requestID")
-let incompleteWebFetchRequest = OpenCodeNativeBridgeRequest(requestID: "web-fetch-1", operation: .webFetch)
+expect(restoredNativeWebSearchRequest == nativeWebSearchRequest, "原生桥接必须持久化 Web Search 请求")
+let nativeBridgeFailure = KimiNativeBridgeResponse.failure(requestID: nativeWebSearchRequest.requestID, error: "测试失败")
+expect(nativeBridgeFailure.requestID == nativeWebSearchRequest.requestID && !nativeBridgeFailure.ok, "原生桥接失败必须保留原始 requestID")
+let incompleteWebFetchRequest = KimiNativeBridgeRequest(requestID: "web-fetch-1", operation: .webFetch)
 let webFetchValidationRejected: Bool
 do {
   try incompleteWebFetchRequest.validate()
   webFetchValidationRejected = false
-} catch OpenCodeNativeBridgeValidationError.missingURL {
+} catch KimiNativeBridgeValidationError.missingURL {
   webFetchValidationRejected = true
 } catch {
   webFetchValidationRejected = false
@@ -5285,8 +5285,6 @@ let redactedTrace = try awaitValue { await redactedTraceRecorder.record(id: reda
 let redactedTraceData = try JSONEncoder().encode(redactedTrace)
 let redactedTraceText = String(data: redactedTraceData, encoding: .utf8) ?? ""
 expect(!redactedTraceText.contains("sk-secret-token") && !redactedTraceText.contains("super-secret"), "Provider Trace 不得写入明文密钥")
-
-print("KimiAgentCore checks passed")
 
 @discardableResult
 private func runCheckCommand(_ executable: String, _ arguments: [String], in directory: URL) throws -> String {
@@ -5426,7 +5424,7 @@ final class LockedStringCollector: @unchecked Sendable {
 
 // Native Kimi UI / App Kernel contract tests. These are intentionally written
 // before the implementation so the first run proves the new boundary is not
-// accidentally satisfied by an existing OpenCode/Electron path.
+// accidentally satisfied by an existing legacy path.
 let nativePrompt = PromptInput(text: "检查登录问题")
 let nativeCommand = KimiAppCommand.prompt(nativePrompt)
 expect(nativeCommand.kind == .prompt, "原生 App Command 必须保留 prompt 类型")
@@ -5436,26 +5434,74 @@ expect(initialUIState.terminalPlacement == .right, "原生工作台终端必须�
 let displayEvent = KimiEvent.assistantText("你好")
 expect(displayEvent.displayText == "你好", "Kimi Event 必须提供稳定的 UI 展示文本")
 
-let endpoint = OpenCodeRuntimeEndpoint(host: "127.0.0.1", port: 43127, token: "test-token")
+let endpoint = KimiRuntimeEndpoint(host: "127.0.0.1", port: 43127, token: "test-token")
 expect(endpoint.baseURL.absoluteString == "http://127.0.0.1:43127", "Headless Runtime 必须只生成 loopback endpoint")
-expect(endpoint.authorizationHeader.hasPrefix("Basic "), "OpenCode Headless 必须使用 Basic opencode:token 认证")
+expect(endpoint.authorizationHeader.hasPrefix("Basic "), "Headless 引擎 必须使用 Basic kimi:token 认证")
 let headlessFactoryConfiguration = KimiHeadlessRuntimeFactory.makeConfiguration(
   resourcesDirectory: temporaryDirectory,
   applicationSupportDirectory: temporaryDirectory.appendingPathComponent("support", isDirectory: true),
   environment: [
-    "KIMI_OPENCODE_BINARY": "/bin/echo",
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
     "KIMI_API_KEY": "test-key",
-    "KIMI_OPENCODE_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
   ]
 )
 let headlessFactoryConfigJSON = headlessFactoryConfiguration?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
 let headlessFactoryConfig = (try? JSONSerialization.jsonObject(with: Data(headlessFactoryConfigJSON.utf8)) as? [String: Any]) ?? [:]
-let configuredPlugin = headlessFactoryConfiguration?.environment["KIMI_OPENCODE_PLUGIN"] ?? ""
-expect(configuredPlugin.hasPrefix("file://"), "Swift Headless Factory 必须把本地插件环境变量写成 file:// URL，OpenCode 虚拟配置才能加载插件")
-expect((headlessFactoryConfig["tool_output"] as? [String: Any])?["max_bytes"] as? Int == 51_200, "Swift Headless Factory 必须与 Kimi OpenCode Profile 使用一致的工具输出上限")
-expect((headlessFactoryConfig["compaction"] as? [String: Any])?["tail_turns"] as? Int == 8, "Swift Headless Factory 必须与 Kimi OpenCode Profile 使用一致的压缩策略")
-let idleClient = IdleOpenCodeSessionClient()
-let idleDriver = OpenCodeOperationDriver(client: idleClient)
+let configuredPlugin = headlessFactoryConfiguration?.environment["KIMI_RUNTIME_PLUGIN"] ?? ""
+expect(configuredPlugin.hasPrefix("file://"), "Swift Headless Factory 必须把本地插件环境变量写成 file:// URL，Engine 虚拟配置才能加载插件")
+expect((headlessFactoryConfig["tool_output"] as? [String: Any])?["max_bytes"] as? Int == 51_200, "Swift Headless Factory 必须与 Kimi Engine Profile 使用一致的工具输出上限")
+expect((headlessFactoryConfig["compaction"] as? [String: Any])?["tail_turns"] as? Int == 8, "Swift Headless Factory 必须与 Kimi Engine Profile 使用一致的压缩策略")
+expect(headlessFactoryConfiguration?.environment["OPENCODE_SERVER_USERNAME"] == "kimi", "Headless 引擎必须使用 Kimi 认证用户名")
+expect(headlessFactoryConfiguration?.workingDirectory?.path
+  == temporaryDirectory.appendingPathComponent("support", isDirectory: true).path,
+  "打包后引擎源码目录不存在时，workingDirectory 必须回退到 Application Support，否则进程无法 spawn")
+expect(headlessFactoryConfiguration?.environment["XDG_DATA_HOME"]?.hasSuffix("runtime/data") == true
+  && headlessFactoryConfiguration?.environment["XDG_CONFIG_HOME"]?.hasSuffix("runtime/config") == true
+  && headlessFactoryConfiguration?.environment["XDG_STATE_HOME"]?.hasSuffix("runtime/state") == true,
+  "Headless 引擎的所有可写目录必须收编进 Application Support/runtime，禁止泄漏到 ~/.config 或 ~/.local")
+expect(headlessFactoryConfig["$schema"] == nil, "引擎配置不得携带暴露来源的 $schema 链接")
+
+// Runtime data migration: legacy XDG locations must fold into the contained
+// runtime directory without overwriting anything.
+let migrationHome = temporaryDirectory.appendingPathComponent("migration-home", isDirectory: true)
+let migrationSupport = temporaryDirectory.appendingPathComponent("migration-support", isDirectory: true)
+let migrLegacyData = migrationHome.appendingPathComponent(".local/share/opencode", isDirectory: true)
+let migrLegacyConfig = migrationHome.appendingPathComponent(".config/opencode", isDirectory: true)
+let migrLegacyState = migrationSupport.appendingPathComponent("opencode-state", isDirectory: true)
+try! FileManager.default.createDirectory(at: migrLegacyData, withIntermediateDirectories: true)
+try! FileManager.default.createDirectory(at: migrLegacyConfig, withIntermediateDirectories: true)
+try! FileManager.default.createDirectory(at: migrLegacyState, withIntermediateDirectories: true)
+try! "sessions".write(to: migrLegacyData.appendingPathComponent("db.txt"), atomically: true, encoding: .utf8)
+try! "config".write(to: migrLegacyConfig.appendingPathComponent("engine.json"), atomically: true, encoding: .utf8)
+try! "state".write(to: migrLegacyState.appendingPathComponent("engine-state.txt"), atomically: true, encoding: .utf8)
+let migrationReport = KimiRuntimeDataMigrator.migrateIfNeeded(
+  applicationSupportDirectory: migrationSupport,
+  homeDirectory: migrationHome
+)
+expect(migrationReport.failed.isEmpty, "运行时数据迁移不得失败：\(migrationReport.failed)")
+expect(FileManager.default.fileExists(atPath: migrationSupport.appendingPathComponent("runtime/data/opencode/db.txt").path),
+  "旧 XDG 数据目录必须迁移进 runtime/data")
+expect(FileManager.default.fileExists(atPath: migrationSupport.appendingPathComponent("runtime/config/opencode/engine.json").path),
+  "旧 XDG 配置目录必须迁移进 runtime/config")
+expect(FileManager.default.fileExists(atPath: migrationSupport.appendingPathComponent("runtime/state/engine-state.txt").path),
+  "旧 state 目录必须迁移进 runtime/state")
+expect(!FileManager.default.fileExists(atPath: migrLegacyData.path) && !FileManager.default.fileExists(atPath: migrLegacyConfig.path),
+  "迁移完成后旧 XDG 目录不得残留")
+// Second run with both source and target present must preserve, not overwrite.
+try! FileManager.default.createDirectory(at: migrLegacyData, withIntermediateDirectories: true)
+try! "newer".write(to: migrLegacyData.appendingPathComponent("db2.txt"), atomically: true, encoding: .utf8)
+let secondReport = KimiRuntimeDataMigrator.migrateIfNeeded(
+  applicationSupportDirectory: migrationSupport,
+  homeDirectory: migrationHome
+)
+expect(secondReport.failed.isEmpty
+  && FileManager.default.fileExists(atPath: migrationSupport.appendingPathComponent("runtime/legacy/opencode-legacy/db2.txt").path)
+  && FileManager.default.fileExists(atPath: migrationSupport.appendingPathComponent("runtime/data/opencode/db.txt").path),
+  "新旧数据同时存在时必须保留双份且不得覆盖")
+
+let idleClient = IdleKimiRuntimeSessionClient()
+let idleDriver = KimiRuntimeOperationDriver(client: idleClient)
 let idleDriverTrace = ThreadSafeStringTrace()
 try! awaitValue { await idleDriver.setSession("session-idle"); return () }
 try! awaitValue {
@@ -5471,11 +5517,11 @@ try! awaitValue {
   )
   return ()
 }
-expect(idleClient.promptCount == 1 && idleDriverTrace.snapshot.contains("turn-ended"), "OpenCode Operation Driver 必须等待 session.idle 后才结束 Harness turn")
-let crashOnlyRuntime = OpenCodeRuntimeSupervisor(configuration: OpenCodeRuntimeConfiguration(
+expect(idleClient.promptCount == 1 && idleDriverTrace.snapshot.contains("turn-ended"), "Engine Operation Driver 必须等待 session.idle 后才结束 Harness turn")
+let crashOnlyRuntime = KimiRuntimeSupervisor(configuration: KimiRuntimeConfiguration(
   executableURL: URL(fileURLWithPath: "/bin/sh"),
   arguments: ["-c", "exit 0"],
-  endpoint: OpenCodeRuntimeEndpoint(port: 43128, token: "restart-test"),
+  endpoint: KimiRuntimeEndpoint(port: 43128, token: "restart-test"),
   restartLimit: 1,
   restartDelay: 0.02
 ))
@@ -5484,21 +5530,21 @@ try? await Task.sleep(for: .milliseconds(180))
 let restartCount = try! awaitValue { await crashOnlyRuntime.unexpectedExitRestartCount() }
 expect(restartCount == 1, "Headless Sidecar 意外退出后必须在限定次数内自动重启")
 try! awaitValue { await crashOnlyRuntime.stop(); return () }
-let bridged = OpenCodeEventBridge.map(
-  OpenCodeEvent(sessionID: "session-1", kind: .assistantText, text: "桥接成功")
+let bridged = KimiRuntimeEventBridge.map(
+  KimiRuntimeEvent(sessionID: "session-1", kind: .assistantText, text: "桥接成功")
 )
-expect(bridged.contains(where: { $0.displayText == "桥接成功" }), "OpenCode assistant event 必须映射为 Kimi Event")
+expect(bridged.contains(where: { $0.displayText == "桥接成功" }), "Engine assistant event 必须映射为 Kimi Event")
 let toolWireEvent = Data(#"{"type":"message.part.updated","properties":{"sessionID":"session-1","part":{"type":"tool","callID":"call-1","tool":"read","state":{"status":"running","input":{"path":"README.md"}}}}}"#.utf8)
-let decodedToolWireEvent = OpenCodeEventBridge.decodeSSEData(toolWireEvent, sessionID: "session-1")
-expect(decodedToolWireEvent?.kind == .toolCall && decodedToolWireEvent?.toolCallID == "call-1" && decodedToolWireEvent?.toolID == "read", "OpenCode message.part.updated 工具事件必须解析嵌套 part")
-let textDeltaEvent = OpenCodeEventBridge.decodeSSEData(Data(#"{"type":"session.next.text.delta","properties":{"sessionID":"session-1","delta":"增量"}}"#.utf8), sessionID: "session-1")
-expect(textDeltaEvent?.kind == .assistantText && textDeltaEvent?.text == "增量", "OpenCode text delta 必须映射为助手增量文本")
-let permissionWireEvent = OpenCodeEventBridge.decodeSSEData(Data(#"{"type":"permission.asked","properties":{"id":"perm-42","sessionID":"session-1","permission":"execute","patterns":["npm test"]}}"#.utf8), sessionID: "session-1")
-let bridgedPermission = permissionWireEvent.flatMap { OpenCodeEventBridge.map($0).compactMap { event -> KimiPermissionRequest? in
+let decodedToolWireEvent = KimiRuntimeEventBridge.decodeSSEData(toolWireEvent, sessionID: "session-1")
+expect(decodedToolWireEvent?.kind == .toolCall && decodedToolWireEvent?.toolCallID == "call-1" && decodedToolWireEvent?.toolID == "read", "Engine message.part.updated 工具事件必须解析嵌套 part")
+let textDeltaEvent = KimiRuntimeEventBridge.decodeSSEData(Data(#"{"type":"session.next.text.delta","properties":{"sessionID":"session-1","delta":"增量"}}"#.utf8), sessionID: "session-1")
+expect(textDeltaEvent?.kind == .assistantText && textDeltaEvent?.text == "增量", "Engine text delta 必须映射为助手增量文本")
+let permissionWireEvent = KimiRuntimeEventBridge.decodeSSEData(Data(#"{"type":"permission.asked","properties":{"id":"perm-42","sessionID":"session-1","permission":"execute","patterns":["npm test"]}}"#.utf8), sessionID: "session-1")
+let bridgedPermission = permissionWireEvent.flatMap { KimiRuntimeEventBridge.map($0).compactMap { event -> KimiPermissionRequest? in
   if case let .permission(value) = event { return value }
   return nil
 }.first }
-expect(bridgedPermission?.runtimeID == "perm-42", "Permission Card 必须保留 OpenCode 原始 request ID，回复时不能把本地 UUID 发回服务端")
+expect(bridgedPermission?.runtimeID == "perm-42", "Permission Card 必须保留原始 request ID，回复时不能把本地 UUID 发回服务端")
 let nativeAppKernel = KimiAppKernel()
 let kernelState = try! awaitValue { await nativeAppKernel.snapshot() }
 expect(kernelState.terminalPlacement == .right, "KimiAppKernel 必须以右侧终端布局初始化")
@@ -5532,13 +5578,13 @@ try! awaitValue {
   return ()
 }
 let externalSnapshot = try! awaitValue { await externalHarness.snapshot() }
-expect(externalSnapshot.intents[externalEffect.effectID] == externalEffect, "OpenCode 外部工具事件必须能够回流 Harness 并建立 Effect Intent")
+expect(externalSnapshot.intents[externalEffect.effectID] == externalEffect, "Engine 外部工具事件必须能够回流 Harness 并建立 Effect Intent")
 
-let openCodeRequestTrace = ThreadSafeStringTrace()
+let engineRequestTrace = ThreadSafeStringTrace()
 MockURLProtocol.requestHandler = { request in
   let path = request.url?.path ?? ""
   let requestBody = String(data: requestBodyData(request), encoding: .utf8) ?? ""
-  openCodeRequestTrace.append("\(request.httpMethod ?? "GET") \(path) \(requestBody)")
+  engineRequestTrace.append("\(request.httpMethod ?? "GET") \(path) \(requestBody)")
   let body: Data
   switch path {
   case "/session":
@@ -5550,23 +5596,25 @@ MockURLProtocol.requestHandler = { request in
 }
 let mockConfiguration = URLSessionConfiguration.ephemeral
 mockConfiguration.protocolClasses = [MockURLProtocol.self]
-let mockClient = URLSessionOpenCodeSessionClient(
-  endpoint: OpenCodeRuntimeEndpoint(port: 43210, token: "test"),
+let mockClient = URLSessionRuntimeClient(
+  endpoint: KimiRuntimeEndpoint(port: 43210, token: "test"),
   session: URLSession(configuration: mockConfiguration)
 )
 let mockedSession = try! awaitValue { try await mockClient.createSession(CreateSessionInput(title: "测试会话")) }
-expect(mockedSession.id == "session-1", "OpenCode Session Client 必须解析创建会话响应")
-try! awaitValue { try await mockClient.prompt(OpenCodePromptInput(sessionID: "session-1", text: "测试消息")); return () }
+expect(mockedSession.id == "session-1", "引擎会话客户端 必须解析创建会话响应")
+try! awaitValue { try await mockClient.prompt(KimiRuntimePromptInput(sessionID: "session-1", text: "测试消息")); return () }
 try! awaitValue { try await mockClient.respondPermission(PermissionResponse(sessionID: "session-1", requestID: "perm-1", reply: "once")); return () }
-expect(openCodeRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/prompt_async") }), "OpenCode Prompt 必须使用异步 /session/{id}/prompt_async 协议，避免同步请求阻塞 UI")
-expect(openCodeRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/permissions/perm-1") && $0.contains("\"response\":\"once\"") }), "OpenCode Permission 回复必须携带 runtime request ID 和 response 字段")
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/prompt_async") }), "Engine Prompt 必须使用异步 /session/{id}/prompt_async 协议，避免同步请求阻塞 UI")
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/permissions/perm-1") && $0.contains("\"response\":\"once\"") }), "Engine Permission 回复必须携带 runtime request ID 和 response 字段")
 
 if let rawPort = ProcessInfo.processInfo.environment["KIMI_HEADLESS_PORT"],
    let headlessPort = Int(rawPort),
    let headlessToken = ProcessInfo.processInfo.environment["KIMI_HEADLESS_TOKEN"] {
-  let liveClient = URLSessionOpenCodeSessionClient(
-    endpoint: OpenCodeRuntimeEndpoint(port: headlessPort, token: headlessToken)
+  let liveClient = URLSessionRuntimeClient(
+    endpoint: KimiRuntimeEndpoint(port: headlessPort, token: headlessToken)
   )
   let liveSessions = try! awaitValue { try await liveClient.listSessions(directory: nil) }
   expect(liveSessions.count >= 0, "真实 Headless Session API 必须可访问")
 }
+
+print("KimiAgentCore checks passed")

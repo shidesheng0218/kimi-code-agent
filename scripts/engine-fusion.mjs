@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const rootDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const foundationDirectory = path.join(rootDirectory, 'vendor', 'opencode');
+const foundationDirectory = path.join(rootDirectory, 'vendor', 'engine');
 const applicationSupportDirectory = process.env.KIMI_APPLICATION_SUPPORT_DIR
   ?? path.join(process.env.HOME ?? '', 'Library', 'Application Support', 'Kimi Code Agent');
 const bunVersion = '1.3.14';
@@ -13,14 +13,14 @@ function requireFoundation() {
   const packageFile = path.join(foundationDirectory, 'packages', 'opencode', 'package.json');
   const kimiPrompt = path.join(foundationDirectory, 'packages', 'opencode', 'src', 'session', 'prompt', 'kimi.txt');
   if (!existsSync(packageFile) || !existsSync(kimiPrompt)) {
-    throw new Error('OpenCode 运行时不完整。请重新拉取包含 vendor/opencode 的项目源码。');
+    throw new Error('执行引擎源码不完整。请重新拉取包含 vendor/engine 的项目源码。');
   }
 }
 
 async function prepareProfile() {
-  const moduleURL = pathToFileURL(path.join(rootDirectory, 'dist', 'src', 'opencode', 'prepareFusion.js')).href;
-  const { prepareOpenCodeFusionConfig } = await import(moduleURL);
-  const prepared = await prepareOpenCodeFusionConfig({
+  const moduleURL = pathToFileURL(path.join(rootDirectory, 'dist', 'src', 'engine', 'prepareFusion.js')).href;
+  const { prepareEngineFusionConfig } = await import(moduleURL);
+  const prepared = await prepareEngineFusionConfig({
     applicationSupportDirectory,
     baseURL: process.env.KIMI_BASE_URL,
     modelID: process.env.KIMI_MODEL ?? 'kimi-k2.7-code'
@@ -45,15 +45,15 @@ function readKimiAPIKey() {
 }
 
 async function launchEnvironment(requireAPIKey) {
-  const { createOpenCodeLaunchEnvironment, resolveOpenCodeFoundationPaths } = await import(
-    pathToFileURL(path.join(rootDirectory, 'dist', 'src', 'opencode', 'openCodeFusion.js')).href
+  const { createEngineLaunchEnvironment, resolveEngineFoundationPaths } = await import(
+    pathToFileURL(path.join(rootDirectory, 'dist', 'src', 'engine', 'engineFusion.js')).href
   );
-  const paths = resolveOpenCodeFoundationPaths(rootDirectory);
+  const paths = resolveEngineFoundationPaths(rootDirectory);
   if (!existsSync(paths.nativePluginFile)) {
-    throw new Error('Kimi OpenCode 原生插件缺失。请重新拉取完整项目源码。');
+    throw new Error('Kimi 原生插件缺失。请重新拉取完整项目源码。');
   }
-  const environment = createOpenCodeLaunchEnvironment(process.env, applicationSupportDirectory);
-  environment.KIMI_OPENCODE_PLUGIN = pathToFileURL(paths.nativePluginFile).href;
+  const environment = createEngineLaunchEnvironment(process.env, applicationSupportDirectory);
+  environment.KIMI_RUNTIME_PLUGIN = pathToFileURL(paths.nativePluginFile).href;
   if (requireAPIKey) environment.KIMI_API_KEY = readKimiAPIKey();
   return environment;
 }
@@ -95,7 +95,7 @@ function runBun(args, environment) {
         resolve();
         return;
       }
-      reject(new Error(`OpenCode 命令退出，状态码：${code ?? 'unknown'}`));
+      reject(new Error(`执行引擎命令退出，状态码：${code ?? 'unknown'}`));
     });
   });
 }
@@ -111,15 +111,15 @@ async function main() {
 
   if (command === 'prepare') {
     const prepared = await prepareProfile();
-    process.stdout.write(`OpenCode Kimi 配置已写入：${prepared.configFile}\n`);
+    process.stdout.write(`Kimi 引擎配置已写入：${prepared.configFile}\n`);
     return;
   }
 
   if (command === 'dev' || command === 'package') {
-    throw new Error('OpenCode Desktop / Electron 已退出生产路径。请使用 SwiftUI 的 npm run native:build 或 npm run native:package。');
+    throw new Error('Electron 桌面壳已退出生产路径。请使用 npm run native:build 或 npm run native:package。');
   }
 
-  throw new Error('用法：node scripts/opencode-fusion.mjs <install|prepare|dev|package>');
+  throw new Error('用法：node scripts/engine-fusion.mjs <install|prepare|dev|package>');
 }
 
 main().catch(error => {

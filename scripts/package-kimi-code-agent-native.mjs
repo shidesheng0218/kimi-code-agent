@@ -39,25 +39,25 @@ await mkdir(macos, { recursive: true })
 await mkdir(path.join(resources, "runtime"), { recursive: true })
 await mkdir(path.join(resources, "native"), { recursive: true })
 
-const opencodePackage = path.join(root, "vendor/opencode/packages/opencode")
-const pluginSource = path.join(root, "vendor/opencode/packages/kimi-code-agent-plugin/src/index.ts")
+const enginePackage = path.join(root, "vendor/engine/packages/opencode")
+const pluginSource = path.join(root, "vendor/engine/packages/kimi-code-agent-plugin/src/index.ts")
 const pluginBundle = path.join(resources, "kimi-native-plugin.mjs")
 const sparkleBinDir = path.join(root, "macos/.cache/sparkle-bin/bin")
 const signUpdateTool = path.join(sparkleBinDir, "sign_update")
 
-// Compile OpenCode into a standalone Bun executable so released users do not
+// Compile the embedded engine into a standalone Bun executable so released users do not
 // need Bun, Node, or Electron installed locally.
-run("npx", ["--yes", "bun@1.3.14", "run", "--cwd", opencodePackage, "script/build.ts", "--single", "--skip-install", "--skip-embed-web-ui"], {
+run("npx", ["--yes", "bun@1.3.14", "run", "--cwd", enginePackage, "script/build.ts", "--single", "--skip-install", "--skip-embed-web-ui"], {
   env: { OPENCODE_MODELS_URL: "http://127.0.0.1:9" },
 })
-const openCodeBinary = path.join(opencodePackage, "dist", `opencode-darwin-${arch}`, "bin", "opencode")
-if (!existsSync(openCodeBinary)) throw new Error(`OpenCode standalone binary missing: ${openCodeBinary}`)
+const engineBinary = path.join(enginePackage, "dist", `opencode-darwin-${arch}`, "bin", "opencode")
+if (!existsSync(engineBinary)) throw new Error(`Engine standalone binary missing: ${engineBinary}`)
 
 run("npx", ["--yes", "bun@1.3.14", "build", pluginSource, "--outfile", pluginBundle, "--target", "bun", "--format", "esm"])
 
 await cp(path.join(binDirectory, "KimiCodeAgent"), path.join(macos, "KimiCodeAgent"))
 await cp(path.join(binDirectory, "KimiNativeBridge"), path.join(resources, "native/KimiNativeBridge"))
-await cp(openCodeBinary, path.join(resources, "runtime/opencode"))
+await cp(engineBinary, path.join(resources, "runtime/kimi-agent"))
 // App icon rendered from media/kimi-readme.svg via scripts/generate-icon.sh.
 const iconSource = path.join(root, "media/AppIcon.icns")
 if (!existsSync(iconSource)) throw new Error(`App icon missing: ${iconSource}. Run scripts/generate-icon.sh first.`)

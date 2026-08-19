@@ -1,6 +1,6 @@
 import Foundation
 
-public struct OpenCodeSession: Codable, Equatable, Identifiable, Sendable {
+public struct KimiRuntimeSession: Codable, Equatable, Identifiable, Sendable {
   public let id: String
   public var title: String?
   public var directory: String?
@@ -22,7 +22,7 @@ public struct CreateSessionInput: Codable, Sendable {
   }
 }
 
-public struct OpenCodePromptInput: Codable, Sendable {
+public struct KimiRuntimePromptInput: Codable, Sendable {
   public let sessionID: String
   public let text: String
   public let directory: String?
@@ -34,7 +34,7 @@ public struct OpenCodePromptInput: Codable, Sendable {
   }
 }
 
-public struct OpenCodeSteerInput: Codable, Sendable {
+public struct KimiRuntimeSteerInput: Codable, Sendable {
   public let sessionID: String
   public let text: String
   public let directory: String?
@@ -60,28 +60,28 @@ public struct PermissionResponse: Codable, Sendable {
   }
 }
 
-public protocol OpenCodeSessionClient: Sendable {
-  func createSession(_ input: CreateSessionInput) async throws -> OpenCodeSession
-  func prompt(_ input: OpenCodePromptInput) async throws
-  func steer(_ input: OpenCodeSteerInput) async throws
+public protocol KimiRuntimeSessionClient: Sendable {
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession
+  func prompt(_ input: KimiRuntimePromptInput) async throws
+  func steer(_ input: KimiRuntimeSteerInput) async throws
   func abort(sessionID: String) async throws
   func respondPermission(_ input: PermissionResponse) async throws
-  func listSessions(directory: String?) async throws -> [OpenCodeSession]
-  func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<OpenCodeEvent, Error>
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession]
+  func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error>
 }
 
-public final class URLSessionOpenCodeSessionClient: OpenCodeSessionClient, @unchecked Sendable {
-  private let endpoint: OpenCodeRuntimeEndpoint
+public final class URLSessionRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+  private let endpoint: KimiRuntimeEndpoint
   private let directory: String?
   private let session: URLSession
 
-  public init(endpoint: OpenCodeRuntimeEndpoint, directory: String? = nil, session: URLSession = .shared) {
+  public init(endpoint: KimiRuntimeEndpoint, directory: String? = nil, session: URLSession = .shared) {
     self.endpoint = endpoint
     self.directory = directory
     self.session = session
   }
 
-  public func createSession(_ input: CreateSessionInput) async throws -> OpenCodeSession {
+  public func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
     let body: [String: Any] = [
       "directory": input.directory ?? directory as Any,
       "title": input.title as Any
@@ -89,7 +89,7 @@ public final class URLSessionOpenCodeSessionClient: OpenCodeSessionClient, @unch
     return try await request(path: "/session", method: "POST", body: body)
   }
 
-  public func prompt(_ input: OpenCodePromptInput) async throws {
+  public func prompt(_ input: KimiRuntimePromptInput) async throws {
     let body: [String: Any] = [
       "parts": [["type": "text", "text": input.text]],
       "directory": input.directory ?? directory as Any
@@ -97,8 +97,8 @@ public final class URLSessionOpenCodeSessionClient: OpenCodeSessionClient, @unch
     _ = try await requestData(path: "/session/\(input.sessionID)/prompt_async", method: "POST", body: body)
   }
 
-  public func steer(_ input: OpenCodeSteerInput) async throws {
-    try await prompt(OpenCodePromptInput(sessionID: input.sessionID, text: input.text, directory: input.directory))
+  public func steer(_ input: KimiRuntimeSteerInput) async throws {
+    try await prompt(KimiRuntimePromptInput(sessionID: input.sessionID, text: input.text, directory: input.directory))
   }
 
   public func abort(sessionID: String) async throws {
@@ -113,12 +113,12 @@ public final class URLSessionOpenCodeSessionClient: OpenCodeSessionClient, @unch
     ])
   }
 
-  public func listSessions(directory: String? = nil) async throws -> [OpenCodeSession] {
+  public func listSessions(directory: String? = nil) async throws -> [KimiRuntimeSession] {
     let query = (directory ?? self.directory).map { "?directory=\(Self.escape($0))" } ?? ""
     return try await request(path: "/session\(query)", method: "GET", body: nil)
   }
 
-  public func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<OpenCodeEvent, Error> {
+  public func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
     let url = endpoint.baseURL.appendingPathComponent("event")
     var request = URLRequest(url: url)
     request.setValue(endpoint.authorizationHeader, forHTTPHeaderField: "Authorization")
@@ -130,7 +130,7 @@ public final class URLSessionOpenCodeSessionClient: OpenCodeSessionClient, @unch
         do {
           let (bytes, response) = try await session.bytes(for: eventRequest)
           guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw OpenCodeRuntimeError.invalidResponse
+            throw KimiRuntimeError.invalidResponse
           }
           var dataLines: [String] = []
           for try await line in bytes.lines {
@@ -138,7 +138,7 @@ public final class URLSessionOpenCodeSessionClient: OpenCodeSessionClient, @unch
               dataLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
             } else if line.isEmpty, !dataLines.isEmpty {
               let data = Data(dataLines.joined(separator: "\n").utf8)
-              if let event = OpenCodeEventBridge.decodeSSEData(data, sessionID: sessionID), event.sessionID == sessionID {
+              if let event = KimiRuntimeEventBridge.decodeSSEData(data, sessionID: sessionID), event.sessionID == sessionID {
                 continuation.yield(event)
               }
               dataLines.removeAll()
@@ -156,11 +156,11 @@ public final class URLSessionOpenCodeSessionClient: OpenCodeSessionClient, @unch
   private func request<T: Decodable>(path: String, method: String, body: [String: Any]?) async throws -> T {
     let data = try await requestData(path: path, method: method, body: body)
     do { return try JSONDecoder().decode(T.self, from: data) }
-    catch { throw OpenCodeRuntimeError.requestFailed("OpenCode 响应解析失败：\(error.localizedDescription)") }
+    catch { throw KimiRuntimeError.requestFailed("引擎响应解析失败：\(error.localizedDescription)") }
   }
 
   private func requestData(path: String, method: String, body: [String: Any]?) async throws -> Data {
-    guard let url = URL(string: path, relativeTo: endpoint.baseURL)?.absoluteURL else { throw OpenCodeRuntimeError.invalidResponse }
+    guard let url = URL(string: path, relativeTo: endpoint.baseURL)?.absoluteURL else { throw KimiRuntimeError.invalidResponse }
     var request = URLRequest(url: url)
     request.httpMethod = method
     request.timeoutInterval = 30
@@ -172,13 +172,13 @@ public final class URLSessionOpenCodeSessionClient: OpenCodeSessionClient, @unch
     do {
       let (data, response) = try await session.data(for: request)
       guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-        throw OpenCodeRuntimeError.requestFailed("OpenCode HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+        throw KimiRuntimeError.requestFailed("引擎 HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
       }
       return data
-    } catch let error as OpenCodeRuntimeError {
+    } catch let error as KimiRuntimeError {
       throw error
     } catch {
-      throw OpenCodeRuntimeError.requestFailed(error.localizedDescription)
+      throw KimiRuntimeError.requestFailed(error.localizedDescription)
     }
   }
 

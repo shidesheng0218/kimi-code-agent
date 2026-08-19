@@ -85,7 +85,7 @@ public enum KimiRuntimeState: String, Codable, Sendable {
 
 public struct KimiSessionSummary: Codable, Equatable, Identifiable, Sendable {
   public let id: UUID
-  /// OpenCode uses string IDs such as `ses_...`; the UUID remains the local
+  /// The engine uses string IDs such as `ses_...`; the UUID remains the local
   /// stable identity used by SwiftUI's ForEach and Harness records.
   public let runtimeID: String?
   public var title: String
@@ -181,7 +181,7 @@ public struct KimiActivity: Codable, Equatable, Identifiable, Sendable {
 
 public struct KimiPermissionRequest: Codable, Equatable, Identifiable, Sendable {
   public let id: UUID
-  /// Opaque OpenCode permission request identifier. The Swift UUID is used
+  /// Opaque engine permission request identifier. The Swift UUID is used
   /// for stable SwiftUI identity only; this value is what must be sent back to
   /// the headless server when the user approves or rejects the request.
   public let runtimeID: String?

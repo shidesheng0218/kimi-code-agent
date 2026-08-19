@@ -37,7 +37,7 @@ Never place API keys, `.p12` files, private signing keys, or notarization passwo
 
 1. Update release notes and verify `npm run verify` locally.
 2. Create and push a semantic tag, for example `v1.4.0`.
-3. The **Release macOS** workflow builds the native SwiftUI app for the runner architecture, embeds the OpenCode headless runtime, signs it (ad-hoc by default; Developer ID + notarization only when the optional secrets are configured), validates the DMG/ZIP, and creates a GitHub Release.
+3. The **Release macOS** workflow builds the native SwiftUI app for the runner architecture, embeds the headless engine runtime, signs it (ad-hoc by default; Developer ID + notarization only when the optional secrets are configured), validates the DMG/ZIP, and creates a GitHub Release.
 4. Verify the published Release contains the DMG, ZIP, and `SHA256SUMS` file.
 5. Download the asset on a clean macOS account and confirm: Gatekeeper bypass (right-click → Open, or `xattr -dr com.apple.quarantine` on the app), launch, API setup, a local terminal command, a Browser task, and app restart recovery.
 

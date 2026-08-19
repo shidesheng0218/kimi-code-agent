@@ -1,6 +1,6 @@
 import Foundation
 
-public enum OpenCodeNativeBridgeOperation: String, Codable, CaseIterable, Sendable {
+public enum KimiNativeBridgeOperation: String, Codable, CaseIterable, Sendable {
   case webSearch = "web.search"
   case webFetch = "web.fetch"
   case browserVerify = "browser.verify"
@@ -11,7 +11,7 @@ public enum OpenCodeNativeBridgeOperation: String, Codable, CaseIterable, Sendab
   case computerPressKey = "computer.press_key"
 }
 
-public enum OpenCodeNativeBridgeValidationError: LocalizedError, Equatable, Sendable {
+public enum KimiNativeBridgeValidationError: LocalizedError, Equatable, Sendable {
   case emptyRequestID
   case missingBrowserPlan
   case missingCoordinates
@@ -33,9 +33,9 @@ public enum OpenCodeNativeBridgeValidationError: LocalizedError, Equatable, Send
   }
 }
 
-public struct OpenCodeNativeBridgeRequest: Codable, Equatable, Sendable {
+public struct KimiNativeBridgeRequest: Codable, Equatable, Sendable {
   public let requestID: String
-  public let operation: OpenCodeNativeBridgeOperation
+  public let operation: KimiNativeBridgeOperation
   public let browserPlan: BrowserVerificationPlan?
   public let artifactsDirectory: String?
   public let x: Double?
@@ -50,7 +50,7 @@ public struct OpenCodeNativeBridgeRequest: Codable, Equatable, Sendable {
 
   public init(
     requestID: String,
-    operation: OpenCodeNativeBridgeOperation,
+    operation: KimiNativeBridgeOperation,
     browserPlan: BrowserVerificationPlan? = nil,
     artifactsDirectory: String? = nil,
     x: Double? = nil,
@@ -80,27 +80,27 @@ public struct OpenCodeNativeBridgeRequest: Codable, Equatable, Sendable {
 
   public func validate() throws {
     guard !requestID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-      throw OpenCodeNativeBridgeValidationError.emptyRequestID
+      throw KimiNativeBridgeValidationError.emptyRequestID
     }
     switch operation {
     case .webSearch:
       guard let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        throw OpenCodeNativeBridgeValidationError.missingQuery
+        throw KimiNativeBridgeValidationError.missingQuery
       }
     case .webFetch:
       guard let url, !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        throw OpenCodeNativeBridgeValidationError.missingURL
+        throw KimiNativeBridgeValidationError.missingURL
       }
       _ = try WebFetchPolicy.validate(url: url)
     case .browserVerify:
-      guard browserPlan != nil else { throw OpenCodeNativeBridgeValidationError.missingBrowserPlan }
+      guard browserPlan != nil else { throw KimiNativeBridgeValidationError.missingBrowserPlan }
     case .computerClick:
-      guard x != nil, y != nil else { throw OpenCodeNativeBridgeValidationError.missingCoordinates }
+      guard x != nil, y != nil else { throw KimiNativeBridgeValidationError.missingCoordinates }
     case .computerTypeText:
-      guard let text, !text.isEmpty else { throw OpenCodeNativeBridgeValidationError.missingText }
+      guard let text, !text.isEmpty else { throw KimiNativeBridgeValidationError.missingText }
     case .computerPressKey:
       guard let key, !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        throw OpenCodeNativeBridgeValidationError.missingKey
+        throw KimiNativeBridgeValidationError.missingKey
       }
     case .computerInspect, .computerScreenshot:
       break
@@ -108,7 +108,7 @@ public struct OpenCodeNativeBridgeRequest: Codable, Equatable, Sendable {
   }
 }
 
-public struct OpenCodeNativeBridgeResponse: Codable, Equatable, Sendable {
+public struct KimiNativeBridgeResponse: Codable, Equatable, Sendable {
   public let requestID: String
   public let ok: Bool
   public let output: String
@@ -132,7 +132,7 @@ public struct OpenCodeNativeBridgeResponse: Codable, Equatable, Sendable {
     self.error = error
   }
 
-  public static func failure(requestID: String, error: String) -> OpenCodeNativeBridgeResponse {
-    OpenCodeNativeBridgeResponse(requestID: requestID, ok: false, error: error)
+  public static func failure(requestID: String, error: String) -> KimiNativeBridgeResponse {
+    KimiNativeBridgeResponse(requestID: requestID, ok: false, error: error)
   }
 }

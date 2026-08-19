@@ -1,6 +1,6 @@
 import Foundation
 
-/// The persisted boundary for the native shell.  OpenCode session IDs are
+/// The persisted boundary for the native shell.  Runtime session IDs are
 /// intentionally kept as opaque strings inside `KimiUIState`; the Harness
 /// session ID is local and stable so event replay can survive an app restart.
 public struct KimiPersistedAppState: Codable, Equatable, Sendable {

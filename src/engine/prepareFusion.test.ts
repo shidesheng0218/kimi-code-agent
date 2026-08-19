@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
-import { prepareOpenCodeFusionConfig } from './prepareFusion.js';
+import { prepareEngineFusionConfig } from './prepareFusion.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -10,12 +10,12 @@ afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map(directory => rm(directory, { recursive: true, force: true })));
 });
 
-describe('prepareOpenCodeFusionConfig', () => {
-  it('writes a private secret-free OpenCode profile and state directory', async () => {
-    const applicationSupportDirectory = await mkdtemp(path.join(tmpdir(), 'kimi-opencode-'));
+describe('prepareEngineFusionConfig', () => {
+  it('writes a private secret-free engine profile and state directory', async () => {
+    const applicationSupportDirectory = await mkdtemp(path.join(tmpdir(), 'kimi-engine-'));
     temporaryDirectories.push(applicationSupportDirectory);
 
-    const prepared = await prepareOpenCodeFusionConfig({
+    const prepared = await prepareEngineFusionConfig({
       applicationSupportDirectory,
       baseURL: 'https://api.moonshot.cn/v1',
       modelID: 'kimi-k2.7-code'
@@ -40,7 +40,7 @@ describe('prepareOpenCodeFusionConfig', () => {
     await mkdir(path.dirname(legacyStateFile), { recursive: true });
     await writeFile(legacyStateFile, '{"session":"legacy"}\n', 'utf8');
 
-    const prepared = await prepareOpenCodeFusionConfig({
+    const prepared = await prepareEngineFusionConfig({
       applicationSupportDirectory,
       modelID: 'kimi-k2.7-code'
     });

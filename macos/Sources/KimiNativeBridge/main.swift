@@ -8,24 +8,24 @@ struct KimiNativeBridge {
   static func main() async {
     let data = FileHandle.standardInput.readDataToEndOfFile()
     guard !data.isEmpty else {
-      emit(OpenCodeNativeBridgeResponse(requestID: "unknown", ok: false, error: "原生桥接未收到请求。"))
+      emit(KimiNativeBridgeResponse(requestID: "unknown", ok: false, error: "原生桥接未收到请求。"))
       return
     }
 
     do {
-      let request = try JSONDecoder().decode(OpenCodeNativeBridgeRequest.self, from: data)
+      let request = try JSONDecoder().decode(KimiNativeBridgeRequest.self, from: data)
       do {
         try request.validate()
         emit(try await execute(request))
       } catch {
-        emit(OpenCodeNativeBridgeResponse.failure(requestID: request.requestID, error: error.localizedDescription))
+        emit(KimiNativeBridgeResponse.failure(requestID: request.requestID, error: error.localizedDescription))
       }
     } catch {
-      emit(OpenCodeNativeBridgeResponse(requestID: "unknown", ok: false, error: error.localizedDescription))
+      emit(KimiNativeBridgeResponse(requestID: "unknown", ok: false, error: error.localizedDescription))
     }
   }
 
-  private static func execute(_ request: OpenCodeNativeBridgeRequest) async throws -> OpenCodeNativeBridgeResponse {
+  private static func execute(_ request: KimiNativeBridgeRequest) async throws -> KimiNativeBridgeResponse {
     switch request.operation {
     case .webSearch:
       let runtime = try await webRuntime(requiresSearchProvider: true)
@@ -39,7 +39,7 @@ struct KimiNativeBridge {
         let snippet = source.snippet.isEmpty ? "" : " — \(source.snippet)"
         return "- [\(source.title)](\(source.url))\(snippet)"
       }.joined(separator: "\n")
-      return OpenCodeNativeBridgeResponse(
+      return KimiNativeBridgeResponse(
         requestID: request.requestID,
         ok: true,
         output: output.isEmpty ? "未找到公开来源。" : output,
@@ -63,7 +63,7 @@ struct KimiNativeBridge {
         sourceID: nil,
         maxCharacters: request.maxCharacters ?? 100_000
       ))
-      return OpenCodeNativeBridgeResponse(
+      return KimiNativeBridgeResponse(
         requestID: request.requestID,
         ok: true,
         output: result.content,
@@ -77,7 +77,7 @@ struct KimiNativeBridge {
         ]
       )
     case .browserVerify:
-      guard let plan = request.browserPlan else { throw OpenCodeNativeBridgeValidationError.missingBrowserPlan }
+      guard let plan = request.browserPlan else { throw KimiNativeBridgeValidationError.missingBrowserPlan }
       if plan.steps.contains(where: requiresHighRiskApproval) { try requireApproval() }
       let directory = try artifactsDirectory(request)
       let controller = await MainActor.run { () -> BrowserVerificationController in
@@ -85,7 +85,7 @@ struct KimiNativeBridge {
         return BrowserVerificationController()
       }
       let result = await controller.run(plan: plan, artifactsDirectory: directory)
-      return OpenCodeNativeBridgeResponse(
+      return KimiNativeBridgeResponse(
         requestID: request.requestID,
         ok: result.passed,
         output: result.passed ? "浏览器验证通过。" : "浏览器验证未通过：\(result.repairSummary)",
@@ -99,7 +99,7 @@ struct KimiNativeBridge {
       )
     case .computerInspect:
       let diagnostics = ComputerUseController.diagnostics()
-      return OpenCodeNativeBridgeResponse(
+      return KimiNativeBridgeResponse(
         requestID: request.requestID,
         ok: true,
         output: diagnostics.message,
@@ -108,7 +108,7 @@ struct KimiNativeBridge {
     case .computerScreenshot, .computerClick, .computerTypeText, .computerPressKey:
       try requireApproval()
       let result = try await ComputerUseController.executeHarnessRequest(toolRequest(for: request))
-      return OpenCodeNativeBridgeResponse(requestID: request.requestID, ok: true, output: result.output, metadata: result.metadata)
+      return KimiNativeBridgeResponse(requestID: request.requestID, ok: true, output: result.output, metadata: result.metadata)
     }
   }
 
@@ -186,7 +186,7 @@ struct KimiNativeBridge {
       .flatMap { value in value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : URL(fileURLWithPath: value, isDirectory: true) }
       ?? FileManager.default.temporaryDirectory
         .appendingPathComponent("Kimi Code Agent", isDirectory: true)
-        .appendingPathComponent("opencode-state", isDirectory: true)
+        .appendingPathComponent("engine-state", isDirectory: true)
     return WebSourceReceiptStore(directory: directory.appendingPathComponent("native-web", isDirectory: true))
   }
 
@@ -200,22 +200,22 @@ struct KimiNativeBridge {
 
   private static func requireApproval() throws {
     guard ProcessInfo.processInfo.environment["KIMI_NATIVE_BRIDGE_APPROVED"] == "1" else {
-      throw NSError(domain: "KimiNativeBridge", code: 1, userInfo: [NSLocalizedDescriptionKey: "高风险原生操作尚未经过 OpenCode 审批。"])
+      throw NSError(domain: "KimiNativeBridge", code: 1, userInfo: [NSLocalizedDescriptionKey: "高风险原生操作尚未经过审批。"])
     }
   }
 
-  private static func artifactsDirectory(_ request: OpenCodeNativeBridgeRequest) throws -> URL {
+  private static func artifactsDirectory(_ request: KimiNativeBridgeRequest) throws -> URL {
     let directory = request.artifactsDirectory
       .flatMap { URL(fileURLWithPath: $0, isDirectory: true) }
       ?? FileManager.default.temporaryDirectory
         .appendingPathComponent("Kimi Code Agent", isDirectory: true)
-        .appendingPathComponent("opencode-artifacts", isDirectory: true)
+        .appendingPathComponent("engine-artifacts", isDirectory: true)
         .appendingPathComponent(request.requestID, isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     return directory
   }
 
-  private static func toolRequest(for request: OpenCodeNativeBridgeRequest) -> ToolExecutionRequest {
+  private static func toolRequest(for request: KimiNativeBridgeRequest) -> ToolExecutionRequest {
     let toolID: String
     var input: [String: String] = [:]
     switch request.operation {
@@ -236,10 +236,10 @@ struct KimiNativeBridge {
     case .browserVerify, .computerInspect:
       fatalError("Unsupported native tool conversion")
     }
-    return ToolExecutionRequest(taskID: UUID(), sessionID: UUID(), agentID: "opencode-native-bridge", toolID: toolID, input: input)
+    return ToolExecutionRequest(taskID: UUID(), sessionID: UUID(), agentID: "kimi-native-bridge", toolID: toolID, input: input)
   }
 
-  private static func emit(_ response: OpenCodeNativeBridgeResponse) {
+  private static func emit(_ response: KimiNativeBridgeResponse) {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
     let data = (try? encoder.encode(response)) ?? Data("{\"ok\":false,\"error\":\"编码失败\"}".utf8)

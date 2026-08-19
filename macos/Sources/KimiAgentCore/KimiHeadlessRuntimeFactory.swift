@@ -6,30 +6,36 @@ public enum KimiHeadlessRuntimeFactory {
     applicationSupportDirectory: URL,
     environment: [String: String] = ProcessInfo.processInfo.environment,
     fileManager: FileManager = .default
-  ) -> OpenCodeRuntimeConfiguration? {
-    let nativeOpenCodeURL = configuredRuntimeURL(
-      environment["KIMI_OPENCODE_BINARY"],
-      fallback: resourcesDirectory.appendingPathComponent("runtime/opencode")
+  ) -> KimiRuntimeConfiguration? {
+    let nativeRuntimeBinaryURL = configuredRuntimeURL(
+      environment["KIMI_RUNTIME_BINARY"],
+      fallback: resourcesDirectory.appendingPathComponent("runtime/kimi-agent")
     )
     let bunURL = configuredRuntimeURL(
       environment["KIMI_BUN_PATH"],
       fallback: resourcesDirectory.appendingPathComponent("runtime/bun")
     ) ?? ManagedRuntimeLocator.bunPath(environment: environment).map(URL.init(fileURLWithPath:))
-    guard nativeOpenCodeURL != nil || bunURL != nil else { return nil }
+    guard nativeRuntimeBinaryURL != nil || bunURL != nil else { return nil }
 
-    let opencodeRoot = URL(fileURLWithPath: environment["KIMI_OPENCODE_ROOT"] ?? resourcesDirectory.appendingPathComponent("opencode", isDirectory: true).path, isDirectory: true)
-    let entrypoint = URL(fileURLWithPath: environment["KIMI_OPENCODE_ENTRY"] ?? opencodeRoot.appendingPathComponent("src/index.ts").path)
-    if nativeOpenCodeURL == nil && !(fileManager.fileExists(atPath: entrypoint.path) || environment["KIMI_OPENCODE_ENTRY"] != nil) {
+    let engineRoot = URL(fileURLWithPath: environment["KIMI_RUNTIME_ROOT"] ?? resourcesDirectory.appendingPathComponent("engine", isDirectory: true).path, isDirectory: true)
+    let entrypoint = URL(fileURLWithPath: environment["KIMI_RUNTIME_ENTRY"] ?? engineRoot.appendingPathComponent("src/index.ts").path)
+    if nativeRuntimeBinaryURL == nil && !(fileManager.fileExists(atPath: entrypoint.path) || environment["KIMI_RUNTIME_ENTRY"] != nil) {
       return nil
     }
 
-    let port = Int(environment["KIMI_OPENCODE_PORT"] ?? "") ?? Int.random(in: 20_000...45_000)
-    let configuredToken = environment["KIMI_OPENCODE_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let port = Int(environment["KIMI_RUNTIME_PORT"] ?? "") ?? Int.random(in: 20_000...45_000)
+    let configuredToken = environment["KIMI_RUNTIME_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let token = configuredToken.isEmpty ? UUID().uuidString : configuredToken
-    let endpoint = OpenCodeRuntimeEndpoint(port: port, token: token)
-    let stateDirectory = applicationSupportDirectory.appendingPathComponent("opencode-state", isDirectory: true)
-    let pluginPath = environment["KIMI_OPENCODE_PLUGIN"] ?? resourcesDirectory.appendingPathComponent("kimi-native-plugin.mjs").path
-    // OPENCODE_CONFIG_CONTENT is a virtual config source. OpenCode resolves
+    let endpoint = KimiRuntimeEndpoint(port: port, token: token)
+    // Contain every engine-writable location inside the app's own sandbox
+    // directory so nothing leaks into ~/.config, ~/.local, or other shared
+    // XDG paths.
+    let runtimeHome = applicationSupportDirectory.appendingPathComponent("runtime", isDirectory: true)
+    let dataHome = runtimeHome.appendingPathComponent("data", isDirectory: true)
+    let configHome = runtimeHome.appendingPathComponent("config", isDirectory: true)
+    let stateHome = runtimeHome.appendingPathComponent("state", isDirectory: true)
+    let pluginPath = environment["KIMI_RUNTIME_PLUGIN"] ?? resourcesDirectory.appendingPathComponent("kimi-native-plugin.mjs").path
+    // OPENCODE_CONFIG_CONTENT is a virtual config source. The engine resolves
     // path plugins relative to a config file only when it sees a file URL;
     // passing an absolute filesystem path here makes the loader treat the
     // .mjs file as a directory and silently drops the plugin. Keep the
@@ -46,8 +52,8 @@ public enum KimiHeadlessRuntimeFactory {
       ?? (try? MacKeychainCredentialVault().read(key: "kimi.runtime.identity.apiKey")) ?? ""
     let commandArguments: [String]
     let executableURL: URL
-    if let nativeOpenCodeURL {
-      executableURL = nativeOpenCodeURL
+    if let nativeRuntimeBinaryURL {
+      executableURL = nativeRuntimeBinaryURL
       commandArguments = ["serve", "--hostname", endpoint.host, "--port", String(endpoint.port)]
     } else {
       executableURL = bunURL!
@@ -55,18 +61,20 @@ public enum KimiHeadlessRuntimeFactory {
     }
     var runtimeEnvironment: [String: String] = [
       "OPENCODE_SERVER_PASSWORD": token,
+      "OPENCODE_SERVER_USERNAME": "kimi",
       "OPENCODE_CLIENT": "kimi-code-agent",
-      "XDG_STATE_HOME": stateDirectory.path,
-      "KIMI_OPENCODE_PLUGIN": plugin,
+      "XDG_DATA_HOME": dataHome.path,
+      "XDG_CONFIG_HOME": configHome.path,
+      "XDG_STATE_HOME": stateHome.path,
+      "KIMI_RUNTIME_PLUGIN": plugin,
       "KIMI_NATIVE_BRIDGE": bridge,
       "KIMI_APPLICATION_SUPPORT_DIR": applicationSupportDirectory.path
     ]
     if !apiKey.isEmpty { runtimeEnvironment["KIMI_API_KEY"] = apiKey }
     let config: [String: Any] = [
-      "$schema": "https://opencode.ai/config.json",
       "model": "moonshotai-cn/\(modelID)",
       "small_model": "moonshotai-cn/\(modelID)",
-      "plugin": ["{env:KIMI_OPENCODE_PLUGIN}"],
+      "plugin": ["{env:KIMI_RUNTIME_PLUGIN}"],
       "provider": [
         "moonshotai-cn": [
           "name": "Kimi / Moonshot AI",
@@ -86,10 +94,14 @@ public enum KimiHeadlessRuntimeFactory {
       runtimeEnvironment["OPENCODE_CONFIG_CONTENT"] = text
     }
 
-    return OpenCodeRuntimeConfiguration(
+    return KimiRuntimeConfiguration(
       executableURL: executableURL,
       arguments: commandArguments,
-      workingDirectory: opencodeRoot,
+      // A packaged app ships only the standalone engine binary, not the
+      // engine source tree, so engineRoot may not exist. Spawning a process
+      // with a missing working directory throws before exec; fall back to the
+      // always-present, contained Application Support directory instead.
+      workingDirectory: fileManager.fileExists(atPath: engineRoot.path) ? engineRoot : applicationSupportDirectory,
       environment: runtimeEnvironment,
       endpoint: endpoint
     )

@@ -11,7 +11,7 @@ describe('Kimi Code Agent native runtime', () => {
 
     expect(packageJSON.scripts).toHaveProperty('native:build');
     expect(packageJSON.scripts).toHaveProperty('native:package');
-    expect(packageJSON.scripts['opencode:package']).toBe('npm run native:package');
+    expect(packageJSON.scripts['engine:package']).toBe('npm run native:package');
     expect(packageJSON.scripts).not.toHaveProperty('opencode:dev');
     expect(packageJSON.scripts).not.toHaveProperty('update');
     expect(swiftPackage).not.toContain('KimiAgentDesktop');

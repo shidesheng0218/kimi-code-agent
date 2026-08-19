@@ -4,20 +4,20 @@
 
 # Kimi Code Agent
 
-**基于 OpenCode 执行内核、接入 Kimi 与 macOS 原生能力的 Coding Agent 工作台**
+**接入 Kimi 大模型与 macOS 原生能力的本地优先 Coding Agent 工作台**
 
 自然对话 · Worktree 隔离 · 可审计工具 · MCP / Skills / Hooks · 可恢复执行
 
 <p>
   <img src="https://img.shields.io/badge/platform-macOS%2014%2B-111827?style=flat-square" alt="macOS 14+">
-  <img src="https://img.shields.io/badge/runtime-Kimi%20SwiftUI%20%2B%20OpenCode%20Headless-0f766e?style=flat-square" alt="Kimi SwiftUI and OpenCode Headless">
+  <img src="https://img.shields.io/badge/runtime-SwiftUI%20%2B%20Headless%20Engine-0f766e?style=flat-square" alt="Kimi SwiftUI and OpenCode Headless">
   <img src="https://img.shields.io/badge/model-Kimi%20API%20%7C%20Kimi%20Code-2563eb?style=flat-square" alt="Kimi API and Kimi Code">
   <img src="https://img.shields.io/badge/distribution-GitHub%20Releases-181717?style=flat-square&logo=github" alt="GitHub Releases">
 </p>
 
 </div>
 
-> 当前生产桌面工作台是 Kimi 原生 SwiftUI/AppKit；OpenCode 只作为随机 loopback 端口上的无界面执行基座。用户不需要手动安装 Node/Bun，默认在本机和隔离 Worktree 中执行，审阅 Diff 后再合并。
+> 当前生产桌面工作台是 Kimi 原生 SwiftUI/AppKit；内置执行引擎只监听随机 loopback 端口，无界面运行。用户不需要手动安装 Node/Bun，默认在本机和隔离 Worktree 中执行，审阅 Diff 后再合并。
 
 ## 目录
 
@@ -167,13 +167,13 @@ https://api.moonshot.ai/v1
 ```mermaid
 flowchart TB
     UI[Kimi 原生 SwiftUI / AppKit]
-    S[OpenCode Session Runtime<br/>Provider / Tool / Permission / MCP]
+    S[Headless Session Runtime<br/>Provider / Tool / Permission / MCP]
     P[Kimi Provider Profile<br/>Keychain → Sidecar Env]
     NP[Kimi Native Plugin]
     B[Swift KimiNativeBridge]
     WEB[Swift WebRuntime<br/>Kimi Formula + Safe Fetch]
     MAC[WKWebView Browser / Computer Use]
-    OC[OpenCode Store<br/>Session / Artifact / Diff / Terminal]
+    OC[Engine Store<br/>Session / Artifact / Diff / Terminal]
 
     UI --> S
     P --> S
@@ -201,20 +201,20 @@ Kimi API 是默认模型入口。ACP / CLI 只产生模型事件，作为兼容�
 
 ```text
 .
-├── vendor/opencode/                 # OpenCode 1.18.18 执行内核与 Desktop 工作台（MIT）
+├── vendor/engine/                 # 内置执行内核源码（MIT，见 THIRD_PARTY_NOTICES）
 │   ├── packages/opencode/            # Session、Tool、Permission、MCP、Skills、Hooks
-│   ├── packages/desktop/             # 仅作为 OpenCode 参考源码，不进入生产包
+│   ├── packages/desktop/             # 桌面参考源码，不进入生产包
 │   └── packages/kimi-code-agent-plugin/
 │                                     # Kimi Web / Browser / Computer Use 原生工具
 ├── macos/
 │   ├── Sources/KimiAgentCore/       # Swift WebRuntime、安全策略、原生 Adapter
-│   ├── Sources/KimiNativeBridge/    # OpenCode ↔ Swift JSON 原生桥接
+│   ├── Sources/KimiNativeBridge/    # 引擎 ↔ Swift JSON 原生桥接
 │   └── Sources/KimiAgentCoreChecks/ # Swift 原生闭环与故障注入检查
-├── src/opencode/                    # Kimi OpenCode 配置与启动环境
+├── src/engine/                    # Kimi 引擎配置与启动环境
 ├── scripts/                         # 融合、打包、签名脚本
 ├── docs/GITHUB_RELEASES.md          # GitHub Release / 公证 Runbook
 ├── media/kimi.svg                   # 项目图标
-└── THIRD_PARTY_NOTICES.md            # OpenCode 等第三方许可证说明
+└── THIRD_PARTY_NOTICES.md            # 第三方许可证与版权声明
 ```
 
 ## 从源码构建
@@ -229,9 +229,9 @@ npm install
 # 旧项目的 TypeScript 检查、JS 单测、Swift CoreChecks
 npm run verify
 
-# 安装并准备 OpenCode Headless 依赖与 Kimi Profile
-npm run opencode:install
-npm run opencode:prepare
+# 安装并准备执行引擎依赖与 Kimi Profile
+npm run engine:install
+npm run engine:prepare
 
 # 编译 Kimi 原生 SwiftUI 应用
 npm run native:build
@@ -246,8 +246,8 @@ npm run native:package
 npm run check
 npm test
 swift run --package-path macos KimiAgentCoreChecks
-cd vendor/opencode/packages/core && bun test test/tool/network-policy.test.ts
-cd vendor/opencode/packages/kimi-code-agent-plugin && bun test
+cd vendor/engine/packages/core && bun test test/tool/network-policy.test.ts
+cd vendor/engine/packages/kimi-code-agent-plugin && bun test
 git diff --check
 ```
 
@@ -329,8 +329,8 @@ codesign --verify --deep --strict \
 
 ## 当前边界
 
-- 只维护 macOS 版本；生产桌面 UI 是 Kimi 原生 SwiftUI/AppKit，OpenCode Desktop/Electron 不进入发布包；
-- 默认 Kimi API，保留 OpenCode Provider 协议与兼容 Provider；
+- 只维护 macOS 版本；生产桌面 UI 是 Kimi 原生 SwiftUI/AppKit，Electron 桌面壳不进入发布包；
+- 默认 Kimi API，保留开放 Provider 协议与兼容 Provider；
 - Browser、Computer Use、MCP、Skills、Hooks、Plugins 的真实能力受本机权限、服务配置和 Worker 状态影响；
 - Computer Use 不是后台静默自动化，高风险动作始终需要用户确认；
 - 发布包为 ad-hoc 签名、未公证，首次启动需按安装章节放行 Gatekeeper；仅支持 Apple Silicon（arm64）；
@@ -339,7 +339,7 @@ codesign --verify --deep --strict \
 ## 维护原则
 
 - 以真实任务闭环作为完成标准，不用能力目录冒充实现；
-- OpenCode Session / Tool Registry 是默认执行链；Swift 旧 Harness 仅保留迁移、原生工具和兼容数据能力；
+- 内置引擎 Session / Tool Registry 是默认执行链；Swift 旧 Harness 仅保留迁移、原生工具和兼容数据能力；
 - 默认本地执行、Worktree 隔离、人工审阅、人工合并；
 - 低风险公网只读减少重复审批，高风险和越界动作保持明确边界；
 - 所有关键操作都应有事件、Intent、Receipt、Artifact 或明确失败原因。

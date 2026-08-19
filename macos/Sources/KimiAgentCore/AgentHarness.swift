@@ -917,7 +917,7 @@ public actor AgentHarness {
   }
 
   /// Accepts events emitted by an external execution authority such as the
-  /// OpenCode headless server.  The event still passes through the same
+  /// embedded headless server.  The event still passes through the same
   /// checkpoint, intent, receipt and durable event-store projection as native
   /// Harness drivers.
   public func record(_ event: HarnessDriverEvent, operationID: OperationID) async {

@@ -1,6 +1,6 @@
 import Foundation
 
-public enum OpenCodeEventKind: String, Codable, Sendable {
+public enum KimiRuntimeEventKind: String, Codable, Sendable {
   case sessionCreated
   case sessionUpdated
   case sessionStatus
@@ -22,10 +22,10 @@ public enum OpenCodeEventKind: String, Codable, Sendable {
   case unknown
 }
 
-public struct OpenCodeEvent: Codable, Equatable, Sendable {
+public struct KimiRuntimeEvent: Codable, Equatable, Sendable {
   public let id: UUID
   public let sessionID: String
-  public let kind: OpenCodeEventKind
+  public let kind: KimiRuntimeEventKind
   public let text: String?
   public let toolCallID: String?
   public let toolID: String?
@@ -36,7 +36,7 @@ public struct OpenCodeEvent: Codable, Equatable, Sendable {
   public init(
     id: UUID = UUID(),
     sessionID: String,
-    kind: OpenCodeEventKind,
+    kind: KimiRuntimeEventKind,
     text: String? = nil,
     toolCallID: String? = nil,
     toolID: String? = nil,
@@ -56,8 +56,8 @@ public struct OpenCodeEvent: Codable, Equatable, Sendable {
   }
 }
 
-public enum OpenCodeEventBridge {
-  public static func map(_ event: OpenCodeEvent) -> [KimiEvent] {
+public enum KimiRuntimeEventBridge {
+  public static func map(_ event: KimiRuntimeEvent) -> [KimiEvent] {
     switch event.kind {
     case .assistantText:
       return event.text.map { [.assistantText($0)] } ?? []
@@ -97,11 +97,11 @@ public enum OpenCodeEventBridge {
          .mcpUpdated, .subagentStarted, .subagentCompleted, .compacted, .unknown:
       return event.text.map { [.activity(KimiActivity(title: event.kind.rawValue, detail: $0, state: .completed))] } ?? []
     case .error:
-      return [.error(event.text ?? "OpenCode 运行时出现错误。")]
+      return [.error(event.text ?? "执行引擎出现错误。")]
     }
   }
 
-  public static func decodeSSEData(_ data: Data, sessionID: String) -> OpenCodeEvent? {
+  public static func decodeSSEData(_ data: Data, sessionID: String) -> KimiRuntimeEvent? {
     guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
     let rawType = (object["type"] as? String) ?? (object["event"] as? String) ?? "unknown"
     let properties = object["properties"] as? [String: Any] ?? object["data"] as? [String: Any] ?? object
@@ -143,7 +143,7 @@ public enum OpenCodeEventBridge {
     if let input = properties["input"], let encoded = stringify(input) { payload["arguments"] = encoded }
     if let status = partState?["status"] as? String { payload["status"] = status }
     if let error = properties["error"] { payload["error"] = stringify(error) ?? "error" }
-    return OpenCodeEvent(
+    return KimiRuntimeEvent(
       sessionID: eventSessionID,
       kind: kind,
       text: text,
@@ -162,7 +162,7 @@ public enum OpenCodeEventBridge {
     return String(data: data, encoding: .utf8)
   }
 
-  private static func mapKind(_ raw: String) -> OpenCodeEventKind {
+  private static func mapKind(_ raw: String) -> KimiRuntimeEventKind {
     let value = raw.lowercased()
     if value.contains("session.idle") { return .sessionIdle }
     if value.contains("session.status") { return .sessionStatus }
