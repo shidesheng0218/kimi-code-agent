@@ -79,5 +79,14 @@
 
 ## 尚需真实环境验收
 
-- 真实 Kimi API、真实 MCP OAuth/远程 Transport、Browser/Computer Use 系统权限和 100 仓库对标基准必须在已配置凭据与用户授权的 macOS 环境中执行。
+已通过的真实验收（本机，含证据产物）：
+
+- Browser 真实闭环：`BrowserSmokeCheck` 通过本地 loopback HTTP + 生产 `BrowserVerificationController`（离屏 WKWebView）完成 open → inspect h1 → screenshot → collectConsole，截图产物真实落盘且可读（`BROWSER_SMOKE_OK`，截图 91KB）。
+- Computer Use 真实闭环：`ComputerUseSmokeCheck` 驱动生产 `ComputerUseController.executeHarnessRequest` 完成 inspect、真实屏幕捕获（303KB PNG，目视确认）、参数校验、辅助功能/屏幕录制权限门与结构化错误路径（`COMPUTER_USE_SMOKE_OK screenGranted=true accessibilityGranted=true`）。
+- MCP 真实第三方 Server：`MCPSmokeCheck` 驱动生产 `MCPStdioClient` 连接 `@modelcontextprotocol/server-everything@2.0.0`，完成 initialize 握手、tools/list（12 个工具）、echo 真实回环、resources/list + read、prompts/list + get，以及 `kill -9` 崩溃注入后结构化 `notConnected`（无挂起、无崩溃）和 close 后守卫（`MCP_SMOKE_OK`）。
+- 重启恢复进程级闭环：`RestartRecoveryCheck` 以两个独立进程共享同一状态目录模拟应用被杀后重启。已结算 op 保持 completed 且成功 Receipt 保留（零重放）；中途被杀的 op 恢复为 suspended，未结算写入 Intent 保留但绝不伪造 Receipt，未应答 tool call 写入合成中断结果；restore 实测 0.001s（预算 2s）；会话列表、活跃会话和消息历史经生产 `KimiAppKernel` 恢复（`RESTART_RECOVERY_OK`）。
+
+仍需真实环境验收：
+
+- 真实 Kimi API 端到端对话、真实 MCP OAuth/远程 Transport 和 100 仓库对标基准必须在已配置凭据与用户授权的 macOS 环境中执行。
 - 这些外部验收在通过前不应标记为“超过 Claude Code”；本地 CoreChecks、构建和打包只证明可回放的本地闭环。

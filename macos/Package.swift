@@ -10,7 +10,8 @@ let package = Package(
     .executable(name: "KimiNativeBridge", targets: ["KimiNativeBridge"]),
     .executable(name: "BrowserSmokeCheck", targets: ["BrowserSmokeCheck"]),
     .executable(name: "ComputerUseSmokeCheck", targets: ["ComputerUseSmokeCheck"]),
-    .executable(name: "MCPSmokeCheck", targets: ["MCPSmokeCheck"])
+    .executable(name: "MCPSmokeCheck", targets: ["MCPSmokeCheck"]),
+    .executable(name: "RestartRecoveryCheck", targets: ["RestartRecoveryCheck"])
   ],
   dependencies: [
     .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.5.0")
@@ -33,6 +34,7 @@ let package = Package(
     .executableTarget(name: "KimiAgentCoreChecks", dependencies: ["KimiAgentCore"]),
     .executableTarget(name: "BrowserSmokeCheck", dependencies: ["KimiAgentCore"]),
     .executableTarget(name: "ComputerUseSmokeCheck", dependencies: ["KimiAgentCore"]),
-    .executableTarget(name: "MCPSmokeCheck", dependencies: ["KimiAgentCore"])
+    .executableTarget(name: "MCPSmokeCheck", dependencies: ["KimiAgentCore"]),
+    .executableTarget(name: "RestartRecoveryCheck", dependencies: ["KimiAgentCore"])
   ]
 )
