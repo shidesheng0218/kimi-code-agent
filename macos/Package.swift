@@ -7,7 +7,8 @@ let package = Package(
   products: [
     .library(name: "KimiAgentCore", targets: ["KimiAgentCore"]),
     .executable(name: "KimiCodeAgent", targets: ["KimiCodeAgent"]),
-    .executable(name: "KimiNativeBridge", targets: ["KimiNativeBridge"])
+    .executable(name: "KimiNativeBridge", targets: ["KimiNativeBridge"]),
+    .executable(name: "BrowserSmokeCheck", targets: ["BrowserSmokeCheck"])
   ],
   dependencies: [
     .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.5.0")
@@ -27,6 +28,7 @@ let package = Package(
       ]
     ),
     .executableTarget(name: "KimiNativeBridge", dependencies: ["KimiAgentCore"]),
-    .executableTarget(name: "KimiAgentCoreChecks", dependencies: ["KimiAgentCore"])
+    .executableTarget(name: "KimiAgentCoreChecks", dependencies: ["KimiAgentCore"]),
+    .executableTarget(name: "BrowserSmokeCheck", dependencies: ["KimiAgentCore"])
   ]
 )
