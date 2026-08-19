@@ -255,6 +255,27 @@ git diff --check
 
 GitHub 分发不是 App Store 分发。正式 Release 需要 Developer ID 签名和 Apple 公证；本地开发包可能使用 ad-hoc 签名。完整流程见 [`docs/GITHUB_RELEASES.md`](docs/GITHUB_RELEASES.md)。
 
+### 自动更新（Sparkle）
+
+应用内置 Sparkle 更新器，菜单栏「检查更新…」可手动触发，默认每 24 小时后台检查一次。更新源是仓库根目录的 `appcast.xml`（通过 `raw.githubusercontent.com` 分发），更新包用 EdDSA（ed25519）签名防篡改。
+
+发布一个可自动更新的版本：
+
+```bash
+# 1) 更新 package.json 里的 version，然后一键构建 + 签名 + 更新 appcast
+npm run native:package
+# 2) appcast.xml 会被自动更新；把它和版本代码一起提交、打 tag、推送到 master
+git add appcast.xml && git commit -m "release: vX.Y.Z" && git push origin HEAD:master
+# 3) 上传 DMG/ZIP/SHA256SUMS 到 GitHub Release
+```
+
+关键点：
+
+- `appcast.xml` 必须存在于 **master** 分支（`SUFeedURL` 指向 master 的 raw 地址）。
+- EdDSA 私钥只保存在发布机器的钥匙串里（由 Sparkle 的 `generate_keys` 生成），公钥写入 `Info.plist` 的 `SUPublicEDKey`。**私钥一旦丢失就无法再发布签名更新**，务必离线备份。
+- `sign_update` / `generate_keys` 工具缓存在 `macos/.cache/sparkle-bin/`（不入库）。
+- 更新要求新旧包代码签名一致；当前为 ad-hoc 签名，更新校验按 bundle id 匹配。
+
 生成包后建议执行：
 
 ```bash

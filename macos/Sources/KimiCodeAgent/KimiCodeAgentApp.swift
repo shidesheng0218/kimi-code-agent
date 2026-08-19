@@ -1,9 +1,18 @@
 import SwiftUI
 import KimiAgentCore
+import Sparkle
 
 @main
 struct KimiCodeAgentApp: App {
   @StateObject private var model = KimiAppViewModel()
+  private let updaterController: SPUStandardUpdaterController
+
+  init() {
+    // Start the updater early so scheduled background checks run even before
+    // the user opens the update menu item. Sparkle reads SUFeedURL /
+    // SUPublicEDKey from the bundle Info.plist at packaging time.
+    updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
+  }
 
   var body: some Scene {
     WindowGroup("Kimi Code Agent") {
@@ -15,6 +24,11 @@ struct KimiCodeAgentApp: App {
       CommandGroup(after: .newItem) {
         Button("新建会话") { model.createSession() }
           .keyboardShortcut("n", modifiers: [.command])
+      }
+      CommandGroup(replacing: .appInfo) {
+        Button("检查更新…") {
+          updaterController.checkForUpdates(nil)
+        }
       }
     }
   }

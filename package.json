@@ -2,7 +2,7 @@
   "name": "kimi-code-agent-macos",
   "displayName": "Kimi Code Agent for macOS",
   "description": "Native macOS local-first Kimi coding agent workbench.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "license": "MIT",
   "type": "commonjs",

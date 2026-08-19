@@ -9,10 +9,23 @@ let package = Package(
     .executable(name: "KimiCodeAgent", targets: ["KimiCodeAgent"]),
     .executable(name: "KimiNativeBridge", targets: ["KimiNativeBridge"])
   ],
-  dependencies: [],
+  dependencies: [
+    .package(url: "https://github.com/sparkle-project/Sparkle.git", from: "2.5.0")
+  ],
   targets: [
     .target(name: "KimiAgentCore"),
-    .executableTarget(name: "KimiCodeAgent", dependencies: ["KimiAgentCore"]),
+    .executableTarget(
+      name: "KimiCodeAgent",
+      dependencies: [
+        "KimiAgentCore",
+        .product(name: "Sparkle", package: "Sparkle")
+      ],
+      linkerSettings: [
+        // The packaged app embeds Sparkle.xcframework in Contents/Frameworks,
+        // so the executable must resolve it relative to itself once installed.
+        .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])
+      ]
+    ),
     .executableTarget(name: "KimiNativeBridge", dependencies: ["KimiAgentCore"]),
     .executableTarget(name: "KimiAgentCoreChecks", dependencies: ["KimiAgentCore"])
   ]
