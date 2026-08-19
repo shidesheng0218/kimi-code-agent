@@ -1,6 +1,7 @@
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { execFileSync, spawnSync } from "node:child_process"
+import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -115,28 +116,44 @@ await writeFile(path.join(outRoot, "SHA256SUMS.txt"), shaOutput, "utf8")
 console.log(`SHA256 written: ${path.join(outRoot, "SHA256SUMS.txt")}`)
 
 // Sparkle EdDSA signature for the ZIP. sign_update reads the private key from
-// the release machine's Keychain and prints sparkle:edSignature / length.
+// the release machine's Keychain by default; CI has no Keychain entry, so it
+// passes the key via KIMI_SPARKLE_PRIVATE_KEY_FILE or the
+// KIMI_SPARKLE_EDDSA_PRIVATE_KEY secret (written to a 0600 temp file).
 if (existsSync(signUpdateTool)) {
-  const signatureOutput = execFileSync(signUpdateTool, [zip], { cwd: root, encoding: "utf8" }).trim()
-  const signatureMatch = signatureOutput.match(/sparkle:edSignature="([^"]+)"/)
-  const lengthMatch = signatureOutput.match(/length="(\d+)"/)
-  if (!signatureMatch || !lengthMatch) throw new Error(`sign_update produced unexpected output: ${signatureOutput}`)
-  await writeFile(path.join(outRoot, `Kimi-Code-Agent-${version}-mac-${arch}.zip.sparkle.txt`), `${signatureMatch[1]} ${lengthMatch[1]}\n`, "utf8")
-  console.log(`Sparkle signature written: release-native/Kimi-Code-Agent-${version}-mac-${arch}.zip.sparkle.txt`)
+  const sparklePrivateKeyFile = process.env.KIMI_SPARKLE_PRIVATE_KEY_FILE?.trim()
+  const sparklePrivateKey = process.env.KIMI_SPARKLE_EDDSA_PRIVATE_KEY?.trim()
+  let keyFile = sparklePrivateKeyFile
+  let tempKeyFile
+  if (!keyFile && sparklePrivateKey) {
+    tempKeyFile = path.join(os.tmpdir(), `kimi-sparkle-ed25519-${process.pid}.key`)
+    await writeFile(tempKeyFile, `${sparklePrivateKey}\n`, { mode: 0o600 })
+    keyFile = tempKeyFile
+  }
+  try {
+    const signArgs = keyFile ? ["--ed-key-file", keyFile, zip] : [zip]
+    const signatureOutput = execFileSync(signUpdateTool, signArgs, { cwd: root, encoding: "utf8" }).trim()
+    const signatureMatch = signatureOutput.match(/sparkle:edSignature="([^"]+)"/)
+    const lengthMatch = signatureOutput.match(/length="(\d+)"/)
+    if (!signatureMatch || !lengthMatch) throw new Error(`sign_update produced unexpected output: ${signatureOutput}`)
+    await writeFile(path.join(outRoot, `Kimi-Code-Agent-${version}-mac-${arch}.zip.sparkle.txt`), `${signatureMatch[1]} ${lengthMatch[1]}\n`, "utf8")
+    console.log(`Sparkle signature written: release-native/Kimi-Code-Agent-${version}-mac-${arch}.zip.sparkle.txt`)
 
-  const tag = `v${version}`
-  const zipName = path.basename(zip)
-  const downloadURL = `https://github.com/shidesheng0218/kimi-code-agent/releases/download/${tag}/${zipName}`
-  const notesURL = `https://github.com/shidesheng0218/kimi-code-agent/releases/tag/${tag}`
-  run("node", [
-    "scripts/update-appcast.mjs",
-    "--version", version,
-    "--build", version.replaceAll(".", ""),
-    "--url", downloadURL,
-    "--signature", signatureMatch[1],
-    "--length", lengthMatch[1],
-    "--notes", notesURL
-  ])
+    const tag = `v${version}`
+    const zipName = path.basename(zip)
+    const downloadURL = `https://github.com/shidesheng0218/kimi-code-agent/releases/download/${tag}/${zipName}`
+    const notesURL = `https://github.com/shidesheng0218/kimi-code-agent/releases/tag/${tag}`
+    run("node", [
+      "scripts/update-appcast.mjs",
+      "--version", version,
+      "--build", version.replaceAll(".", ""),
+      "--url", downloadURL,
+      "--signature", signatureMatch[1],
+      "--length", lengthMatch[1],
+      "--notes", notesURL
+    ])
+  } finally {
+    if (tempKeyFile) await rm(tempKeyFile, { force: true })
+  }
 } else {
   console.warn(`sign_update not found at ${signUpdateTool}; skipping Sparkle signature and appcast update. Run the Sparkle toolchain setup to enable auto-update releases.`)
 }

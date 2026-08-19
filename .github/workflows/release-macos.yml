@@ -149,12 +149,23 @@ jobs:
       - name: Verify source
         run: npm run verify
 
+      # Sparkle's sign_update is not committed to the repo; fetch the official
+      # release tarball so the packaging script can EdDSA-sign the update ZIP.
+      - name: Fetch Sparkle signing tools
+        run: |
+          mkdir -p macos/.cache/sparkle-bin
+          curl -fsSL https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz \
+            -o /tmp/sparkle.tar.xz
+          tar -xJf /tmp/sparkle.tar.xz -C macos/.cache/sparkle-bin
+          macos/.cache/sparkle-bin/bin/sign_update --help > /dev/null
+
       - name: Package Kimi Code Agent release
         env:
           CSC_NAME: ${{ secrets.KIMI_DEVELOPER_ID_APPLICATION }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          KIMI_SPARKLE_EDDSA_PRIVATE_KEY: ${{ secrets.KIMI_SPARKLE_EDDSA_PRIVATE_KEY }}
           OPENCODE_MODELS_URL: http://127.0.0.1:9
         run: |
           VERSION="${KIMI_VERSION#v}"
@@ -165,6 +176,22 @@ jobs:
             release-native/Kimi-Code-Agent-"$VERSION"-SHA256SUMS.txt
           unzip -t release-native/Kimi-Code-Agent-"$VERSION"-mac-*.zip
           hdiutil verify release-native/Kimi-Code-Agent-"$VERSION"-mac-*.dmg
+
+      # The packaging script prepends this release to appcast.xml; publish it
+      # back to master because SUFeedURL reads the feed from master's raw URL.
+      - name: Publish updated Sparkle feed
+        run: |
+          if git diff --quiet -- appcast.xml; then
+            echo "appcast.xml unchanged; skipping feed publish"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add appcast.xml
+          git commit -m "chore(appcast): add ${KIMI_VERSION} to Sparkle feed"
+          git fetch origin master
+          git rebase origin/master
+          git push origin HEAD:master
 
       - name: Publish GitHub release
         env:

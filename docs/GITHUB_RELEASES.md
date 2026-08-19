@@ -6,6 +6,15 @@ Default distribution uses **ad-hoc signing without Apple notarization**: no
 Apple Developer account is required, and any machine can cut a release. Users
 bypass Gatekeeper once on first launch (see the README installation section).
 
+## Required GitHub Secret (Sparkle auto-update)
+
+| Secret | Purpose |
+| --- | --- |
+| `KIMI_SPARKLE_EDDSA_PRIVATE_KEY` | EdDSA (ed25519) private key used by `sign_update` to sign the update ZIP and refresh `appcast.xml`. Lives in the release machine's Keychain (`https://sparkle-project.org` / `ed25519`); losing it blocks future signed updates. |
+
+Without this secret the release still publishes the DMG/ZIP/SHA256SUMS, but
+the Sparkle feed is not updated and installed clients will not auto-update.
+
 ## Optional GitHub Secrets (Developer ID + notarization)
 
 These are only needed if a future maintainer wants Developer ID signed and
