@@ -6,6 +6,16 @@
     <description>macOS releases for Kimi Code Agent (arm64).</description>
     <language>zh-CN</language>
     <item>
+      <title>0.3.4</title>
+      <sparkle:version>034</sparkle:version>
+      <sparkle:shortVersionString>0.3.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <sparkle:releaseNotesLink>https://github.com/shidesheng0218/kimi-code-agent/releases/tag/v0.3.4</sparkle:releaseNotesLink>
+      <pubDate>Wed, 19 Aug 2026 09:24:34 GMT</pubDate>
+      <enclosure url="https://github.com/shidesheng0218/kimi-code-agent/releases/download/v0.3.4/Kimi-Code-Agent-0.3.4-mac-arm64.zip" type="application/octet-stream" sparkle:edSignature="+q/4ccv5Y+ge3UtWGOSH1Ty/yVWUVZrEMMe9J6Q6nT4CQHlOQYBr/Wjq3U113rBMWMrgoat9HJSMDR5FrUKwDQ==" length="42084750"/>
+    </item>
+
+    <item>
       <title>0.3.3</title>
       <sparkle:version>033</sparkle:version>
       <sparkle:shortVersionString>0.3.3</sparkle:shortVersionString>
