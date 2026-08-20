@@ -2,6 +2,7 @@
 
 ## Unreleased - 2026-08-19
 
+- 修复 Sparkle 自动更新循环风险：appcast 的 sparkle:version 曾用去点的构建号（"034"），与 CFBundleVersion（"0.3.4"）按 Sparkle 分段整数比较时永远判定为更新（34 > 0），已装用户会被无限提示更新同版本。打包脚本改为传完整 semver，存量 feed 条目同步修正，并以 vitest 契约测试锁定。
 - 接通全部断链链路并对齐 Claude Code 交互：停止按钮、Steer 插队、Follow-up 排队、流式合并、reasoning 折叠、三键权限审批（含“总是允许”与 patterns 展示）、SSE 断线重连、会话历史重建、Todo 清单、结构化问答卡、消息级 revert/unrevert、Slash 命令、compact。
 - 真实引擎 + 真实 Kimi API 验收（内核级 27 项断言）中修复四个存量深层缺陷：SSE 帧解析失效（事件流此前从未产出事件）、SSE 60 秒默认超时掐断长 turn、permission.replied 被误判为 asked 产生僵尸审批卡、用户消息 text part 被回显为助手气泡。
 - 修复会话目录缺陷：directory 从 POST body 迁移到引擎实际读取的 query 参数；新建会话强制选择项目文件夹，侧栏按项目分组。

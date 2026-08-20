@@ -149,7 +149,11 @@ if (existsSync(signUpdateTool)) {
     run("node", [
       "scripts/update-appcast.mjs",
       "--version", version,
-      "--build", version.replaceAll(".", ""),
+      // sparkle:version must compare cleanly against CFBundleVersion (which is
+      // the dotted semver). Sparkle compares component-wise as integers, so a
+      // stripped "034" outranks an installed "0.3.4" (34 > 0) and loops the
+      // updater on the same version forever. Keep the dots.
+      "--build", version,
       "--url", downloadURL,
       "--signature", signatureMatch[1],
       "--length", lengthMatch[1],

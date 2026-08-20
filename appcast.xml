@@ -7,7 +7,7 @@
     <language>zh-CN</language>
     <item>
       <title>0.3.4</title>
-      <sparkle:version>034</sparkle:version>
+      <sparkle:version>0.3.4</sparkle:version>
       <sparkle:shortVersionString>0.3.4</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
       <sparkle:releaseNotesLink>https://github.com/shidesheng0218/kimi-code-agent/releases/tag/v0.3.4</sparkle:releaseNotesLink>
@@ -17,7 +17,7 @@
 
     <item>
       <title>0.3.3</title>
-      <sparkle:version>033</sparkle:version>
+      <sparkle:version>0.3.3</sparkle:version>
       <sparkle:shortVersionString>0.3.3</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
       <sparkle:releaseNotesLink>https://github.com/shidesheng0218/kimi-code-agent/releases/tag/v0.3.3</sparkle:releaseNotesLink>
