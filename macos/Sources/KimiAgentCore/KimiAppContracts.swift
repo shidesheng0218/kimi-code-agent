@@ -3,14 +3,22 @@ import Foundation
 /// Commands emitted by the native SwiftUI shell. This deliberately uses a
 /// distinct name from the legacy `KimiCommand` process-launch value type.
 public enum KimiAppCommand: Sendable, Equatable {
-  case createSession
+  case createSession(directory: String?)
   case selectSession(UUID)
+  case showHome
   case prompt(PromptInput)
   case steer(PromptInput)
   case followUp(PromptInput)
   case abort(OperationID)
   case approve(UUID)
+  case approveAlways(UUID)
   case deny(UUID)
+  case answerQuestion(UUID, [[String]])
+  case rejectQuestion(UUID)
+  case revertLastTurn
+  case unrevert
+  case runSlashCommand(name: String, arguments: String)
+  case compact
   case retry(OperationID)
   case resume(OperationID)
   case openTerminal(UUID)
@@ -23,12 +31,20 @@ public enum KimiAppCommand: Sendable, Equatable {
   public enum Kind: String, Codable, Sendable {
     case createSession
     case selectSession
+    case showHome
     case prompt
     case steer
     case followUp
     case abort
     case approve
+    case approveAlways
     case deny
+    case answerQuestion
+    case rejectQuestion
+    case revertLastTurn
+    case unrevert
+    case runSlashCommand
+    case compact
     case retry
     case resume
     case openTerminal
@@ -43,12 +59,20 @@ public enum KimiAppCommand: Sendable, Equatable {
     switch self {
     case .createSession: .createSession
     case .selectSession: .selectSession
+    case .showHome: .showHome
     case .prompt: .prompt
     case .steer: .steer
     case .followUp: .followUp
     case .abort: .abort
     case .approve: .approve
+    case .approveAlways: .approveAlways
     case .deny: .deny
+    case .answerQuestion: .answerQuestion
+    case .rejectQuestion: .rejectQuestion
+    case .revertLastTurn: .revertLastTurn
+    case .unrevert: .unrevert
+    case .runSlashCommand: .runSlashCommand
+    case .compact: .compact
     case .retry: .retry
     case .resume: .resume
     case .openTerminal: .openTerminal
@@ -122,6 +146,10 @@ public struct KimiMessage: Codable, Equatable, Identifiable, Sendable {
   public let role: KimiMessageRole
   public var text: String
   public var isStreaming: Bool
+  /// Engine-side part identifier (`partID` from `message.part.*` events). A
+  /// streaming text part maps to exactly one bubble, so deltas append to and
+  /// snapshots replace the same row instead of shattering into fragments.
+  public let runtimePartID: String?
   public let createdAt: Date
 
   public init(
@@ -129,12 +157,14 @@ public struct KimiMessage: Codable, Equatable, Identifiable, Sendable {
     role: KimiMessageRole,
     text: String,
     isStreaming: Bool = false,
+    runtimePartID: String? = nil,
     createdAt: Date = .now
   ) {
     self.id = id
     self.role = role
     self.text = text
     self.isStreaming = isStreaming
+    self.runtimePartID = runtimePartID
     self.createdAt = createdAt
   }
 }
@@ -216,6 +246,150 @@ public struct KimiPermissionRequest: Codable, Equatable, Identifiable, Sendable 
   }
 }
 
+/// One entry of the engine's todo list (todo.updated event / todo endpoint),
+/// rendered as the session's working checklist.
+public struct KimiTodoItem: Codable, Equatable, Sendable, Identifiable {
+  public let id: String
+  public var content: String
+  /// Engine status string: pending / in_progress / completed / cancelled.
+  public var status: String
+  public var priority: String?
+
+  public init(id: String, content: String, status: String, priority: String? = nil) {
+    self.id = id
+    self.content = content
+    self.status = status
+    self.priority = priority
+  }
+
+  public var isCompleted: Bool { status == "completed" || status == "cancelled" }
+}
+
+public struct KimiQuestionOption: Codable, Equatable, Sendable, Identifiable {
+  public var id: String { label }
+  public let label: String
+  public let description: String?
+
+  public init(label: String, description: String? = nil) {
+    self.label = label
+    self.description = description
+  }
+}
+
+public struct KimiQuestionItem: Codable, Equatable, Sendable, Identifiable {
+  public let id: String
+  public let question: String
+  public let header: String?
+  public let options: [KimiQuestionOption]
+  public let multiple: Bool
+  public let custom: Bool
+
+  public init(id: String = UUID().uuidString, question: String, header: String? = nil, options: [KimiQuestionOption] = [], multiple: Bool = false, custom: Bool = true) {
+    self.id = id
+    self.question = question
+    self.header = header
+    self.options = options
+    self.multiple = multiple
+    self.custom = custom
+  }
+}
+
+/// A structured engine question (question tool), the counterpart of an
+/// approval card: the model asks, the user answers or dismisses.
+public struct KimiQuestionRequest: Codable, Equatable, Identifiable, Sendable {
+  public let id: UUID
+  /// Engine-side question request identifier used in the reply.
+  public let runtimeID: String?
+  public let sessionID: String
+  public let questions: [KimiQuestionItem]
+  public let createdAt: Date
+
+  public init(id: UUID = UUID(), runtimeID: String? = nil, sessionID: String, questions: [KimiQuestionItem], createdAt: Date = .now) {
+    self.id = id
+    self.runtimeID = runtimeID
+    self.sessionID = sessionID
+    self.questions = questions
+    self.createdAt = createdAt
+  }
+}
+
+/// A slash command advertised by the engine (`GET /command`), including
+/// project-level commands discovered from the workspace.
+public struct KimiSlashCommand: Codable, Equatable, Sendable, Identifiable {
+  public var id: String { name }
+  public let name: String
+  public let description: String?
+  public let hint: String?
+
+  public init(name: String, description: String? = nil, hint: String? = nil) {
+    self.name = name
+    self.description = description
+    self.hint = hint
+  }
+}
+
+/// One settled (or still open) side effect, projected from the Harness
+/// intent/receipt journal for the verification panel.
+public struct KimiVerificationRecord: Equatable, Sendable, Identifiable {
+  public var id: UUID { effectID }
+  public let effectID: UUID
+  public let subject: String
+  public let kind: String
+  public let risk: String
+  /// settled outcome: success / failure / cancelled; nil while still open.
+  public let outcome: String?
+  public let errorMessage: String?
+  public let retryable: Bool
+  public let createdAt: Date
+
+  public init(effectID: UUID, subject: String, kind: String, risk: String, outcome: String?, errorMessage: String?, retryable: Bool, createdAt: Date = .now) {
+    self.effectID = effectID
+    self.subject = subject
+    self.kind = kind
+    self.risk = risk
+    self.outcome = outcome
+    self.errorMessage = errorMessage
+    self.retryable = retryable
+    self.createdAt = createdAt
+  }
+}
+
+public struct KimiMcpServerStatus: Equatable, Sendable, Identifiable {
+  public var id: String { name }
+  public let name: String
+  public let status: String
+  public let detail: String?
+
+  public init(name: String, status: String, detail: String? = nil) {
+    self.name = name
+    self.status = status
+    self.detail = detail
+  }
+}
+
+public struct KimiSkillSummary: Equatable, Sendable, Identifiable {
+  public var id: String { name }
+  public let name: String
+  public let description: String?
+
+  public init(name: String, description: String? = nil) {
+    self.name = name
+    self.description = description
+  }
+}
+
+/// Everything the integrations panel shows: MCP server health and discovered
+/// skills, fetched live from the engine.
+public struct KimiIntegrationStatus: Equatable, Sendable {
+  public var mcpServers: [KimiMcpServerStatus]
+  public var skills: [KimiSkillSummary]
+
+  public init(mcpServers: [KimiMcpServerStatus] = [], skills: [KimiSkillSummary] = []) {
+    self.mcpServers = mcpServers
+    self.skills = skills
+  }
+}
+
 public struct KimiUIState: Codable, Equatable, Sendable {
   public var activePane: KimiActivePane
   public let terminalPlacement: KimiTerminalPlacement
@@ -226,6 +400,29 @@ public struct KimiUIState: Codable, Equatable, Sendable {
   public var activities: [KimiActivity]
   public var pendingPermissions: [KimiPermissionRequest]
   public var lastError: String?
+  public var selectedModel: String
+  public var modelCatalog: [String]
+  /// Runtime session IDs (`ses_...`) currently executing a turn, driven by
+  /// `session.status` / `session.idle` engine events. The composer uses this
+  /// to offer stop/steer affordances while a session is busy.
+  public var busySessionIDs: [String]
+  /// Recently used project directories, most recent first (cap 10). New
+  /// sessions are created in the most recent project unless the user picks
+  /// another one explicitly.
+  public var recentProjects: [String]
+  /// Working checklist for the active session (engine todo list).
+  public var todos: [KimiTodoItem]
+  /// Runtime session the current `todos` projection belongs to.
+  public var todosSessionID: String?
+  /// Structured questions asked by the engine's question tool.
+  public var pendingQuestions: [KimiQuestionRequest]
+  /// Slash commands advertised by the engine for the active directory.
+  public var availableCommands: [KimiSlashCommand]
+  /// Sessions whose file changes are currently reverted engine-side.
+  public var revertedSessionIDs: [String]
+  /// Engine message ID of the last user message per runtime session; revert
+  /// targets it to roll back the latest turn's file changes.
+  public var lastUserMessageIDBySession: [String: String]
 
   public init(
     activePane: KimiActivePane = .conversation,
@@ -236,7 +433,17 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     messages: [KimiMessage] = [],
     activities: [KimiActivity] = [],
     pendingPermissions: [KimiPermissionRequest] = [],
-    lastError: String? = nil
+    lastError: String? = nil,
+    selectedModel: String = KimiRuntimeIdentityStore.defaultModelID,
+    modelCatalog: [String]? = nil,
+    busySessionIDs: [String] = [],
+    recentProjects: [String] = [],
+    todos: [KimiTodoItem] = [],
+    todosSessionID: String? = nil,
+    pendingQuestions: [KimiQuestionRequest] = [],
+    availableCommands: [KimiSlashCommand] = [],
+    revertedSessionIDs: [String] = [],
+    lastUserMessageIDBySession: [String: String] = [:]
   ) {
     self.activePane = activePane
     self.terminalPlacement = terminalPlacement
@@ -247,14 +454,96 @@ public struct KimiUIState: Codable, Equatable, Sendable {
     self.activities = activities
     self.pendingPermissions = pendingPermissions
     self.lastError = lastError
+    self.selectedModel = selectedModel
+    self.modelCatalog = modelCatalog ?? [selectedModel]
+    self.busySessionIDs = busySessionIDs
+    self.recentProjects = recentProjects
+    self.todos = todos
+    self.todosSessionID = todosSessionID
+    self.pendingQuestions = pendingQuestions
+    self.availableCommands = availableCommands
+    self.revertedSessionIDs = revertedSessionIDs
+    self.lastUserMessageIDBySession = lastUserMessageIDBySession
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case activePane
+    case terminalPlacement
+    case runtimeState
+    case activeSessionID
+    case sessions
+    case messages
+    case activities
+    case pendingPermissions
+    case lastError
+    case selectedModel
+    case modelCatalog
+    case busySessionIDs
+    case recentProjects
+    case todos
+    case todosSessionID
+    case pendingQuestions
+    case availableCommands
+    case revertedSessionIDs
+    case lastUserMessageIDBySession
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    activePane = try container.decodeIfPresent(KimiActivePane.self, forKey: .activePane) ?? .conversation
+    terminalPlacement = try container.decodeIfPresent(KimiTerminalPlacement.self, forKey: .terminalPlacement) ?? .right
+    runtimeState = try container.decodeIfPresent(KimiRuntimeState.self, forKey: .runtimeState) ?? .stopped
+    activeSessionID = try container.decodeIfPresent(UUID.self, forKey: .activeSessionID)
+    sessions = try container.decodeIfPresent([KimiSessionSummary].self, forKey: .sessions) ?? []
+    messages = try container.decodeIfPresent([KimiMessage].self, forKey: .messages) ?? []
+    activities = try container.decodeIfPresent([KimiActivity].self, forKey: .activities) ?? []
+    pendingPermissions = try container.decodeIfPresent([KimiPermissionRequest].self, forKey: .pendingPermissions) ?? []
+    lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+    let decodedModel = try container.decodeIfPresent(String.self, forKey: .selectedModel) ?? KimiRuntimeIdentityStore.defaultModelID
+    selectedModel = decodedModel
+    modelCatalog = try container.decodeIfPresent([String].self, forKey: .modelCatalog) ?? [decodedModel]
+    // Busy markers describe in-flight engine turns; they never survive a
+    // restart because the engine itself went away, so decode but drop stale
+    // entries rather than showing a phantom running state.
+    busySessionIDs = []
+    recentProjects = try container.decodeIfPresent([String].self, forKey: .recentProjects) ?? []
+    todos = try container.decodeIfPresent([KimiTodoItem].self, forKey: .todos) ?? []
+    todosSessionID = try container.decodeIfPresent(String.self, forKey: .todosSessionID)
+    // Engine question requests share the approval-card lifecycle: they only
+    // exist inside the engine process, so persisted ones can never be
+    // answered after a restart and are dropped on decode.
+    pendingQuestions = []
+    availableCommands = try container.decodeIfPresent([KimiSlashCommand].self, forKey: .availableCommands) ?? []
+    revertedSessionIDs = try container.decodeIfPresent([String].self, forKey: .revertedSessionIDs) ?? []
+    lastUserMessageIDBySession = try container.decodeIfPresent([String: String].self, forKey: .lastUserMessageIDBySession) ?? [:]
   }
 }
 
 public enum KimiEvent: Sendable, Equatable {
   case runtimeChanged(KimiRuntimeState)
   case sessionChanged(KimiSessionSummary)
+  case modelChanged(String)
   case userText(String)
-  case assistantText(String)
+  /// Assistant text for one streaming part. `isSnapshot` means `text` is the
+  /// part's full content so far (replace semantics); otherwise it is an
+  /// incremental delta (append semantics).
+  case assistantText(text: String, partID: String?, isSnapshot: Bool)
+  /// Model reasoning content, kept out of the chat bubbles and rendered as a
+  /// collapsible activity instead.
+  case reasoningText(text: String, partID: String?, isSnapshot: Bool)
+  /// Engine session.status / session.idle projection: a session started or
+  /// stopped executing a turn.
+  case sessionBusy(sessionID: String, isBusy: Bool)
+  /// The engine's todo list changed for a session.
+  case todoUpdated(sessionID: String, todos: [KimiTodoItem])
+  /// The engine's question tool asks the user a structured question.
+  case questionAsked(KimiQuestionRequest)
+  /// Engine confirmed a permission reply; drops the matching pending card.
+  /// Duplicate `permission.asked` emissions for one request would otherwise
+  /// leave an unanswerable zombie card behind.
+  case permissionSettled(requestID: String)
+  /// Engine confirmed a question reply/rejection.
+  case questionSettled(requestID: String)
   case activity(KimiActivity)
   case permission(KimiPermissionRequest)
   case error(String)
@@ -263,7 +552,15 @@ public enum KimiEvent: Sendable, Equatable {
     switch self {
     case let .runtimeChanged(state): return state.rawValue
     case let .sessionChanged(session): return session.title
-    case let .userText(text), let .assistantText(text), let .error(text): return text
+    case let .modelChanged(model): return model
+    case let .userText(text), let .error(text): return text
+    case let .assistantText(text, _, _): return text
+    case let .reasoningText(text, _, _): return text
+    case let .sessionBusy(sessionID, isBusy): return "\(sessionID):\(isBusy ? "busy" : "idle")"
+    case let .todoUpdated(sessionID, todos): return "\(sessionID):\(todos.count) 项待办"
+    case let .questionAsked(request): return request.questions.first?.question ?? "引擎提问"
+    case let .permissionSettled(requestID): return "审批已结算：\(requestID)"
+    case let .questionSettled(requestID): return "问题已结算：\(requestID)"
     case let .activity(activity): return activity.title
     case let .permission(permission): return permission.reason
     }

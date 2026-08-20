@@ -436,11 +436,15 @@ public struct HarnessAssistantMessageRecord: Codable, Equatable, Sendable {
   public let turnID: UUID
   public let step: Int
   public let message: HarnessChatMessage
+  /// Model that produced the turn, recorded so dashboard usage statistics can
+  /// attribute messages to a real model instead of a hardcoded placeholder.
+  public let modelID: String?
 
-  public init(turnID: UUID, step: Int, message: HarnessChatMessage) {
+  public init(turnID: UUID, step: Int, message: HarnessChatMessage, modelID: String? = nil) {
     self.turnID = turnID
     self.step = max(1, step)
     self.message = message
+    self.modelID = modelID
   }
 }
 
@@ -607,6 +611,12 @@ public actor HarnessEventStore {
 
   public func events(sessionID: UUID) -> [HarnessEvent] {
     values.filter { $0.sessionID == sessionID }.sorted { $0.sequence < $1.sequence }
+  }
+
+  /// Every recorded event across sessions, ordered by sequence. Used by the
+  /// usage-stats dashboard; read-only.
+  public func allEvents() -> [HarnessEvent] {
+    values.sorted { $0.sequence < $1.sequence }
   }
 }
 

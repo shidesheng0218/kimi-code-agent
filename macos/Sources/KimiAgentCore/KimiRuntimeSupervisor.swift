@@ -108,12 +108,15 @@ public enum KimiRuntimeError: LocalizedError, Equatable, Sendable {
 /// SwiftUI layer. The production bundle supplies the executable and runtime;
 /// development may point this at a local Bun/Node command.
 public actor KimiRuntimeSupervisor {
-  private let configuration: KimiRuntimeConfiguration
+  private var configuration: KimiRuntimeConfiguration
   private var process: KimiProcessHandle?
-  private var state: KimiRuntimeState = .stopped
+  private var state: KimiRuntimeState = .stopped {
+    didSet { publishState(state) }
+  }
   private var monitorTask: Task<Void, Never>?
   private var intentionalStop = false
   private var unexpectedExitRestarts = 0
+  private var stateContinuations: [UUID: AsyncStream<KimiRuntimeState>.Continuation] = [:]
 
   public init(configuration: KimiRuntimeConfiguration) {
     self.configuration = configuration
@@ -121,6 +124,28 @@ public actor KimiRuntimeSupervisor {
 
   public func snapshot() -> (state: KimiRuntimeState, endpoint: KimiRuntimeEndpoint) {
     (state, configuration.endpoint)
+  }
+
+  /// Observers (the app kernel) follow engine state transitions here so an
+  /// unexpected-exit restart is visible outside this actor — previously the
+  /// state simply went stale in the UI after a crash recovery.
+  public func stateChanges() -> AsyncStream<KimiRuntimeState> {
+    let token = UUID()
+    return AsyncStream { continuation in
+      continuation.yield(state)
+      stateContinuations[token] = continuation
+      continuation.onTermination = { [weak self] _ in
+        Task { await self?.removeStateContinuation(token) }
+      }
+    }
+  }
+
+  private func publishState(_ value: KimiRuntimeState) {
+    stateContinuations.values.forEach { $0.yield(value) }
+  }
+
+  private func removeStateContinuation(_ token: UUID) {
+    stateContinuations.removeValue(forKey: token)
   }
 
   public func start() throws -> KimiRuntimeEndpoint {
@@ -184,6 +209,25 @@ public actor KimiRuntimeSupervisor {
     return try start()
   }
 
+  /// Swaps the runtime configuration (e.g. after a model change) and
+  /// relaunches the engine. The endpoint is preserved so existing session
+  /// clients keep working without re-handshaking.
+  public func reconfigure(_ newConfiguration: KimiRuntimeConfiguration) async throws {
+    stop()
+    configuration = KimiRuntimeConfiguration(
+      executableURL: newConfiguration.executableURL,
+      arguments: newConfiguration.arguments,
+      workingDirectory: newConfiguration.workingDirectory,
+      environment: newConfiguration.environment,
+      endpoint: configuration.endpoint,
+      healthTimeout: newConfiguration.healthTimeout,
+      restartLimit: newConfiguration.restartLimit,
+      restartDelay: newConfiguration.restartDelay
+    )
+    _ = try start()
+    try await waitUntilReady()
+  }
+
   public func waitUntilReady() async throws {
     guard process?.isRunning == true else { throw KimiRuntimeError.notRunning }
     let deadline = Date().addingTimeInterval(configuration.healthTimeout)
@@ -241,6 +285,10 @@ public actor KimiRuntimeSupervisor {
       guard !Task.isCancelled, !intentionalStop else { return }
       do {
         _ = try launch(resetRestartCount: false)
+        // A relaunched engine must prove health before observers see `ready`;
+        // otherwise the state would sit in `.starting` forever and the UI
+        // would never re-subscribe to the event stream.
+        try await waitUntilReady()
       } catch {
         state = .failed
       }

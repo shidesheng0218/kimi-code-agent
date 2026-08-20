@@ -1,6 +1,57 @@
 # Implementation Status
 
-更新日期：2026-08-15
+更新日期：2026-08-19
+
+## 2026-08-19 断链补全（Claude Code 交互对齐）
+
+本期把已实现但未接线的链路全部接通，并把引擎已支持的能力上浮到 UI。架构决策：内置引擎（opencode 派生）是唯一执行链；Swift 侧 Supervisor/DAG 编排（AgentKernel/AgentGraphSupervisor/AgentRunScheduler 等）保持仅测试接线，不再追求生产化。
+
+### 真实环境验收（2026-08-19，本机 + 真实 Kimi API）
+
+以发布包内真实引擎二进制（生产配置镜像）+ 真实 API Key 完成两级验收：
+
+1. **引擎级（curl 驱动）**：会话创建/目录路由、模型目录、edit/bash 权限 ask→once/always、流式 delta、agentic 全循环（写文件→跑测试→测试通过）、steer 插队被运行中 turn 拾起、abort、revert/unrevert 文件回滚与还原。
+2. **内核级（生产 KimiAppKernel + URLSessionRuntimeClient 驱动真实引擎，27 项断言全过）**：建会话→忙态→审批卡（patterns 保留）→always 应答→turn 完成→单气泡合并→无用户消息回显→Harness 回执→steer→历史重建→abort→revert→模型目录/todo/command/mcp 端点。
+
+验收中发现并修复的四个存量深层缺陷（全部有回归断言）：
+
+- **SSE 帧解析失效**：`URLSession.bytes.lines` 不上送空白分隔行，原实现等空行成帧导致事件流实际从未产出任何事件（长 turn 后 UI 与引擎脱节）。改为单行 JSON 完整即解码。
+- **SSE 请求 60 秒默认超时**：`URLRequest` 默认 timeoutInterval 会在长权限等待后掐断流。显式放宽并按心跳维持活性；断流重连后新增 `GET /session/status` 状态对账。
+- **`"replied"` 不含子串 `"reply"`**：`mapKind` 用 `contains("reply")` 判定 `permission.replied`，永远落空导致 replied 被误判为 permissionAsked——审批完成后引擎的结算事件变成第二张不可应答的僵尸审批卡。改判 `replied`/`resolved`，审批卡按引擎 requestID 去重，`permission.replied`/`question.replied` 到达即按 requestID 结算移除。
+- **用户消息回显**：用户消息的 text part 快照/delta 被当作助手文本（出现"自己的消息变成助手气泡"）。解码器新增 messageID→role 注册表，用户消息的 part 一律过滤。
+
+对话闭环修复：
+
+- 修复 directory 误放 POST body 的缺陷（引擎只认 query 参数；此前所有会话都跑在引擎进程 cwd）；全部端点统一 query 路由并用 URLComponents 正确转义。
+- 流式回复按 partID 合并为单条气泡（delta 追加 / snapshot 替换 / idle 封口），不再裂成碎片；reasoning 内容隔离为可折叠“思考过程”卡片。
+- session.status/session.idle 驱动运行态；执行中显示停止按钮（引擎 abort + Harness abort 一致）。
+- 权限审批迁移到 `/permission/{id}/reply`：拒绝 / 允许一次 / 总是允许三按钮，展示引擎下发的 patterns；审批失败可见不静默；重启后过期审批卡自动清理。
+- SSE 断流指数退避重连（上限 12 次）；引擎意外重启后 supervisor 重新等待就绪并通知内核重新订阅全部会话。
+- Driver 超时放宽到 30 分钟且超时后主动 abort 引擎会话保持两侧一致；审计 turn 记录真实所选模型；补记 assistantMessage 让首页模型统计有数据。
+
+会话与项目：
+
+- 新建会话强制 NSOpenPanel 选择项目目录；会话与项目绑定，最近项目持久化；隐式建会话用最近项目，无项目时明确报错引导。
+- 切换会话/重启后从 `GET /session/{id}/message` 重建消息与工具活动；Todo 从 `/todo` 恢复。
+- 模型切换真生效：`prompt_async` 携带 per-prompt ModelRef（免重启）；启动时 `GET /provider` 拉取目录；目录变更时带原 endpoint 就地 reconfigure（端口/token 保持稳定）。
+
+Claude Code 交互：
+
+- Steer：Driver 轮询 Harness steering 队列并转发运行中的引擎会话（引擎 busy 时自动在循环边界拾起）。
+- Follow-up：忙时可排队，本轮结束自动开新轮（Harness 队列语义）。
+- Todo 清单（todo.updated → 会话顶部清单）、结构化问答卡（question.asked → 选项/自定义回答 → reply/reject）、消息级 revert/unrevert、Slash 命令（`/` 补全 → `/session/{id}/command`）、compact（summarize 端点）。
+
+面板实体化（原五个占位面板全部落地）：
+
+- Diff：项目工作区真实 git diff（DiffEngine 解析，文件/hunk 渲染）；
+- Files：项目目录树 + 文本预览；
+- Browser：截图产物与浏览器活动展示（活动卡内联图片）；
+- 验证：Harness Intent/Receipt 审计视图；
+- 集成：引擎 MCP 状态与 Skills 列表。
+
+文档对齐：README 执行闭环/能力地图/权限表/会话语义改写为引擎原生架构的真实描述；ClaudeParityCatalog 更新为真实实现状态（worktreeIsolation、planMode、hooks、githubAutomation、gitlabIntegration、memory 标记为未实现）。
+
+验收：KimiAgentCoreChecks 新增约 40 条断言（directory query 转义、流式合并、reasoning 分类、忙态映射、always 应答、steer 泵送、超时一致性、历史解析/重建、模型目录、工厂 reconfigure 保端点、todo/question 解码、revert/command/summarize/todo/command 端点、MCP/Skills 解析、验证回执聚合、图片产物提取），全部通过；`swift build` 两个产品全绿。
 
 ## 当前产品线
 

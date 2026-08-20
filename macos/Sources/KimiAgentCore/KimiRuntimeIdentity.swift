@@ -35,6 +35,9 @@ public final class KimiRuntimeIdentityStore: @unchecked Sendable {
   public static let defaultBaseURL = "https://api.moonshot.cn/v1"
   public static let legacyDefaultBaseURL = "https://api.moonshot.ai/v1"
   public static let defaultModelID = "kimi-k2.7-code"
+  /// Provider identifier used in the injected engine configuration and in
+  /// per-prompt model references.
+  public static let providerID = "moonshotai-cn"
 
   public static func resolvedModelID(taskModelID: String?, fallbackModelID: String) -> String {
     let taskModel = taskModelID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

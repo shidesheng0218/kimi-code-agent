@@ -3,6 +3,14 @@ import Foundation
 /// The two executable paths exposed by the desktop are deliberately kept
 /// behind one Core-owned runtime boundary.  The UI can project the resulting
 /// snapshots, but it cannot construct a second provider/tool loop of its own.
+///
+/// EXPERIMENTAL — checks-only wiring: as of the 2026-08 engine-native
+/// alignment, the production app executes exclusively through the embedded
+/// engine session loop (`KimiAppKernel` + `KimiRuntimeOperationDriver`).
+/// This Supervisor/DAG stack (AgentKernel, AgentGraphSupervisor,
+/// AgentRunScheduler, TaskGraphCompiler and friends) has no production
+/// caller and is exercised only by KimiAgentCoreChecks; keep it off the
+/// production path unless the orchestration strategy is revisited.
 public struct AgentKernelRuntime: Sendable {
   public let operationDriver: AgentHarness.OperationDriver
   public let childExecutor: AgentGraphSupervisor.ChildExecutor

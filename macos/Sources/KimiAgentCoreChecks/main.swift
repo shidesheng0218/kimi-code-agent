@@ -249,14 +249,192 @@ final class IdleKimiRuntimeSessionClient: KimiRuntimeSessionClient, @unchecked S
   }
 
   func steer(_ input: KimiRuntimeSteerInput) async throws {}
-  func abort(sessionID: String) async throws {}
+  func abort(sessionID: String, directory: String?) async throws {}
   func respondPermission(_ input: PermissionResponse) async throws {}
   func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
 
-  func subscribeEvents(sessionID: String) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
     AsyncThrowingStream { continuation in
       Task {
         try? await Task.sleep(for: .milliseconds(20))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.finish()
+      }
+    }
+  }
+}
+
+/// Streams one scripted assistant turn (busy → deltas → snapshot → idle) so
+/// checks can drive a real `KimiAppKernel` through the production ingest path.
+final class StreamingScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "stream-session", title: "流式", directory: "/tmp/stream")
+  }
+
+  func prompt(_ input: KimiRuntimePromptInput) async throws {}
+  func steer(_ input: KimiRuntimeSteerInput) async throws {}
+  func abort(sessionID: String, directory: String?) async throws {}
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+    AsyncThrowingStream { continuation in
+      Task {
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .assistantText, text: "你好，", messageID: "m1", partID: "p1"))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .assistantText, text: "世界", messageID: "m1", partID: "p1"))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .assistantText, text: "你好，世界！", messageID: "m1", partID: "p1", isSnapshot: true))
+        try? await Task.sleep(for: .milliseconds(30))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.finish()
+      }
+    }
+  }
+}
+
+/// Holds the turn open long enough for a steer message to be pumped in.
+final class SteerScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+  let promptTrace = ThreadSafeStringTrace()
+
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "steer-session", title: "插队", directory: "/tmp/steer")
+  }
+
+  func prompt(_ input: KimiRuntimePromptInput) async throws {
+    promptTrace.append(input.text)
+  }
+
+  func steer(_ input: KimiRuntimeSteerInput) async throws {
+    promptTrace.append(input.text)
+  }
+
+  func abort(sessionID: String, directory: String?) async throws {}
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+    AsyncThrowingStream { continuation in
+      Task {
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
+        try? await Task.sleep(for: .milliseconds(900))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.finish()
+      }
+    }
+  }
+}
+
+/// Never emits completion; used to prove the driver aborts the engine session
+/// when its own timeout fires.
+final class NeverIdleKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+  let abortCounter = InvocationCounter()
+
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "never-idle")
+  }
+
+  func prompt(_ input: KimiRuntimePromptInput) async throws {}
+  func steer(_ input: KimiRuntimeSteerInput) async throws {}
+  func abort(sessionID: String, directory: String?) async throws { abortCounter.increment() }
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+    AsyncThrowingStream { continuation in
+      Task {
+        try? await Task.sleep(for: .seconds(30))
+        continuation.finish()
+      }
+    }
+  }
+}
+
+/// Serves a canned two-message conversation for history-restore checks.
+final class HistoryScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "history-session", title: "历史会话", directory: input.directory)
+  }
+
+  func prompt(_ input: KimiRuntimePromptInput) async throws {}
+  func steer(_ input: KimiRuntimeSteerInput) async throws {}
+  func abort(sessionID: String, directory: String?) async throws {}
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+
+  func fetchMessages(sessionID: String, directory: String?) async throws -> [KimiRuntimeHistoryMessage] {
+    [
+      KimiRuntimeHistoryMessage(
+        id: "m-u",
+        role: "user",
+        createdAt: Date(timeIntervalSince1970: 1_000),
+        parts: [KimiRuntimeHistoryPart(partID: "pu", type: "text", text: "之前的问题")]
+      ),
+      KimiRuntimeHistoryMessage(
+        id: "m-a",
+        role: "assistant",
+        createdAt: Date(timeIntervalSince1970: 1_001),
+        parts: [
+          KimiRuntimeHistoryPart(partID: "pa", type: "text", text: "之前的回答"),
+          KimiRuntimeHistoryPart(partID: "pt", type: "tool", toolName: "read", callID: "c1", status: "completed", output: "内容")
+        ]
+      )
+    ]
+  }
+}
+
+/// Streams one tool call and its result so verification-record joins have a
+/// settled receipt to project.
+final class VerifyScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "verify-session", title: "验证", directory: input.directory)
+  }
+
+  func prompt(_ input: KimiRuntimePromptInput) async throws {}
+  func steer(_ input: KimiRuntimeSteerInput) async throws {}
+  func abort(sessionID: String, directory: String?) async throws {}
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+    AsyncThrowingStream { continuation in
+      Task {
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .toolCall, toolCallID: "vtc1", toolID: "bash", payload: ["arguments": #"{"command":"swift build"}"#]))
+        try? await Task.sleep(for: .milliseconds(20))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .toolResult, text: "Build complete", toolCallID: "vtc1", toolID: "bash", payload: ["status": "completed"]))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
+        continuation.finish()
+      }
+    }
+  }
+}
+
+/// Emits the observed engine quirk: two permission.asked frames sharing one
+/// requestID, then permission.replied, then idle.
+final class PermScriptKimiRuntimeClient: KimiRuntimeSessionClient, @unchecked Sendable {
+  func createSession(_ input: CreateSessionInput) async throws -> KimiRuntimeSession {
+    KimiRuntimeSession(id: "perm-session", title: "审批", directory: input.directory)
+  }
+
+  func prompt(_ input: KimiRuntimePromptInput) async throws {}
+  func steer(_ input: KimiRuntimeSteerInput) async throws {}
+  func abort(sessionID: String, directory: String?) async throws {}
+  func respondPermission(_ input: PermissionResponse) async throws {}
+  func listSessions(directory: String?) async throws -> [KimiRuntimeSession] { [] }
+
+  func subscribeEvents(sessionID: String, directory: String?) async throws -> AsyncThrowingStream<KimiRuntimeEvent, Error> {
+    AsyncThrowingStream { continuation in
+      Task {
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionStatus, payload: ["statusType": "busy"]))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .permissionAsked, toolID: "edit", requestID: "per_zombie"))
+        try? await Task.sleep(for: .milliseconds(30))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .permissionAsked, toolID: "edit", requestID: "per_zombie"))
+        try? await Task.sleep(for: .milliseconds(30))
+        continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .permissionReplied, requestID: "per_zombie"))
         continuation.yield(KimiRuntimeEvent(sessionID: sessionID, kind: .sessionIdle))
         continuation.finish()
       }
@@ -5431,7 +5609,7 @@ expect(nativeCommand.kind == .prompt, "原生 App Command 必须保留 prompt �
 let initialUIState = KimiUIState()
 expect(initialUIState.activePane == .conversation, "原生工作台默认打开会话 Pane")
 expect(initialUIState.terminalPlacement == .right, "原生工作台终端必须固定在右侧")
-let displayEvent = KimiEvent.assistantText("你好")
+let displayEvent = KimiEvent.assistantText(text: "你好", partID: nil, isSnapshot: false)
 expect(displayEvent.displayText == "你好", "Kimi Event 必须提供稳定的 UI 展示文本")
 
 let endpoint = KimiRuntimeEndpoint(host: "127.0.0.1", port: 43127, token: "test-token")
@@ -5583,12 +5761,22 @@ expect(externalSnapshot.intents[externalEffect.effectID] == externalEffect, "Eng
 let engineRequestTrace = ThreadSafeStringTrace()
 MockURLProtocol.requestHandler = { request in
   let path = request.url?.path ?? ""
+  var query = ""
+  if let rawQuery = request.url?.query { query = "?\(rawQuery)" }
   let requestBody = String(data: requestBodyData(request), encoding: .utf8) ?? ""
-  engineRequestTrace.append("\(request.httpMethod ?? "GET") \(path) \(requestBody)")
+  engineRequestTrace.append("\(request.httpMethod ?? "GET") \(path)\(query) \(requestBody)")
   let body: Data
   switch path {
   case "/session":
     body = Data("{\"id\":\"session-1\",\"title\":\"测试会话\"}".utf8)
+  case "/session/session-1/message":
+    body = Data(#"[{"info":{"id":"msg-u1","role":"user","time":{"created":1787000000000}},"parts":[{"id":"p-u1","type":"text","text":"历史问题"}]},{"info":{"id":"msg-a1","role":"assistant","time":{"created":1787000001000}},"parts":[{"id":"p-a1","type":"text","text":"历史回答"},{"id":"p-t1","type":"tool","tool":"read","callID":"call-h1","state":{"status":"completed","output":"文件内容"}}]}]"#.utf8)
+  case "/provider":
+    body = Data(#"{"all":[{"id":"moonshotai-cn","models":{"kimi-k2.7-code":{},"kimi-k3":{}}}],"connected":["moonshotai-cn"]}"#.utf8)
+  case "/mcp":
+    body = Data(#"{"filesystem":{"status":"connected"},"broken":{"status":"failed","error":"exit 1"}}"#.utf8)
+  case "/skill":
+    body = Data(#"[{"name":"code-review","description":"审查改动"},{"name":"release"}]"#.utf8)
   default:
     body = Data("{}".utf8)
   }
@@ -5605,7 +5793,237 @@ expect(mockedSession.id == "session-1", "引擎会话客户端 必须解析创�
 try! awaitValue { try await mockClient.prompt(KimiRuntimePromptInput(sessionID: "session-1", text: "测试消息")); return () }
 try! awaitValue { try await mockClient.respondPermission(PermissionResponse(sessionID: "session-1", requestID: "perm-1", reply: "once")); return () }
 expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/prompt_async") }), "Engine Prompt 必须使用异步 /session/{id}/prompt_async 协议，避免同步请求阻塞 UI")
-expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/permissions/perm-1") && $0.contains("\"response\":\"once\"") }), "Engine Permission 回复必须携带 runtime request ID 和 response 字段")
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /permission/perm-1/reply") && $0.contains("\"reply\":\"once\"") }), "Engine Permission 回复必须使用 /permission/{id}/reply 端点并携带 runtime request ID 与 reply 字段")
+
+_ = try! awaitValue { try await mockClient.createSession(CreateSessionInput(directory: "/tmp/kimi proj&x", title: "目录会话")); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session?directory=") && $0.contains("%26") }), "Engine 会话创建必须把项目目录放进 query 参数（引擎不读 body 里的 directory）并正确转义")
+_ = try! awaitValue { try await mockClient.prompt(KimiRuntimePromptInput(sessionID: "session-1", text: "带目录", directory: "/tmp/kimi proj&x")); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/prompt_async?directory=") }), "Engine Prompt 必须按会话目录路由 query 参数")
+expect(bridgedPermission?.patterns == ["npm test"], "Permission Card 必须保留引擎下发的 patterns 列表")
+
+// P0 流式解码：part 类型注册 → delta 分类 → 快照/增量语义
+let p0Decoder = KimiRuntimeEventDecoder()
+_ = p0Decoder.decode(Data(#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"part-r1","messageID":"m1","type":"reasoning","text":"思考"}}}"#.utf8), sessionID: "s1")
+let reasoningDeltaEvent = p0Decoder.decode(Data(#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-r1","field":"text","delta":"片段"}}"#.utf8), sessionID: "s1")
+expect(reasoningDeltaEvent?.kind == .reasoningText && reasoningDeltaEvent?.text == "片段" && reasoningDeltaEvent?.isSnapshot == false, "注册为 reasoning 的 part，其后续 delta 必须归类为思考内容而非聊天气泡文本")
+let textDeltaEventP0 = p0Decoder.decode(Data(#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"part-t1","field":"text","delta":"正文增量"}}"#.utf8), sessionID: "s1")
+expect(textDeltaEventP0?.kind == .assistantText && textDeltaEventP0?.partID == "part-t1" && textDeltaEventP0?.isSnapshot == false, "普通 part delta 必须携带 partID 并以增量语义归类为助手文本")
+let textSnapshotEvent = p0Decoder.decode(Data(#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"part-t1","messageID":"m1","type":"text","text":"完整正文"}}}"#.utf8), sessionID: "s1")
+expect(textSnapshotEvent?.kind == .assistantText && textSnapshotEvent?.isSnapshot == true && textSnapshotEvent?.text == "完整正文", "message.part.updated 文本 part 必须以快照语义解码")
+let busyStatusEvent = p0Decoder.decode(Data(#"{"type":"session.status","properties":{"sessionID":"s1","status":{"type":"busy"}}}"#.utf8), sessionID: "s1")
+expect(busyStatusEvent?.kind == .sessionStatus && busyStatusEvent?.payload["statusType"] == "busy", "session.status 必须解析出 busy/idle 状态")
+expect(busyStatusEvent.map { KimiRuntimeEventBridge.map($0).contains(.sessionBusy(sessionID: "s1", isBusy: true)) } == true, "session.status busy 必须映射为 UI 忙态事件")
+let idleMapped = KimiRuntimeEventBridge.map(KimiRuntimeEvent(sessionID: "s1", kind: .sessionIdle))
+expect(idleMapped.contains(.sessionBusy(sessionID: "s1", isBusy: false)), "session.idle 必须映射为忙态解除事件")
+
+// P0 端到端（脚本化客户端驱动真实 KimiAppKernel）：流式合并 + 忙态清除
+let streamingClient = StreamingScriptKimiRuntimeClient()
+let streamingKernel = KimiAppKernel(sessionClient: streamingClient)
+try! awaitValue { try await streamingKernel.send(.createSession(directory: "/tmp/stream")); return () }
+try! awaitValue { try await streamingKernel.send(.prompt(PromptInput(text: "打个招呼"))); return () }
+let settledAssistant = try! awaitValue { () async throws -> KimiMessage? in
+  for _ in 0..<150 {
+    let snap = await streamingKernel.snapshot()
+    if let message = snap.messages.first(where: { $0.role == .assistant }), !message.isStreaming { return message }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return nil
+}
+expect(settledAssistant?.text == "你好，世界！", "同一 part 的 delta 与 snapshot 必须合并为一条助手消息（增量拼接、快照替换、idle 封口）")
+let streamingSnapshot = try! awaitValue { await streamingKernel.snapshot() }
+expect(streamingSnapshot.messages.filter { $0.role == .assistant }.count == 1, "流式输出不得裂成多个气泡")
+expect(streamingSnapshot.busySessionIDs.isEmpty, "sessionIdle 后会话忙态必须清除")
+
+// P0 steer 泵：运行中的 turn 必须把 harness 队列里的 steering 转发给引擎
+let steerClient = SteerScriptKimiRuntimeClient()
+let steerKernel = KimiAppKernel(sessionClient: steerClient)
+try! awaitValue { try await steerKernel.send(.createSession(directory: "/tmp/steer")); return () }
+try! awaitValue { try await steerKernel.send(.prompt(PromptInput(text: "开始"))); return () }
+try! awaitValue { try await Task.sleep(for: .milliseconds(80)); return () }
+try! awaitValue { try await steerKernel.send(.steer(PromptInput(text: "补充约束"))); return () }
+let steerDelivered = try! awaitValue { () async throws -> Bool in
+  for _ in 0..<150 {
+    if steerClient.promptTrace.snapshot.contains(where: { $0.contains("补充约束") }) { return true }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return false
+}
+expect(steerDelivered, "运行中发送的 steer 输入必须经 Driver 泵送入引擎会话，而不是只停留在 Harness 队列")
+
+// P0 超时一致性：driver 超时后必须中止引擎会话
+let timeoutClient = NeverIdleKimiRuntimeClient()
+let timeoutDriver = KimiRuntimeOperationDriver(client: timeoutClient, completionTimeout: .milliseconds(150))
+await timeoutDriver.setSession("never-idle")
+let timeoutFailure = try! awaitValue { () async throws -> String? in
+  do {
+    try await timeoutDriver.run(
+      context: HarnessOperationContext(sessionID: UUID(), operationID: UUID(), lane: .main, prompt: PromptInput(text: "长任务")),
+      sink: { _ in }
+    )
+    return nil
+  } catch {
+    return error.localizedDescription
+  }
+}
+expect(timeoutFailure != nil && timeoutClient.abortCounter.count == 1, "Driver 超时后必须中止引擎会话，避免 Harness 判失败而引擎仍在执行")
+
+// P0 监管者状态流：观察者必须看到引擎意外重启后的 ready 迁移
+let supervisedRuntime = KimiRuntimeSupervisor(configuration: KimiRuntimeConfiguration(
+  executableURL: URL(fileURLWithPath: "/bin/sh"),
+  arguments: ["-c", "sleep 30"],
+  endpoint: KimiRuntimeEndpoint(port: 43129, token: "state-stream")
+))
+let supervisorStates = ThreadSafeStringTrace()
+let supervisorWatch = Task.detached {
+  let stream = await supervisedRuntime.stateChanges()
+  for await value in stream {
+    supervisorStates.append(value.rawValue)
+    if supervisorStates.snapshot.count >= 2 { break }
+  }
+}
+try! awaitValue { try await supervisedRuntime.stop(); return () }
+_ = try! awaitValue { try await supervisedRuntime.start(); return () }
+try! awaitValue { await supervisorWatch.value }
+expect(supervisorStates.snapshot.contains("starting") || supervisorStates.snapshot.contains("ready") || supervisorStates.snapshot.contains("stopped"), "Runtime Supervisor 必须向观察者发布状态迁移")
+try! awaitValue { await supervisedRuntime.stop(); return () }
+
+// P1 引擎端点：历史解析、模型目录、per-prompt 模型引用
+let fetchedHistory = try! awaitValue { try await mockClient.fetchMessages(sessionID: "session-1", directory: nil) }
+expect(fetchedHistory.count == 2 && fetchedHistory[0].role == "user" && fetchedHistory[1].parts.count == 2, "会话历史端点必须解析 info/parts 结构")
+expect(fetchedHistory[1].parts.first(where: { $0.type == "tool" })?.output == "文件内容", "历史工具 part 的输出必须被保留")
+expect(fetchedHistory[0].createdAt != nil && fetchedHistory[0].createdAt!.timeIntervalSince1970 > 1_000_000, "历史消息时间戳必须按毫秒纪元解析")
+let fetchedCatalog = try! awaitValue { try await mockClient.fetchModelCatalog(directory: nil) }
+expect(fetchedCatalog == ["kimi-k2.7-code", "kimi-k3"], "模型目录必须从 /provider 的 models 表解析并排序")
+_ = try! awaitValue { try await mockClient.prompt(KimiRuntimePromptInput(sessionID: "session-1", text: "带模型", modelID: "kimi-k3")); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("\"modelID\":\"kimi-k3\"") && $0.contains("\"providerID\":\"moonshotai-cn\"") }), "Prompt 必须携带 per-prompt 模型引用，切模型不必重启引擎")
+
+// P1 会话历史重建与最近项目（脚本化客户端驱动真实 KimiAppKernel）
+let historyClient = HistoryScriptKimiRuntimeClient()
+let historyKernel = KimiAppKernel(sessionClient: historyClient)
+try! awaitValue { try await historyKernel.send(.createSession(directory: "/tmp/history-proj")); return () }
+let historySessionID = try! awaitValue { await historyKernel.snapshot().sessions.first?.id }
+try! awaitValue { try await historyKernel.send(.selectSession(historySessionID!)); return () }
+let historyState = try! awaitValue { await historyKernel.snapshot() }
+expect(historyState.messages.contains(where: { $0.role == .user && $0.text == "之前的问题" }), "切换会话后必须从引擎消息日志重建用户消息")
+expect(historyState.messages.contains(where: { $0.role == .assistant && $0.text == "之前的回答" }), "切换会话后必须从引擎消息日志重建助手消息")
+expect(historyState.activities.contains(where: { $0.toolCallID == "c1" && $0.state == .completed }), "历史工具调用必须重建为已完成活动卡")
+expect(historyState.recentProjects.first == "/tmp/history-proj", "新建会话必须记录最近项目目录")
+
+// P1 引擎工厂：reconfigure 保留 endpoint、模型表注入完整目录
+let factoryOverride = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: URL(fileURLWithPath: "/tmp", isDirectory: true),
+  applicationSupportDirectory: URL(fileURLWithPath: "/tmp", isDirectory: true),
+  environment: ["KIMI_RUNTIME_BINARY": "/bin/sh"],
+  modelID: "kimi-k3",
+  modelCatalog: ["kimi-k2.7-code", "kimi-k3"],
+  endpointOverride: KimiRuntimeEndpoint(port: 43_999, token: "fixed-token")
+)
+expect(factoryOverride?.arguments.contains("43999") == true, "reconfigure 必须保留原 loopback 端口")
+expect(factoryOverride?.environment["OPENCODE_SERVER_PASSWORD"] == "fixed-token", "reconfigure 必须保留原 endpoint token")
+let overrideConfigContent = (factoryOverride?.environment["OPENCODE_CONFIG_CONTENT"] ?? "")
+  .replacingOccurrences(of: "\\/", with: "/")
+expect(overrideConfigContent.contains("kimi-k3") && overrideConfigContent.contains("kimi-k2.7-code"), "引擎 provider 模型表必须注入完整模型目录")
+expect(overrideConfigContent.contains(#""moonshotai-cn/kimi-k3""#), "引擎默认模型必须跟随用户所选模型")
+
+// 回归：permission.replied 不得误判为 permissionAsked（"replied" 不含子串 "reply"）
+let repliedEvent = KimiRuntimeEventDecoder().decode(Data(#"{"type":"permission.replied","properties":{"sessionID":"s1","requestID":"per_x","reply":"always"}}"#.utf8), sessionID: "s1")
+expect(repliedEvent?.kind == .permissionReplied && repliedEvent?.requestID == "per_x", "permission.replied 必须归类为 permissionReplied")
+expect(repliedEvent.map { KimiRuntimeEventBridge.map($0).contains(.permissionSettled(requestID: "per_x")) } == true, "permission.replied 必须映射为卡片结算事件")
+
+// 回归：用户消息的 text part 不得进入助手气泡流
+let roleDecoder = KimiRuntimeEventDecoder()
+_ = roleDecoder.decode(Data(#"{"type":"message.updated","properties":{"sessionID":"s1","info":{"id":"msg-u1","role":"user"}}}"#.utf8), sessionID: "s1")
+let userPartSnapshot = roleDecoder.decode(Data(#"{"type":"message.part.updated","properties":{"sessionID":"s1","part":{"id":"p-u1","messageID":"msg-u1","type":"text","text":"用户原文"}}}"#.utf8), sessionID: "s1")
+expect(userPartSnapshot == nil, "用户消息的 text part 快照必须被过滤")
+let userPartDelta = roleDecoder.decode(Data(#"{"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"msg-u1","partID":"p-u1","field":"text","delta":"增"}}"#.utf8), sessionID: "s1")
+expect(userPartDelta == nil, "用户消息的 text part delta 必须被过滤")
+
+// P2 交互对齐：todo / question / revert / command 事件与端点
+let todoEvent = KimiRuntimeEventDecoder().decode(Data(#"{"type":"todo.updated","properties":{"sessionID":"s1","todos":[{"id":"t1","content":"写测试","status":"in_progress"},{"content":"跑构建","status":"pending"}]}}"#.utf8), sessionID: "s1")
+expect(todoEvent?.kind == .todoUpdated, "todo.updated 必须解码为待办事件")
+let bridgedTodos = todoEvent.flatMap { KimiRuntimeEventBridge.map($0).first }
+if case let .todoUpdated(_, todos)? = bridgedTodos {
+  expect(todos.count == 2 && todos[0].status == "in_progress" && todos[1].id == "todo-1", "todo.updated 必须解析状态与缺省 id")
+} else {
+  expect(false, "todo.updated 必须映射为 UI 待办事件")
+}
+let questionEvent = KimiRuntimeEventDecoder().decode(Data(#"{"type":"question.asked","properties":{"id":"q-1","sessionID":"s1","questions":[{"question":"用哪个方案？","header":"方案","options":[{"label":"A","description":"快"},{"label":"B"}],"multiple":false,"custom":true}]}}"#.utf8), sessionID: "s1")
+let bridgedQuestion = questionEvent.flatMap { event in KimiRuntimeEventBridge.map(event).first }
+if case let .questionAsked(request)? = bridgedQuestion {
+  expect(request.runtimeID == "q-1" && request.questions.first?.options.count == 2 && request.questions.first?.custom == true, "question.asked 必须保留 requestID 并解析选项")
+} else {
+  expect(false, "question.asked 必须映射为问题卡事件")
+}
+let userMessageEvent = KimiRuntimeEventDecoder().decode(Data(#"{"type":"message.updated","properties":{"sessionID":"s1","info":{"id":"msg-u9","role":"user"}}}"#.utf8), sessionID: "s1")
+expect(userMessageEvent?.kind == .userText && userMessageEvent?.messageID == "msg-u9" && userMessageEvent?.text == nil, "message.updated 用户消息必须只携带消息 ID（供 revert 定位），不产生聊天气泡")
+
+_ = try! awaitValue { try await mockClient.revert(sessionID: "session-1", messageID: "msg-u9", directory: "/tmp/p"); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/revert?directory=") && $0.contains("\"messageID\":\"msg-u9\"") }), "revert 必须携带目标用户消息 ID 与目录 query")
+_ = try! awaitValue { try await mockClient.unrevert(sessionID: "session-1", directory: nil); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/unrevert") }), "unrevert 必须调用恢复端点")
+_ = try! awaitValue { try await mockClient.answerQuestion(requestID: "q-1", answers: [["A"]], directory: nil); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /question/q-1/reply") && $0.contains("\"answers\"") }), "问题应答必须使用 /question/{id}/reply 并携带 answers")
+_ = try! awaitValue { try await mockClient.runCommand(sessionID: "session-1", command: "review", arguments: "src/", directory: nil); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/command") && $0.contains("\"command\":\"review\"") }), "Slash 命令必须走 /session/{id}/command 端点")
+_ = try! awaitValue { try await mockClient.summarize(sessionID: "session-1", directory: nil); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("POST /session/session-1/summarize") }), "压缩上下文必须走 summarize 端点")
+_ = try! awaitValue { try await mockClient.fetchTodos(sessionID: "session-1", directory: nil); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("GET /session/session-1/todo") }), "待办必须能从 /session/{id}/todo 拉取")
+_ = try! awaitValue { try await mockClient.fetchCommands(directory: nil); return () }
+expect(engineRequestTrace.snapshot.contains(where: { $0.contains("GET /command") }), "Slash 命令目录必须能从 /command 拉取")
+
+// P3 面板数据源：MCP/Skills 解析、验证回执聚合、图片产物提取
+let mcpPanelStatuses = try! awaitValue { try await mockClient.fetchMcpStatus(directory: nil) }
+expect(mcpPanelStatuses.count == 2 && mcpPanelStatuses.first(where: { $0.name == "broken" })?.detail == "exit 1", "MCP 状态必须解析 name/status/error")
+let skillSummaries = try! awaitValue { try await mockClient.fetchSkills(directory: nil) }
+expect(skillSummaries.count == 2 && skillSummaries.first?.name == "code-review", "Skills 列表必须解析 name/description")
+
+let verifyClient = VerifyScriptKimiRuntimeClient()
+let verifyKernel = KimiAppKernel(sessionClient: verifyClient)
+try! awaitValue { try await verifyKernel.send(.createSession(directory: "/tmp/verify")); return () }
+try! awaitValue { try await verifyKernel.send(.prompt(PromptInput(text: "执行命令"))); return () }
+let verificationSettled = try! awaitValue { () async throws -> Bool in
+  for _ in 0..<150 {
+    let records = await verifyKernel.loadVerificationRecords()
+    if records.contains(where: { $0.outcome == "success" }) { return true }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return false
+}
+expect(verificationSettled, "工具回执必须进入验证面板数据（Intent→Receipt 结算）")
+let verifyRecords = try! awaitValue { await verifyKernel.loadVerificationRecords() }
+expect(verifyRecords.contains(where: { $0.subject == "bash" && $0.outcome == "success" }), "验证记录必须包含 bash 工具的成功回执")
+
+let artifactPNG = temporaryDirectory.appendingPathComponent("shot-\(UUID().uuidString).png")
+try Data([0x89, 0x50, 0x4E, 0x47]).write(to: artifactPNG)
+let extractedArtifacts = KimiArtifactImages.extract(from: ["截图已保存：\(artifactPNG.path) 完成", "无图文本"])
+expect(extractedArtifacts.map(\.path) == [artifactPNG.path], "工具输出中的本地图片路径必须被提取为产物（且过滤不存在的路径）")
+
+// 审批僵尸卡：引擎对同一 request 重复发 permission.asked（真实引擎实测行为）
+let permClient = PermScriptKimiRuntimeClient()
+let permKernel = KimiAppKernel(sessionClient: permClient)
+try! awaitValue { try await permKernel.send(.createSession(directory: "/tmp/perm")); return () }
+try! awaitValue { try await permKernel.send(.prompt(PromptInput(text: "写文件"))); return () }
+let permCardAppeared = try! awaitValue { () async throws -> Bool in
+  for _ in 0..<100 {
+    let snap = await permKernel.snapshot()
+    if !snap.pendingPermissions.isEmpty { return true }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return false
+}
+expect(permCardAppeared, "permission.asked 必须生成审批卡")
+let permSettled = try! awaitValue { () async throws -> Bool in
+  for _ in 0..<100 {
+    let snap = await permKernel.snapshot()
+    if snap.pendingPermissions.isEmpty { return true }
+    try await Task.sleep(for: .milliseconds(20))
+  }
+  return false
+}
+expect(permSettled, "permission.replied 后重复 ask 产生的审批卡必须被结算清理")
+let permFinal = try! awaitValue { await permKernel.snapshot() }
+expect(permFinal.pendingPermissions.isEmpty, "同一 requestID 的重复 permission.asked 不得产生僵尸审批卡")
 
 if let rawPort = ProcessInfo.processInfo.environment["KIMI_HEADLESS_PORT"],
    let headlessPort = Int(rawPort),
@@ -5616,5 +6034,75 @@ if let rawPort = ProcessInfo.processInfo.environment["KIMI_HEADLESS_PORT"],
   let liveSessions = try! awaitValue { try await liveClient.listSessions(directory: nil) }
   expect(liveSessions.count >= 0, "真实 Headless Session API 必须可访问")
 }
+
+// MARK: - Home dashboard statistics
+
+let calendar = Calendar.current
+let statsNow = Date()
+func daysAgo(_ days: Int, hour: Int = 10) -> Date {
+  var components = calendar.dateComponents([.year, .month, .day], from: statsNow)
+  components.hour = hour
+  let day = calendar.date(from: components)!
+  return calendar.date(byAdding: .day, value: -days, to: day)!
+}
+
+let activityStoreURL = temporaryDirectory.appendingPathComponent("activity.jsonl")
+let activityStore = KimiActivityStatsStore(fileURL: activityStoreURL)
+try! awaitValue { await activityStore.record(KimiActivityRecord(kind: .promptSent, date: daysAgo(0, hour: 9))) }
+try! awaitValue { await activityStore.record(KimiActivityRecord(kind: .replyReceived, date: daysAgo(1))) }
+try! awaitValue { await activityStore.record(KimiActivityRecord(kind: .promptSent, date: daysAgo(2, hour: 21))) }
+let storedRecords = try! awaitValue { await activityStore.records() }
+expect(storedRecords.count == 3, "Activity Store 必须能追加并读回全部记录")
+
+let seededSessions = [
+  KimiSessionSummary(title: "旧会话 A", updatedAt: daysAgo(1)),
+  KimiSessionSummary(title: "旧会话 B", updatedAt: daysAgo(4))
+]
+let aggregated = KimiActivityAggregator.aggregate(records: storedRecords, sessions: seededSessions, now: statsNow, calendar: calendar)
+expect(aggregated.sessionCount == 2, "首页统计的会话数必须来自真实会话列表")
+expect(aggregated.messageCount == 3, "首页统计的消息数必须统计 prompt 与 reply 记录")
+expect(aggregated.currentStreak == 3, "今天有记录时当前连续必须从今天开始计算")
+expect(aggregated.longestStreak == 3, "最长连续必须取历史最长区间")
+expect(aggregated.peakHour != nil, "有记录时必须能计算高峰时段")
+expect(aggregated.dailyCounts[calendar.startOfDay(for: daysAgo(4))] == 1, "统计日志之前的会话必须用 updatedAt 回填热力图")
+expect(aggregated.activeDays == 4, "活跃天数必须合并记录与会话回填")
+
+let noTodayRecords = [
+  KimiActivityRecord(kind: .promptSent, date: daysAgo(1)),
+  KimiActivityRecord(kind: .replyReceived, date: daysAgo(2))
+]
+let noToday = KimiActivityAggregator.aggregate(records: noTodayRecords, sessions: [], now: statsNow, calendar: calendar)
+expect(noToday.currentStreak == 2, "今天还没有活动时，当前连续必须从昨天起算且不清零")
+
+let ranged = KimiActivityAggregator.aggregate(records: storedRecords, sessions: seededSessions, now: statsNow, calendar: calendar, rangeDays: 1)
+expect(ranged.messageCount == 1, "范围过滤必须只统计窗口内的记录")
+expect(ranged.dailyCounts[calendar.startOfDay(for: daysAgo(4))] == nil, "范围过滤必须排除窗口外的会话回填")
+
+let emptyAggregate = KimiActivityAggregator.aggregate(records: [], sessions: [], now: statsNow, calendar: calendar)
+expect(emptyAggregate.currentStreak == 0 && emptyAggregate.longestStreak == 0 && emptyAggregate.peakHour == nil, "空数据必须产出零值统计而不是崩溃")
+
+// MARK: - Home stats merge & home navigation
+
+let homeKernel = KimiAppKernel(sessionClient: mockClient, activityStats: activityStore)
+try? awaitValue { try await homeKernel.send(.createSession(directory: nil)) }
+let homeStatsAll = try! awaitValue { await homeKernel.homeStats(range: .all) }
+expect(homeStatsAll.sessionCount == 1, "homeStats 必须包含内核创建的会话")
+expect(homeStatsAll.messageCount >= 3, "homeStats 必须合并 Activity 日志中的消息数")
+expect(homeStatsAll.favoriteModel != nil, "homeStats 必须回退到当前模型而不是留空")
+let homeStateBefore = try! awaitValue { await homeKernel.snapshot() }
+expect(homeStateBefore.activeSessionID != nil, "创建会话后必须进入该会话")
+try! awaitValue { try await homeKernel.send(.showHome) }
+let homeStateAfter = try! awaitValue { await homeKernel.snapshot() }
+expect(homeStateAfter.activeSessionID == nil, "showHome 必须回到首页（无活动会话）")
+
+// MARK: - Terminal output sanitizer
+
+let rawTerminal = "\u{1B}[?2004huser@mac ~ % \u{1B}[32mok\u{1B}[0m\n\u{1B}]0;title\u{7}done\rfinished\nprogress: 50%\u{8}\u{8}\u{8}100%"
+let cleanedTerminal = KimiTerminalSanitizer.strip(rawTerminal)
+expect(!cleanedTerminal.contains("\u{1B}"), "终端输出必须移除所有 ESC 序列（ bracketed-paste / 颜色 / OSC 标题）")
+expect(!cleanedTerminal.contains("\u{7}"), "终端输出必须移除 BEL 控制符")
+expect(cleanedTerminal.contains("user@mac ~ % ok"), "终端清洗必须保留可见文本")
+expect(cleanedTerminal.contains("finished"), "回车符必须表现为行内覆盖而不是残留控制字符")
+expect(cleanedTerminal.contains("progress: 100%"), "退格键必须表现为删除前一个字符")
 
 print("KimiAgentCore checks passed")

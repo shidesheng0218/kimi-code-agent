@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import KimiAgentCore
 import Sparkle
 
@@ -51,6 +52,11 @@ final class KimiAppViewModel: ObservableObject {
   @Published var composerText = ""
   @Published private(set) var terminalOutput = ""
   @Published private(set) var terminalSessionID: UUID?
+  @Published private(set) var homeStats = KimiHomeStats()
+  @Published private(set) var diffSnapshot: DiffSnapshot?
+  @Published private(set) var diffLoading = false
+  @Published private(set) var integrationStatus = KimiIntegrationStatus()
+  @Published private(set) var verificationRecords: [KimiVerificationRecord] = []
 
   let kernel: KimiAppKernel
   let terminalController: KimiTerminalController
@@ -76,21 +82,40 @@ final class KimiAppViewModel: ObservableObject {
     let support = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support/Kimi Code Agent", isDirectory: true)
     KimiRuntimeDataMigrator.migrateIfNeeded(applicationSupportDirectory: support)
+    let stateStore = KimiAppStateStore(fileURL: support.appendingPathComponent("settings/ui-state.json"))
+    // The persisted projection decides the launch-time model and seeds the
+    // engine's provider model table, so the user's last selection survives
+    // restarts and every catalog entry validates engine-side.
+    let persisted = try? stateStore.load()
     guard let configuration = KimiHeadlessRuntimeFactory.makeConfiguration(
       resourcesDirectory: resources,
-      applicationSupportDirectory: support
+      applicationSupportDirectory: support,
+      modelID: persisted?.uiState.selectedModel,
+      modelCatalog: persisted?.uiState.modelCatalog ?? []
     ) else {
       return KimiAppKernel()
     }
     let supervisor = KimiRuntimeSupervisor(configuration: configuration)
     let client = URLSessionRuntimeClient(endpoint: configuration.endpoint)
-    let stateStore = KimiAppStateStore(fileURL: support.appendingPathComponent("settings/ui-state.json"))
     let harnessStore = HarnessEventStore(fileURL: support.appendingPathComponent("harness/events.jsonl"))
+    let activityStats = KimiActivityStatsStore(fileURL: support.appendingPathComponent("harness/activity.jsonl"))
+    let endpoint = configuration.endpoint
+    let configurationProvider: @Sendable (String, [String]) -> KimiRuntimeConfiguration? = { modelID, catalog in
+      KimiHeadlessRuntimeFactory.makeConfiguration(
+        resourcesDirectory: resources,
+        applicationSupportDirectory: support,
+        modelID: modelID,
+        modelCatalog: catalog,
+        endpointOverride: endpoint
+      )
+    }
     return KimiAppKernel(
       sessionClient: client,
       runtimeSupervisor: supervisor,
       persistence: stateStore,
-      harnessStore: harnessStore
+      harnessStore: harnessStore,
+      activityStats: activityStats,
+      runtimeConfigurationProvider: configurationProvider
     )
   }
 
@@ -117,9 +142,11 @@ final class KimiAppViewModel: ObservableObject {
       terminalPollTask = Task { [weak self] in
         guard let self else { return }
         while !Task.isCancelled {
-          guard let id = self.terminalSessionID else { return }
+      guard let id = self.terminalSessionID else { return }
           let output = await self.terminalController.output(for: id)
-          await MainActor.run { [weak self] in self?.terminalOutput = output }
+          let cleaned = KimiTerminalSanitizer.strip(output)
+          let capped = cleaned.count > 300_000 ? String(cleaned.suffix(300_000)) : cleaned
+          await MainActor.run { [weak self] in self?.terminalOutput = capped }
           try? await Task.sleep(for: .milliseconds(80))
         }
       }
@@ -137,9 +164,70 @@ final class KimiAppViewModel: ObservableObject {
     state = await kernel.snapshot()
   }
 
+  func loadHomeStats(range: KimiUsageStatsRange) async {
+    homeStats = await kernel.homeStats(range: range)
+  }
+
+  var activeProjectPath: String? {
+    state.sessions.first(where: { $0.id == state.activeSessionID })?.projectPath
+  }
+
+  func loadDiff() async {
+    diffLoading = true
+    diffSnapshot = await kernel.loadDiffSnapshot()
+    diffLoading = false
+  }
+
+  func loadIntegrations() async {
+    integrationStatus = await kernel.loadIntegrationStatus()
+  }
+
+  func loadVerification() async {
+    verificationRecords = await kernel.loadVerificationRecords()
+  }
+
   func createSession() {
+    guard let directory = pickProjectDirectory() else { return }
     Task {
-      try? await kernel.send(.createSession)
+      try? await kernel.send(.createSession(directory: directory.path))
+      await refresh()
+    }
+  }
+
+  /// All session creation funnels through a project picker: the engine
+  /// resolves the working directory per session, so a session without a
+  /// project would silently run in the engine's cwd instead of user code.
+  @MainActor
+  func pickProjectDirectory() -> URL? {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    panel.prompt = "选择项目文件夹"
+    panel.message = "选择 Kimi Code Agent 要工作的项目文件夹"
+    if let recent = state.recentProjects.first {
+      panel.directoryURL = URL(fileURLWithPath: recent, isDirectory: true)
+    }
+    return panel.runModal() == .OK ? panel.url : nil
+  }
+
+  func goHome() {
+    Task {
+      try? await kernel.send(.showHome)
+      await refresh()
+    }
+  }
+
+  func changeModel(_ model: String) {
+    Task {
+      try? await kernel.send(.changeModel(model))
+      await refresh()
+    }
+  }
+
+  func restartRuntime() {
+    Task {
+      try? await kernel.send(.restartRuntime)
       await refresh()
     }
   }
@@ -154,9 +242,50 @@ final class KimiAppViewModel: ObservableObject {
   func sendPrompt() {
     let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !text.isEmpty else { return }
+    // No session yet and no known project: pick the project first so the
+    // implicit session lands in real user code.
+    if state.activeSessionID == nil, state.recentProjects.isEmpty {
+      guard let directory = pickProjectDirectory() else { return }
+      composerText = ""
+      Task {
+        try? await kernel.send(.createSession(directory: directory.path))
+        try? await kernel.send(.prompt(PromptInput(text: text)))
+        await refresh()
+      }
+      return
+    }
     composerText = ""
     Task {
-      try? await kernel.send(.prompt(PromptInput(text: text)))
+      // Slash commands route to the engine's command endpoint; unknown slash
+      // text falls through to a normal prompt.
+      if text.hasPrefix("/") {
+        let body = String(text.dropFirst())
+        let parts = body.split(separator: " ", maxSplits: 1).map(String.init)
+        if let name = parts.first, state.availableCommands.contains(where: { $0.name == name }) {
+          try? await kernel.send(.runSlashCommand(name: name, arguments: parts.count > 1 ? parts[1] : ""))
+          await refresh()
+          return
+        }
+      }
+      // While the session is executing, a submitted message steers the
+      // running turn instead of failing on a busy lane.
+      if isActiveSessionBusy {
+        try? await kernel.send(.steer(PromptInput(text: text)))
+      } else {
+        try? await kernel.send(.prompt(PromptInput(text: text)))
+      }
+      await refresh()
+    }
+  }
+
+  var isActiveSessionBusy: Bool {
+    guard let session = state.sessions.first(where: { $0.id == state.activeSessionID }) else { return false }
+    return state.busySessionIDs.contains(session.runtimeID ?? session.id.uuidString)
+  }
+
+  func abortActive() {
+    Task {
+      await kernel.abortActiveSession()
       await refresh()
     }
   }
@@ -168,9 +297,73 @@ final class KimiAppViewModel: ObservableObject {
     }
   }
 
+  func approveAlways(_ id: UUID) {
+    Task {
+      try? await kernel.send(.approveAlways(id))
+      await refresh()
+    }
+  }
+
   func deny(_ id: UUID) {
     Task {
       try? await kernel.send(.deny(id))
+      await refresh()
+    }
+  }
+
+  func answerQuestion(_ id: UUID, _ answers: [[String]]) {
+    Task {
+      try? await kernel.send(.answerQuestion(id, answers))
+      await refresh()
+    }
+  }
+
+  func rejectQuestion(_ id: UUID) {
+    Task {
+      try? await kernel.send(.rejectQuestion(id))
+      await refresh()
+    }
+  }
+
+  var activeRuntimeID: String? {
+    guard let session = state.sessions.first(where: { $0.id == state.activeSessionID }) else { return nil }
+    return session.runtimeID ?? session.id.uuidString
+  }
+
+  var canRevertActive: Bool {
+    guard let runtimeID = activeRuntimeID else { return false }
+    return state.lastUserMessageIDBySession[runtimeID] != nil
+      && !state.busySessionIDs.contains(runtimeID)
+      && !state.revertedSessionIDs.contains(runtimeID)
+  }
+
+  func revertLastTurn() {
+    Task {
+      try? await kernel.send(.revertLastTurn)
+      await refresh()
+    }
+  }
+
+  func unrevert() {
+    Task {
+      try? await kernel.send(.unrevert)
+      await refresh()
+    }
+  }
+
+  func compact() {
+    Task {
+      try? await kernel.send(.compact)
+      await refresh()
+    }
+  }
+
+  func sendFollowUp() {
+    let text = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return }
+    composerText = ""
+    Task {
+      try? await kernel.send(.followUp(PromptInput(text: text)))
       await refresh()
     }
   }
@@ -192,21 +385,6 @@ final class KimiAppViewModel: ObservableObject {
       await refresh()
     }
   }
-
-  private func apply(_ event: KimiEvent) {
-    switch event {
-    case let .runtimeChanged(runtime): state.runtimeState = runtime
-    case let .userText(text): state.messages.append(KimiMessage(role: .user, text: text))
-    case let .assistantText(text): state.messages.append(KimiMessage(role: .assistant, text: text))
-    case let .activity(activity): state.activities.append(activity)
-    case let .permission(permission): state.pendingPermissions.append(permission)
-    case let .error(error): state.lastError = error
-    case let .sessionChanged(summary):
-      if let index = state.sessions.firstIndex(where: { $0.id == summary.id }) { state.sessions[index] = summary }
-      else { state.sessions.insert(summary, at: 0) }
-      state.activeSessionID = summary.id
-    }
-  }
 }
 
 enum KimiDesign {
@@ -219,6 +397,17 @@ enum KimiDesign {
   static let muted = Color(red: 0.44, green: 0.48, blue: 0.56)
   static let border = Color(red: 0.88, green: 0.90, blue: 0.93)
   static let radius: CGFloat = 12
+
+  static func statusColor(_ status: SessionStatus) -> Color {
+    switch status {
+    case .running: return primary
+    case .awaitingApproval: return .orange
+    case .failed, .interrupted: return .red
+    case .completed: return .green
+    case .paused, .cancelled: return .gray
+    case .idle: return Color(red: 0.62, green: 0.66, blue: 0.73)
+    }
+  }
 }
 
 struct KimiRootView: View {
@@ -226,283 +415,22 @@ struct KimiRootView: View {
 
   var body: some View {
     HStack(spacing: 0) {
-      KimiSidebar(model: model)
-        .frame(width: 248)
+      KimiSidebarView(model: model)
+        .frame(width: 260)
       Divider()
-      KimiWorkspacePane(model: model)
-        .frame(minWidth: 540, maxWidth: .infinity)
+      if model.state.activeSessionID == nil {
+        KimiHomePane(model: model)
+          .frame(minWidth: 540, maxWidth: .infinity)
+      } else {
+        KimiWorkspacePane(model: model)
+          .frame(minWidth: 540, maxWidth: .infinity)
+      }
       Divider()
       KimiTerminalPane(state: model.state, output: model.terminalOutput, sendInput: model.sendTerminalInput)
         .frame(width: 360)
     }
     .background(KimiDesign.background)
     .preferredColorScheme(.light)
-  }
-}
-
-struct KimiSidebar: View {
-  @ObservedObject var model: KimiAppViewModel
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 14) {
-      HStack(spacing: 10) {
-        Circle().fill(KimiDesign.primary.gradient).frame(width: 30, height: 30)
-          .overlay(Text("K").font(.headline.weight(.bold)).foregroundStyle(.white))
-        VStack(alignment: .leading, spacing: 1) {
-          Text("Kimi Code Agent").font(.headline)
-          Text("原生智能工作台").font(.caption).foregroundStyle(KimiDesign.muted)
-        }
-      }
-      Button(action: model.createSession) {
-        Label("新建会话", systemImage: "plus")
-          .frame(maxWidth: .infinity, alignment: .leading)
-      }
-      .buttonStyle(.borderedProminent)
-      .tint(KimiDesign.primary)
-
-      Text("会话").font(.caption.weight(.semibold)).foregroundStyle(KimiDesign.muted)
-      ScrollView {
-        LazyVStack(spacing: 4) {
-          ForEach(model.state.sessions) { session in
-            Button { model.select(session.id) } label: {
-              VStack(alignment: .leading, spacing: 3) {
-                Text(session.title).lineLimit(1)
-                Text(session.status.rawValue).font(.caption2).foregroundStyle(KimiDesign.muted)
-              }
-              .padding(.horizontal, 10).padding(.vertical, 8)
-              .frame(maxWidth: .infinity, alignment: .leading)
-              .background(model.state.activeSessionID == session.id ? KimiDesign.surfaceSecondary : .clear)
-              .clipShape(RoundedRectangle(cornerRadius: 8))
-            }
-            .buttonStyle(.plain)
-          }
-        }
-      }
-
-      Spacer()
-      Divider()
-      HStack(spacing: 8) {
-        Circle().fill(model.state.runtimeState == .ready ? .green : .orange).frame(width: 8, height: 8)
-        Text(model.state.runtimeState == .ready ? "运行时已连接" : "正在连接运行时")
-          .font(.caption).foregroundStyle(KimiDesign.muted)
-      }
-    }
-    .padding(16)
-    .background(KimiDesign.surface)
-  }
-}
-
-struct KimiWorkspacePane: View {
-  @ObservedObject var model: KimiAppViewModel
-
-  var body: some View {
-    switch model.state.activePane {
-    case .conversation:
-      KimiConversationPane(model: model)
-    case .diff:
-      KimiAuxiliaryPane(
-        title: "Diff 审阅",
-        icon: "arrow.left.arrow.right",
-        detail: "任务生成的 Worktree 修改会在这里展示。审批、变更摘要和最终合并保持分离。",
-        empty: "当前会话还没有可审阅的修改。"
-      ) { model.show(.conversation) }
-    case .browser:
-      KimiAuxiliaryPane(
-        title: "Browser 验证",
-        icon: "safari",
-        detail: "公开网页验证、截图、控制台与网络产物会由原生 WKWebView 执行并回流到 Activity Card。",
-        empty: "尚未发起浏览器验证。"
-      ) { model.show(.conversation) }
-    case .files:
-      KimiAuxiliaryPane(
-        title: "项目文件",
-        icon: "folder",
-        detail: "文件读取、搜索与 Worktree 变更受 Harness 和项目边界约束。",
-        empty: "选择项目后将在这里显示文件与产物。"
-      ) { model.show(.conversation) }
-    case .verification:
-      KimiAuxiliaryPane(
-        title: "验证",
-        icon: "checkmark.seal",
-        detail: "测试、构建、Browser 产物和 Receipt 会在最终答复前进行一致性检查。",
-        empty: "当前没有待展示的验证记录。"
-      ) { model.show(.conversation) }
-    case .integrations:
-      KimiAuxiliaryPane(
-        title: "集成",
-        icon: "puzzlepiece.extension",
-        detail: "MCP、Skills、Hooks、Plugins 和 Provider 的状态由 Headless Runtime 与 Harness 统一管理。",
-        empty: "当前没有需要操作的集成。"
-      ) { model.show(.conversation) }
-    }
-  }
-}
-
-struct KimiAuxiliaryPane: View {
-  let title: String
-  let icon: String
-  let detail: String
-  let empty: String
-  let back: () -> Void
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 20) {
-      HStack {
-        Label(title, systemImage: icon).font(.title3.weight(.semibold))
-        Spacer()
-        Button("返回会话", action: back).buttonStyle(.bordered)
-      }
-      Text(detail).foregroundStyle(KimiDesign.muted)
-      Spacer()
-      VStack(spacing: 10) {
-        Image(systemName: icon).font(.system(size: 36)).foregroundStyle(KimiDesign.primary)
-        Text(empty).foregroundStyle(KimiDesign.muted)
-      }
-      .frame(maxWidth: .infinity)
-      Spacer()
-    }
-    .padding(24)
-    .background(KimiDesign.background)
-  }
-}
-
-struct KimiConversationPane: View {
-  @ObservedObject var model: KimiAppViewModel
-
-  var body: some View {
-    VStack(spacing: 0) {
-      HStack {
-        VStack(alignment: .leading, spacing: 3) {
-          Text("会话").font(.title3.weight(.semibold))
-          Text("把想法变成可验证的代码").font(.caption).foregroundStyle(KimiDesign.muted)
-        }
-        Spacer()
-        Menu {
-          Button("Diff") { model.show(.diff) }
-          Button("Browser") { model.show(.browser) }
-          Button("Files") { model.show(.files) }
-          Button("验证") { model.show(.verification) }
-        } label: {
-          Image(systemName: "slider.horizontal.3")
-        }
-        .buttonStyle(.borderless)
-      }
-      .padding(.horizontal, 24).padding(.vertical, 18)
-
-      ScrollViewReader { proxy in
-        ScrollView {
-          LazyVStack(alignment: .leading, spacing: 16) {
-            if model.state.messages.isEmpty {
-              VStack(spacing: 10) {
-                Text("你好，我是 Kimi Code Agent").font(.title2.weight(.semibold))
-                Text("描述你的目标，我会分析、执行、验证并把结果交给你。").foregroundStyle(KimiDesign.muted)
-              }
-              .frame(maxWidth: .infinity).padding(.top, 120)
-            }
-            ForEach(model.state.messages) { message in
-              KimiMessageRow(message: message)
-                .id(message.id)
-            }
-            ForEach(model.state.activities) { activity in
-              KimiActivityCard(activity: activity)
-            }
-            ForEach(model.state.pendingPermissions) { permission in
-              KimiPermissionCard(permission: permission, approve: { model.approve(permission.id) }, deny: { model.deny(permission.id) })
-            }
-            if let error = model.state.lastError {
-              Text(error).foregroundStyle(.red).padding(12).background(Color.red.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 10))
-            }
-          }
-          .padding(24)
-        }
-        .onChange(of: model.state.messages.count) { _, _ in
-          if let id = model.state.messages.last?.id { withAnimation { proxy.scrollTo(id, anchor: .bottom) } }
-        }
-      }
-
-      KimiComposer(model: model)
-        .padding(18)
-    }
-    .background(KimiDesign.background)
-  }
-}
-
-struct KimiMessageRow: View {
-  let message: KimiMessage
-
-  var body: some View {
-    HStack(alignment: .top, spacing: 12) {
-      Image(systemName: message.role == .user ? "person.circle.fill" : "sparkles")
-        .foregroundStyle(message.role == .user ? KimiDesign.muted : KimiDesign.primary)
-      Text(message.text)
-        .textSelection(.enabled)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-    .padding(14)
-    .background(message.role == .user ? KimiDesign.surface : KimiDesign.surfaceSecondary)
-    .clipShape(RoundedRectangle(cornerRadius: KimiDesign.radius))
-  }
-}
-
-struct KimiActivityCard: View {
-  let activity: KimiActivity
-
-  var body: some View {
-    DisclosureGroup {
-      if let detail = activity.detail { Text(detail).font(.caption).foregroundStyle(KimiDesign.muted).padding(.top, 5) }
-    } label: {
-      HStack(spacing: 8) {
-        Image(systemName: activity.state == .completed ? "checkmark.circle.fill" : "gearshape.2")
-          .foregroundStyle(activity.state == .failed ? .red : KimiDesign.primary)
-        Text(activity.title).font(.subheadline.weight(.medium))
-        Spacer()
-        Text(activity.state.rawValue).font(.caption2).foregroundStyle(KimiDesign.muted)
-      }
-    }
-    .padding(12)
-    .background(KimiDesign.surface)
-    .clipShape(RoundedRectangle(cornerRadius: KimiDesign.radius))
-  }
-}
-
-struct KimiPermissionCard: View {
-  let permission: KimiPermissionRequest
-  let approve: () -> Void
-  let deny: () -> Void
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      Label("需要你的确认", systemImage: "hand.raised.fill").font(.subheadline.weight(.semibold))
-      Text(permission.reason).font(.subheadline)
-      HStack {
-        Button("拒绝", action: deny).buttonStyle(.bordered)
-        Button("允许一次", action: approve).buttonStyle(.borderedProminent).tint(KimiDesign.primary)
-      }
-    }
-    .padding(14)
-    .background(Color.orange.opacity(0.10))
-    .clipShape(RoundedRectangle(cornerRadius: KimiDesign.radius))
-  }
-}
-
-struct KimiComposer: View {
-  @ObservedObject var model: KimiAppViewModel
-
-  var body: some View {
-    HStack(alignment: .bottom, spacing: 10) {
-      TextField("描述你想完成的任务…", text: $model.composerText, axis: .vertical)
-        .textFieldStyle(.plain)
-        .lineLimit(1...6)
-        .padding(12)
-        .background(KimiDesign.surface)
-        .clipShape(RoundedRectangle(cornerRadius: KimiDesign.radius))
-        .onSubmit { model.sendPrompt() }
-      Button(action: model.sendPrompt) {
-        Image(systemName: "arrow.up").font(.headline).frame(width: 38, height: 38)
-      }
-      .buttonStyle(.borderedProminent)
-      .tint(KimiDesign.primary)
-    }
   }
 }
 
@@ -517,6 +445,9 @@ struct KimiTerminalPane: View {
       HStack {
         Label("终端", systemImage: "terminal")
         Spacer()
+        Text("本机交互终端 · 不经权限门")
+          .font(.caption2)
+          .foregroundStyle(.white.opacity(0.45))
         Circle().fill(.green).frame(width: 7, height: 7)
       }
       .padding(16)

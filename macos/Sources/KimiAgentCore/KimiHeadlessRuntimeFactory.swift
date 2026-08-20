@@ -1,11 +1,20 @@
 import Foundation
 
 public enum KimiHeadlessRuntimeFactory {
+  /// Builds the engine launch configuration.
+  /// - `modelID` overrides the launch-time default model (persisted user choice);
+  /// - `modelCatalog` seeds the provider's models table so per-prompt model
+  ///   references validate against the injected configuration;
+  /// - `endpointOverride` keeps the loopback port and token stable across an
+  ///   in-place reconfigure, so existing session clients never re-handshake.
   public static func makeConfiguration(
     resourcesDirectory: URL,
     applicationSupportDirectory: URL,
     environment: [String: String] = ProcessInfo.processInfo.environment,
-    fileManager: FileManager = .default
+    fileManager: FileManager = .default,
+    modelID: String? = nil,
+    modelCatalog: [String] = [],
+    endpointOverride: KimiRuntimeEndpoint? = nil
   ) -> KimiRuntimeConfiguration? {
     let nativeRuntimeBinaryURL = configuredRuntimeURL(
       environment["KIMI_RUNTIME_BINARY"],
@@ -23,9 +32,16 @@ public enum KimiHeadlessRuntimeFactory {
       return nil
     }
 
-    let port = Int(environment["KIMI_RUNTIME_PORT"] ?? "") ?? Int.random(in: 20_000...45_000)
-    let configuredToken = environment["KIMI_RUNTIME_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    let token = configuredToken.isEmpty ? UUID().uuidString : configuredToken
+    let port: Int
+    let token: String
+    if let endpointOverride {
+      port = endpointOverride.port
+      token = endpointOverride.token
+    } else {
+      port = Int(environment["KIMI_RUNTIME_PORT"] ?? "") ?? Int.random(in: 20_000...45_000)
+      let configuredToken = environment["KIMI_RUNTIME_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      token = configuredToken.isEmpty ? UUID().uuidString : configuredToken
+    }
     let endpoint = KimiRuntimeEndpoint(port: port, token: token)
     // Contain every engine-writable location inside the app's own sandbox
     // directory so nothing leaks into ~/.config, ~/.local, or other shared
@@ -42,9 +58,24 @@ public enum KimiHeadlessRuntimeFactory {
     // process environment explicit while emitting the canonical file URL.
     let plugin = filePluginSpec(pluginPath)
     let bridge = environment["KIMI_NATIVE_BRIDGE"] ?? resourcesDirectory.appendingPathComponent("native/KimiNativeBridge").path
-    let modelID = environment["KIMI_MODEL"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-      ? environment["KIMI_MODEL"]!
-      : KimiRuntimeIdentityStore.defaultModelID
+    let resolvedModelID: String
+    if let modelID, !modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      resolvedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+    } else if let envModel = environment["KIMI_MODEL"]?.trimmingCharacters(in: .whitespacesAndNewlines), !envModel.isEmpty {
+      resolvedModelID = envModel
+    } else {
+      resolvedModelID = KimiRuntimeIdentityStore.defaultModelID
+    }
+    let modelID = resolvedModelID
+    // Every selectable model must exist in the injected provider table, or
+    // per-prompt model references would fail engine-side validation.
+    let tableModelIDs = ([modelID] + modelCatalog).reduce(into: [String]()) { result, item in
+      let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !trimmed.isEmpty, !result.contains(trimmed) { result.append(trimmed) }
+    }
+    let modelEntries = tableModelIDs.map { id in
+      (id, ["name": id, "reasoning": true, "tool_call": true, "interleaved": "reasoning_content", "limit": ["context": 262_144, "output": 16_384], "modalities": ["input": ["text", "image"], "output": ["text"]]] as [String: Any])
+    }
     let baseURL = environment["KIMI_BASE_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
       ? environment["KIMI_BASE_URL"]!
       : KimiRuntimeIdentityStore.defaultBaseURL
@@ -72,17 +103,17 @@ public enum KimiHeadlessRuntimeFactory {
     ]
     if !apiKey.isEmpty { runtimeEnvironment["KIMI_API_KEY"] = apiKey }
     let config: [String: Any] = [
-      "model": "moonshotai-cn/\(modelID)",
-      "small_model": "moonshotai-cn/\(modelID)",
+      "model": "\(KimiRuntimeIdentityStore.providerID)/\(modelID)",
+      "small_model": "\(KimiRuntimeIdentityStore.providerID)/\(modelID)",
       "plugin": ["{env:KIMI_RUNTIME_PLUGIN}"],
       "provider": [
-        "moonshotai-cn": [
+        KimiRuntimeIdentityStore.providerID: [
           "name": "Kimi / Moonshot AI",
           "api": baseURL,
           "npm": "@ai-sdk/openai-compatible",
           "env": ["KIMI_API_KEY"],
           "options": ["apiKey": "{env:KIMI_API_KEY}", "baseURL": baseURL, "timeout": 120000, "headerTimeout": 15000, "chunkTimeout": 30000, "setCacheKey": true],
-          "models": [modelID: ["name": modelID, "reasoning": true, "tool_call": true, "interleaved": "reasoning_content", "limit": ["context": 262144, "output": 16384], "modalities": ["input": ["text", "image"], "output": ["text"]]]]
+          "models": Dictionary(uniqueKeysWithValues: modelEntries)
         ]
       ],
       "permission": ["read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "websearch": "allow", "webfetch": "allow", "task": "allow", "bash": "ask", "edit": "ask", "external_directory": "ask", "question": "ask", "skill": "ask"],

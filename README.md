@@ -57,60 +57,54 @@ Kimi Code Agent 的重点不是把更多按钮塞进界面，而是把一次 Cod
 
 ```mermaid
 flowchart LR
-    U[用户消息] --> I[意图识别]
-    I --> S[Supervisor]
-    S --> G{最小 DAG}
-    G --> M[主会话 Lane]
-    G --> C[Child Session]
-    M --> P[Kimi Provider]
-    C --> P
+    U[用户消息] --> K[KimiAppKernel]
+    K --> H[AgentHarness 事件溯源]
+    H --> E[内置执行引擎<br/>Session / Tool / Permission / MCP]
+    E --> P[Kimi Provider]
     P --> T[Tool Call]
-    T --> V[Schema / 参数校验]
-    V --> A[Permission Gate]
-    A --> N[Intent 写入]
-    N --> E[Native Tool Runtime]
-    E --> R[Receipt / Artifact]
-    R --> P
-    R --> Q[验证与质量门]
-    Q --> F[Final Answer Composer]
-    F --> O[主对话]
+    T --> A{引擎权限规则<br/>allow / ask}
+    A -->|ask| C[审批卡片<br/>拒绝 / 允许一次 / 总是允许]
+    C --> T
+    A -->|allow| X[执行]
+    T --> X
+    X --> R[Harness Intent / Receipt 审计]
+    E --> S[SSE 事件流]
+    S --> O[主对话 / Todo / Activity Card]
+    E --> NP[Kimi Native Plugin]
+    NP --> B[KimiNativeBridge]
+    B --> MAC[WKWebView / Computer Use / WebRuntime]
 ```
 
-每个有副作用的工具遵循同一协议：
+- 内置引擎（opencode 派生）是唯一执行链：会话循环、工具注册、权限判定、压缩与子代理都在引擎内完成；
+- Swift 侧 Harness 对每次工具调用事后补记 Intent/Receipt（含输入输出 sha256 摘要），用于审计、统计与崩溃恢复，绝不伪造成功回执；
+- 需要联网、浏览器验证或系统级操作的工具由引擎插件转发给一次性 `KimiNativeBridge` 进程，桥端再做一次 URL/审批校验；
+- 主对话只展示结论、证据和下一步；工具原始 JSON、终端长输出和内部推理进入可折叠 Activity Card，不污染聊天内容。
 
-```text
-tool_call_declared
-→ input_validated
-→ permission_settled
-→ intent_written
-→ effect_started
-→ effect_settled
-→ receipt_written
-→ tool_result_recorded
-```
+### 交互语义
+
+- **停止**：执行中随时点停止按钮，引擎中断当前 turn；
+- **插队（Steer）**：执行中发送的消息进入正在运行的 turn，引擎在下一个循环边界拾起；
+- **排队（Follow-up）**：排队消息在当前 turn 结束后自动开始新一轮；
+- **撤销**：消息级 `revert` 回滚该轮文件改动，`unrevert` 还原；
+- **恢复**：应用重启后从引擎消息日志重建对话、Todo 与工具活动；未结算的本地 Operation 标记 `suspended`，副作用绝不自动重放。
 
 ## 能力地图
 
 | 能力 | 默认执行位置 | 用户看到的结果 | 恢复语义 |
 | --- | --- | --- | --- |
-| 普通对话 / 解释 | Kimi API + 主会话 Lane | 直接中文回复 | 保留 SessionTree，可继续 |
-| Explore / Plan / Implement / Test / Review | Child Session + DAG Worker | 阶段摘要、Diff、验证结果 | 单节点重试，不重放已结算副作用 |
-| 文件读取 / 搜索 | Worktree 内 Native Runtime | 折叠活动卡片 | 只读操作可安全重试 |
-| 文件写入 / Shell | Worktree + OS Sandbox | 审批、Diff、终端摘要 | Intent 无 Receipt 时标记 unknown |
-| Web Search / Fetch | Swift WebRuntime；兼容模式才使用 Node Bridge | 来源、标题、正文 Artifact | 公网只读可重试，私网需拦截或审批 |
-| Browser Verification | WKWebView Adapter | URL、截图、Console、验证结论 | 保留当前 URL 和失败产物 |
+| 普通对话 / 解释 | 内置引擎 + Kimi Provider | 流式中文回复、Todo 清单、可折叠思考过程 | 消息日志持久化，切换/重启后完整重建 |
+| Agentic 编码任务 | 引擎 Session（工具循环 + 压缩） | 活动卡片、Diff 面板、验证回执 | 中断 turn 可继续；重启后任务标记 suspended，人工选择继续 |
+| 子代理（Subagents） | 引擎 task 工具 | 嵌套活动卡（运行/结算状态） | 随主会话恢复 |
+| 文件读取 / 搜索 | 引擎内置工具（项目目录内） | 折叠活动卡片 | 只读操作可安全重试 |
+| 文件写入 / Shell | 引擎内置工具 | 审批卡片（拒绝/允许一次/总是允许）、Diff、回执 | Intent 无 Receipt 时标记 unknown，绝不自动重放 |
+| Web Search / Fetch | Kimi Native Plugin → Swift WebRuntime | 来源、标题、正文引用 | 公网只读可重试，私网拦截 |
+| Browser Verification | WKWebView（离屏） | URL、截图、Console、验证结论与产物展示 | 截图产物落盘并在面板展示 |
 | Computer Use | macOS 系统权限边界 | 截图、动作回执、权限诊断 | 高风险动作逐次确认 |
-| MCP Tool / Resources / Prompts | MCP Worker + Harness Adapter | Worker 状态、结果和审计 | 崩溃限次重连，不重复已有 Receipt |
-| Skills / Hooks / Plugins | 隔离 Worker | 触发记录、决策、错误诊断 | 超时、取消和失败均回流 Harness |
+| Slash 命令 / Skills | 引擎命令目录与技能发现 | 输入 `/` 自动补全、集成面板 | 项目命令随工作区发现 |
+| MCP | 引擎 MCP 管理 | 集成面板连接状态 | 引擎侧重连，状态实时可见 |
+| Todo 清单 | 引擎 todo 工具 | 会话顶部实时清单 | 随会话恢复 |
 
-### Agent View
-
-```text
-Needs Input → Working → Waiting Approval → Completed
-                         ↘ Failed / Degraded → Retry / Resume
-```
-
-终端固定在工作区右侧；Diff、Browser、Files、Plan、Tasks、Subagents 和 Verification 都是独立面板，不把工具日志倒灌进主对话。
+主区面板：对话（统一时间线）、Diff 审阅（工作区真实 git diff）、项目文件（目录树 + 预览）、Browser 产物（截图）、验证（Harness Intent/Receipt 审计）、集成（MCP / Skills）。终端固定在工作区右侧，为本机交互终端（不经权限门，UI 已明示）。
 
 ## 快速开始
 
@@ -139,26 +133,27 @@ https://api.moonshot.ai/v1
 
 ### 3. 运行第一个任务
 
-1. 选择一个 Git 项目文件夹；
+1. 点击“新建会话”，选择一个 Git 项目文件夹（会话与项目目录绑定，侧栏按项目分组）；
 2. 输入自然语言任务，例如：`检查登录流程的错误处理，并补充测试`；
-3. 应用按任务类型选择直接对话、Web Research 或 Explore → Plan → Implement → Test → Review；
-4. 需要写入时，在审批卡片中确认；
-5. 在 Diff 面板审阅修改，确认后手动合并 Worktree。
+3. 执行中可以随时停止、插队补充指令、排队下一轮，或查看 Todo 清单；
+4. 需要写入或执行命令时，在审批卡片中选择“拒绝 / 允许一次 / 总是允许”；
+5. 在 Diff 面板审阅工作区改动；合并保持人工操作。
 
 ## 权限与安全
 
-权限不是 UI 文案，而是执行前的硬边界：
+权限判定由内置引擎在执行前硬阻塞（不是 UI 文案）；审批规则在引擎启动时注入：
 
 | 操作 | 默认策略 | 额外边界 |
 | --- | --- | --- |
-| Worktree 内读取、代码搜索 | 低风险 | 解析符号链接，阻止越界读取 |
-| 公网只读 Web Search / HTTPS Fetch | 任务或域名级记忆授权 | 禁止 Cookie、上传、凭据 URL 和私网目标 |
-| Worktree 写入 | 审批后执行 | Worktree 外写入直接拒绝，OS Sandbox 二次限制 |
-| Shell | 逐次审批 | 受限工作目录、网络默认关闭 |
-| Browser 点击、输入、提交 | 逐次审批 | Browser Domain Policy 和当前页面状态校验 |
+| 项目内读取、搜索（read/glob/grep/list） | allow | 引擎工作区边界 |
+| Web Search / Fetch | allow（公网只读） | 桥端三层私网拦截、逐跳 DNS 复核、禁 Cookie、凭据 URL 拒绝 |
+| task 子代理 | allow | 与主会话同一权限体系 |
+| Shell（bash） | 逐次审批 | 支持“总是允许”（引擎按 pattern 记忆） |
+| 文件写入（edit） | 逐次审批 | 支持“总是允许” |
+| 工作区外路径（external_directory） | 逐次审批 | 引擎边界硬约束 |
+| Browser 点击、输入、提交 | 逐次审批 | 桥端域名授权复核 |
 | Computer Use | 逐次审批 | 需要 Accessibility / Screen Recording 权限 |
-| Git Push、PR/MR、删除 | 高风险逐次审批 | 不自动合并、不静默执行 |
-| Secret | 不进入普通日志 | 只接受 Keychain / 本地凭据库引用 |
+| Secret | 不进入普通日志 | Keychain 保存；引擎配置只含环境变量占位符 |
 
 应用重启后，未完成 Operation 会进入 `suspended` / `interrupted`，用户点击继续后才恢复；已存在成功 Receipt 的副作用不会重复执行。
 
@@ -188,14 +183,12 @@ flowchart TB
 
 Kimi API 是默认模型入口。ACP / CLI 只产生模型事件，作为兼容回退，不直接拥有文件、终端、网络或浏览器执行权。模型流会记录脱敏 Trace，支持 sparse tool-call delta、断流和重试回放。
 
-### Session 与 Worktree
+### Session 与项目目录
 
-- 普通连续对话使用同一 Session 的 `main` Lane；
-- Steering 进入当前运行，Follow-up 进入当前回合结束后的队列；
-- 强隔离任务使用 Child Session；
-- 并行 Implement Worker 使用不同 Worktree；
-- Test / Review / Debug 继承产生修改的 Worktree，验证真实改动；
-- 同一 Worktree 写入串行，读取和搜索可并行。
+- 每个会话在创建时绑定一个项目目录（新建会话时选择），引擎按目录路由到对应实例；
+- 同目录的连续对话共享引擎会话上下文；Steering 进入当前运行，Follow-up 排队到当前回合结束；
+- 引擎自带 worktree 沙箱端点（`/experimental/worktree`），当前版本未接入——会话直接在项目目录执行，改动经 Diff 面板审阅后人工合并；
+- 消息历史、Todo、工具产物由引擎持久化，应用重启或切换会话后完整重建。
 
 ## 项目结构
 
