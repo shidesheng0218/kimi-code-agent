@@ -6038,7 +6038,10 @@ if let rawPort = ProcessInfo.processInfo.environment["KIMI_HEADLESS_PORT"],
 // MARK: - Home dashboard statistics
 
 let calendar = Calendar.current
-let statsNow = Date()
+// Anchor the dataset to a fixed instant: with wall-clock `now`, the
+// "today at 9:00" record is in the future on runners whose local time is
+// earlier than 9:00 (e.g. UTC CI), making the range assertions flaky.
+let statsNow = calendar.date(from: DateComponents(year: 2026, month: 8, day: 15, hour: 15))!
 func daysAgo(_ days: Int, hour: Int = 10) -> Date {
   var components = calendar.dateComponents([.year, .month, .day], from: statsNow)
   components.hour = hour
