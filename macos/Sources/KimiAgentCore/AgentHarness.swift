@@ -885,10 +885,17 @@ public actor AgentHarness {
     operation.state = .aborted
     operation.updatedAt = .now
     snapshotValue.operations[operationID] = operation
-    runningTasks[operationID]?.cancel()
+    let runningTask = runningTasks[operationID]
+    runningTask?.cancel()
     // The lane stays reserved until the driver task actually stops (run()
     // releases it in its completion paths), so a new prompt on this lane can
     // never race a still-executing tool effect from the aborted operation.
+    // But a suspended or restored operation has no live driver to reach that
+    // release path, so aborting it must free the lane here or it stays busy
+    // until the next restart.
+    if runningTask == nil {
+      releaseLane(operation)
+    }
     try? await publish(.operationStateChanged, operationID: operationID, lane: operation.lane, payload: try? JSONEncoder().encode(operation))
   }
 
@@ -1129,9 +1136,18 @@ public actor AgentHarness {
 
   private func run(_ operationID: OperationID, driver: @escaping OperationDriver) async {
     guard var operation = snapshotValue.operations[operationID],
-          let prompt = operation.prompt else { return }
+          let prompt = operation.prompt else {
+      // No runnable prompt: a terminal operation here can never reach a
+      // completion path, so release its lane now or it stays reserved.
+      if let operation = snapshotValue.operations[operationID], operation.state.isTerminal {
+        releaseLane(operation)
+      }
+      runningTasks.removeValue(forKey: operationID)
+      return
+    }
     if operation.state == .aborted {
       releaseLane(operation)
+      runningTasks.removeValue(forKey: operationID)
       return
     }
     operation.state = .running
@@ -1157,6 +1173,7 @@ public actor AgentHarness {
         if let aborted = snapshotValue.operations[operationID], aborted.state == .aborted {
           releaseLane(aborted)
         }
+        runningTasks.removeValue(forKey: operationID)
         return
       }
       settled.state = .completed
@@ -1171,8 +1188,18 @@ public actor AgentHarness {
       if let aborted = snapshotValue.operations[operationID], aborted.state == .aborted {
         releaseLane(aborted)
       }
+      runningTasks.removeValue(forKey: operationID)
     } catch {
-      guard var failed = snapshotValue.operations[operationID], failed.state != .aborted else { return }
+      // The driver surfaced a non-cancellation error after abort() (for example
+      // a transport error racing the cancel). The operation is already terminal,
+      // so still release the lane and drop the task record instead of leaking it.
+      guard var failed = snapshotValue.operations[operationID], failed.state != .aborted else {
+        if let aborted = snapshotValue.operations[operationID], aborted.state == .aborted {
+          releaseLane(aborted)
+        }
+        runningTasks.removeValue(forKey: operationID)
+        return
+      }
       failed.state = .failed
       failed.errorMessage = error.localizedDescription
       failed.updatedAt = .now

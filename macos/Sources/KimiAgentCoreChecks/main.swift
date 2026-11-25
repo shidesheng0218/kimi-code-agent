@@ -2971,11 +2971,59 @@ do {
 }
 expect(promptRejectedBeforeDriverExit, "Driver 尚未退出时 Abort 后仍必须保持 Lane 占用")
 _ = try awaitValue { await releaseGate.open(); return true }
-_ = try awaitValue { try await nonCooperativeHarness.wait(for: nonCooperativeOperation, timeout: 1); return true }
+// wait(for:) returns as soon as the state is terminal, and abort() already set
+// .aborted — so it does NOT prove run() reached releaseLane. Poll the lane
+// itself until the driver task has actually released it before re-prompting.
+let laneFreed = try awaitValue { () async throws -> Bool in
+  let deadline = Date().addingTimeInterval(2)
+  while Date() < deadline {
+    if await nonCooperativeHarness.snapshot().lanes[.main]?.activeOperation == nil { return true }
+    try await Task.sleep(nanoseconds: 10_000_000)
+  }
+  return false
+}
+expect(laneFreed, "Driver 退出后必须释放 Lane（不能只到终态就停）")
 let promptAfterDriverExit = try awaitValue {
   try await nonCooperativeHarness.prompt(PromptInput(text: "Driver 退出后提交"), lane: .main)
 }
 _ = try awaitValue { try await nonCooperativeHarness.wait(for: promptAfterDriverExit, timeout: 1); return true }
+
+// Aborting a suspended/restored operation has no live driver to release the
+// lane in run(); abort() must free it directly or the lane stays busy for good.
+let suspendedAbortHarness = AgentHarness(store: HarnessEventStore(), driver: { _, _ in
+  try await Task.sleep(nanoseconds: 800_000_000)
+})
+let suspendedAbortOperation = try awaitValue {
+  try await suspendedAbortHarness.prompt(PromptInput(text: "暂停后中止"), lane: .main)
+}
+_ = try awaitValue { await suspendedAbortHarness.suspend(suspendedAbortOperation); return true }
+_ = try awaitValue { await suspendedAbortHarness.abort(suspendedAbortOperation); return true }
+let suspendedAbortLaneFree = try awaitValue { await suspendedAbortHarness.snapshot().lanes[.main]?.activeOperation == nil }
+expect(suspendedAbortLaneFree, "Abort 一个 suspended Operation(无存活 driver)必须立即释放 Lane")
+
+// A driver that throws a non-cancellation error after abort() must still
+// release the lane; the terminal .aborted state must not leak the reservation.
+struct NonCancellationError: Error {}
+let errorDriverStarted = OneShotAsyncGate()
+let errorAbortHarness = AgentHarness(store: HarnessEventStore(), driver: { _, _ in
+  await errorDriverStarted.open()
+  try await Task.sleep(nanoseconds: 50_000_000)
+  throw NonCancellationError()
+})
+let errorAbortOperation = try awaitValue {
+  try await errorAbortHarness.prompt(PromptInput(text: "中止后抛非取消错误"), lane: .main)
+}
+_ = try awaitValue { await errorDriverStarted.wait(); return true }
+_ = try awaitValue { await errorAbortHarness.abort(errorAbortOperation); return true }
+let errorLaneFreed = try awaitValue { () async throws -> Bool in
+  let deadline = Date().addingTimeInterval(2)
+  while Date() < deadline {
+    if await errorAbortHarness.snapshot().lanes[.main]?.activeOperation == nil { return true }
+    try await Task.sleep(nanoseconds: 10_000_000)
+  }
+  return false
+}
+expect(errorLaneFreed, "Driver 在 abort 后抛非取消错误时也必须释放 Lane")
 
 
 let suspendedHarness = AgentHarness(

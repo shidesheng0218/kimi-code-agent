@@ -42,7 +42,7 @@ async function installFoundation(paths) {
   if (!fs.existsSync(paths.nativePluginFile)) {
     throw new Error(`Missing Kimi native adapter plugin at ${paths.nativePluginFile}`);
   }
-  run('bun', ['install', '--frozen-lockfile'], {
+  run('npx', ['--yes', 'bun@1.3.14', 'install', '--frozen-lockfile'], {
     cwd: paths.foundationDirectory,
     env: launchEnvironment(paths)
   });
