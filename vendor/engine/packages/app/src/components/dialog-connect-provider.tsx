@@ -425,6 +425,11 @@ function ProviderConnection(props: {
         .then((result) => result.data),
   )
   const loading = createMemo(() => integration.loading)
+  createEffect(() => {
+    const error = integration.error
+    if (!error) return
+    dispatch({ type: "auth.error", error: formatError(error, language.t("common.requestFailed")) })
+  })
   const methods = createMemo<ConnectMethod[]>(() => {
     const values = integration.latest?.methods.filter(
       (method): method is ConnectMethod => method.type === "key" || method.type === "oauth",
@@ -709,9 +714,17 @@ function ProviderConnection(props: {
   })
 
   async function complete() {
-    await serverSync()
-      .refreshProviders()
-      .catch(() => undefined)
+    try {
+      await serverSync().refreshProviders()
+    } catch (error) {
+      showToast({
+        variant: "error",
+        icon: "circle-x",
+        title: language.t("common.requestFailed"),
+        description: formatError(error, language.t("common.requestFailed")),
+      })
+      return
+    }
     dialog.close()
     showToast({
       variant: "success",
@@ -821,12 +834,16 @@ function ProviderConnection(props: {
       }
 
       setFormStore("error", undefined)
-      await serverSDK().api.integration.connect.key({
-        integrationID: props.provider,
-        location: location(),
-        key: apiKey,
-      })
-      await complete()
+      try {
+        await serverSDK().api.integration.connect.key({
+          integrationID: props.provider,
+          location: location(),
+          key: apiKey,
+        })
+        await complete()
+      } catch (error) {
+        setFormStore("error", formatError(error, language.t("common.requestFailed")))
+      }
     }
 
     if (newLayout())
@@ -1141,7 +1158,7 @@ function ProviderConnection(props: {
                 </div>
               </div>
             </Match>
-            <Match when={store.methodIndex === undefined}>
+            <Match when={store.methodIndex === undefined && store.state !== "error"}>
               <MethodSelection />
             </Match>
             <Match when={store.state === "pending"}>

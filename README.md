@@ -213,7 +213,7 @@ Kimi API 是默认模型入口。ACP / CLI 只产生模型事件，作为兼容�
 │   ├── Sources/KimiAgentCore/       # Swift WebRuntime、安全策略、原生 Adapter
 │   ├── Sources/KimiNativeBridge/    # 引擎 ↔ Swift JSON 原生桥接
 │   └── Sources/KimiAgentCoreChecks/ # Swift 原生闭环与故障注入检查
-├── src/engine/                    # Kimi 引擎配置与启动环境
+├── src/engine/                    # Kimi 引擎启动环境（引擎配置由应用启动时生成）
 ├── scripts/                         # 融合、打包、签名脚本
 ├── docs/GITHUB_RELEASES.md          # GitHub Release / 公证 Runbook
 ├── media/kimi.svg                   # 项目图标
@@ -232,9 +232,8 @@ npm install
 # 旧项目的 TypeScript 检查、JS 单测、Swift CoreChecks
 npm run verify
 
-# 安装并准备执行引擎依赖与 Kimi Profile
+# 安装执行引擎依赖（引擎配置由应用在启动时生成，无需额外准备步骤）
 npm run engine:install
-npm run engine:prepare
 
 # 编译 Kimi 原生 SwiftUI 应用
 npm run native:build
