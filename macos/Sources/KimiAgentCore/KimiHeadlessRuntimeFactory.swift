@@ -58,6 +58,15 @@ public enum KimiHeadlessRuntimeFactory {
     // process environment explicit while emitting the canonical file URL.
     let plugin = filePluginSpec(pluginPath)
     let bridge = environment["KIMI_NATIVE_BRIDGE"] ?? resourcesDirectory.appendingPathComponent("native/KimiNativeBridge").path
+    // Fail closed on missing integration files. Without the plugin the engine
+    // silently falls back to its built-in webfetch (no private-address checks)
+    // and native browser/computer tools would only error at call time; without
+    // the bridge every native tool call would fail mid-session. Refusing to
+    // start surfaces the broken install immediately instead.
+    guard let pluginFilePath = Self.localFilePath(pluginPath),
+          fileManager.fileExists(atPath: pluginFilePath),
+          let bridgeFilePath = Self.localFilePath(bridge),
+          fileManager.isExecutableFile(atPath: bridgeFilePath) else { return nil }
     let resolvedModelID: String
     if let modelID, !modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       resolvedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -171,7 +180,11 @@ public enum KimiHeadlessRuntimeFactory {
       "small_model": "\(KimiRuntimeIdentityStore.providerID)/\(smallModelID ?? modelID)",
       "plugin": pluginEntry,
       "provider": providerEntries,
-      "permission": ["read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "websearch": "allow", "webfetch": "allow", "task": "allow", "bash": "ask", "edit": "ask", "external_directory": "ask", "question": "ask", "skill": "ask"],
+      // webfetch stays "ask" as a fail-safe: the Kimi plugin registers its own
+      // SSRF-defended webfetch that never consults this rule, so normal fetches
+      // are unaffected; only the engine's unguarded built-in fallback (reached
+      // if the plugin fails to load) is forced back onto the approval path.
+      "permission": ["read": "allow", "glob": "allow", "grep": "allow", "list": "allow", "websearch": "allow", "webfetch": "ask", "task": "allow", "bash": "ask", "edit": "ask", "external_directory": "ask", "question": "ask", "skill": "ask"],
       "compaction": ["auto": true, "prune": true, "tail_turns": 8, "preserve_recent_tokens": 24000],
       "tool_output": ["max_lines": 2000, "max_bytes": 51200]
     ]
@@ -208,5 +221,18 @@ public enum KimiHeadlessRuntimeFactory {
     let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     if value.lowercased().hasPrefix("file://") { return value }
     return URL(fileURLWithPath: value).absoluteString
+  }
+
+  /// Both KIMI_RUNTIME_PLUGIN (engine-fusion.mjs passes a file:// URL) and
+  /// KIMI_NATIVE_BRIDGE (plain path) must be resolved back to a filesystem
+  /// path before existence checks; anything else means a broken install.
+  private static func localFilePath(_ raw: String) -> String? {
+    let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty else { return nil }
+    if value.lowercased().hasPrefix("file://") {
+      guard let url = URL(string: value), url.isFileURL else { return nil }
+      return url.path(percentEncoded: false)
+    }
+    return value
   }
 }

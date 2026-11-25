@@ -2950,6 +2950,33 @@ if case .success = busyResult {
 _ = try awaitValue { await laneBusyHarness.abort(busyOperation); return true }
 let abortedSnapshot = try awaitValue { await laneBusyHarness.snapshot() }
 expect(abortedSnapshot.operations[busyOperation]?.state == .aborted, "Abort 必须产生可恢复的 aborted 状态")
+// A driver may ignore task cancellation until its underlying engine request stops.
+// Abort must therefore reserve the lane until run() reaches its release path.
+let startedGate = OneShotAsyncGate()
+let releaseGate = OneShotAsyncGate()
+let nonCooperativeHarness = AgentHarness(store: HarnessEventStore(), driver: { _, _ in
+  await startedGate.open()
+  await releaseGate.wait()
+})
+let nonCooperativeOperation = try awaitValue {
+  try await nonCooperativeHarness.prompt(PromptInput(text: "不可协作取消"), lane: .main)
+}
+_ = try awaitValue { await startedGate.wait(); return true }
+_ = try awaitValue { await nonCooperativeHarness.abort(nonCooperativeOperation); return true }
+var promptRejectedBeforeDriverExit = false
+do {
+  _ = try awaitValue { try await nonCooperativeHarness.prompt(PromptInput(text: "取消后立即提交"), lane: .main) }
+} catch {
+  promptRejectedBeforeDriverExit = true
+}
+expect(promptRejectedBeforeDriverExit, "Driver 尚未退出时 Abort 后仍必须保持 Lane 占用")
+_ = try awaitValue { await releaseGate.open(); return true }
+_ = try awaitValue { try await nonCooperativeHarness.wait(for: nonCooperativeOperation, timeout: 1); return true }
+let promptAfterDriverExit = try awaitValue {
+  try await nonCooperativeHarness.prompt(PromptInput(text: "Driver 退出后提交"), lane: .main)
+}
+_ = try awaitValue { try await nonCooperativeHarness.wait(for: promptAfterDriverExit, timeout: 1); return true }
+
 
 let suspendedHarness = AgentHarness(
   store: HarnessEventStore(),
@@ -3463,13 +3490,22 @@ expect(displayEvent.displayText == "你好", "Kimi Event 必须提供稳定的 U
 let endpoint = KimiRuntimeEndpoint(host: "127.0.0.1", port: 43127, token: "test-token")
 expect(endpoint.baseURL.absoluteString == "http://127.0.0.1:43127", "Headless Runtime 必须只生成 loopback endpoint")
 expect(endpoint.authorizationHeader.hasPrefix("Basic "), "Headless 引擎 必须使用 Basic kimi:token 认证")
+
+// Fail-closed 夹具：工厂只允许在原生插件文件与可执行桥接二进制真实存在时启动引擎。
+let stubPluginURL = temporaryDirectory.appendingPathComponent("kimi-native-plugin-stub.mjs")
+try! "// stub plugin".write(to: stubPluginURL, atomically: true, encoding: .utf8)
+let stubBridgeURL = temporaryDirectory.appendingPathComponent("stub-native/KimiNativeBridge", isDirectory: false)
+try! FileManager.default.createDirectory(at: stubBridgeURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+try! "#!/bin/sh\nexit 0\n".write(to: stubBridgeURL, atomically: true, encoding: .utf8)
+try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stubBridgeURL.path)
+
 let headlessFactoryConfiguration = KimiHeadlessRuntimeFactory.makeConfiguration(
   resourcesDirectory: temporaryDirectory,
   applicationSupportDirectory: temporaryDirectory.appendingPathComponent("support", isDirectory: true),
   environment: [
     "KIMI_RUNTIME_BINARY": "/bin/echo",
     "KIMI_API_KEY": "test-key",
-    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path, "KIMI_NATIVE_BRIDGE": stubBridgeURL.path
   ]
 )
 let headlessFactoryConfigJSON = headlessFactoryConfiguration?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
@@ -3487,6 +3523,57 @@ expect(headlessFactoryConfiguration?.environment["XDG_DATA_HOME"]?.hasSuffix("ru
   && headlessFactoryConfiguration?.environment["XDG_STATE_HOME"]?.hasSuffix("runtime/state") == true,
   "Headless 引擎的所有可写目录必须收编进 Application Support/runtime，禁止泄漏到 ~/.config 或 ~/.local")
 expect(headlessFactoryConfig["$schema"] == nil, "引擎配置不得携带暴露来源的 $schema 链接")
+expect((headlessFactoryConfig["permission"] as? [String: Any])?["webfetch"] as? String == "ask",
+  "webfetch 权限必须保持 ask 兜底：插件自带的 webfetch 不经此规则，只有引擎内置无 SSRF 防护的回退实现会被强制走审批")
+
+// Fail-closed：插件或原生桥接缺失时，工厂必须拒绝生成引擎配置（返回 nil），而不是让引擎静默回退到无防护的内置 webfetch。
+let missingPluginConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: temporaryDirectory.appendingPathComponent("support-missing-plugin", isDirectory: true),
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": temporaryDirectory.appendingPathComponent("does-not-exist-plugin.mjs").path,
+    "KIMI_NATIVE_BRIDGE": stubBridgeURL.path
+  ]
+)
+expect(missingPluginConfig == nil, "插件文件不存在时必须拒绝启动引擎（fail-closed）")
+let missingBridgeConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: temporaryDirectory.appendingPathComponent("support-missing-bridge", isDirectory: true),
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path,
+    "KIMI_NATIVE_BRIDGE": temporaryDirectory.appendingPathComponent("does-not-exist-bridge").path
+  ]
+)
+expect(missingBridgeConfig == nil, "原生桥接二进制不存在时必须拒绝启动引擎（fail-closed）")
+let nonExecutableBridgeURL = temporaryDirectory.appendingPathComponent("stub-native/NotExecutableBridge", isDirectory: false)
+try! "#!/bin/sh\nexit 0\n".write(to: nonExecutableBridgeURL, atomically: true, encoding: .utf8)
+try! FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: nonExecutableBridgeURL.path)
+let nonExecutableBridgeConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: temporaryDirectory.appendingPathComponent("support-nonexec-bridge", isDirectory: true),
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path,
+    "KIMI_NATIVE_BRIDGE": nonExecutableBridgeURL.path
+  ]
+)
+expect(nonExecutableBridgeConfig == nil, "桥接文件存在但不可执行时也必须拒绝启动引擎（fail-closed）")
+let fileURLPluginConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
+  resourcesDirectory: temporaryDirectory,
+  applicationSupportDirectory: temporaryDirectory.appendingPathComponent("support-file-url-plugin", isDirectory: true),
+  environment: [
+    "KIMI_RUNTIME_BINARY": "/bin/echo",
+    "KIMI_API_KEY": "test-key",
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.absoluteString,
+    "KIMI_NATIVE_BRIDGE": stubBridgeURL.path
+  ]
+)
+expect(fileURLPluginConfig != nil, "KIMI_RUNTIME_PLUGIN 传 file:// URL 时也必须能通过存在性校验（engine-fusion.mjs 的传参形式）")
 
 // MCP server entry engine config schema validation
 let localMcpEntry = KimiMCPServerEntry(
@@ -3538,7 +3625,7 @@ let mcpFactoryConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
   environment: [
     "KIMI_RUNTIME_BINARY": "/bin/echo",
     "KIMI_API_KEY": "test-key",
-    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path, "KIMI_NATIVE_BRIDGE": stubBridgeURL.path
   ]
 )
 let mcpFactoryConfigJSON = mcpFactoryConfig?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
@@ -3565,7 +3652,7 @@ let mcpFactoryConfig2 = KimiHeadlessRuntimeFactory.makeConfiguration(
   environment: [
     "KIMI_RUNTIME_BINARY": "/bin/echo",
     "KIMI_API_KEY": "test-key",
-    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path, "KIMI_NATIVE_BRIDGE": stubBridgeURL.path
   ]
 )
 let mcpFactoryConfigJSON2 = mcpFactoryConfig2?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
@@ -3610,7 +3697,7 @@ let hookFactoryConfigNoRules = KimiHeadlessRuntimeFactory.makeConfiguration(
   environment: [
     "KIMI_RUNTIME_BINARY": "/bin/echo",
     "KIMI_API_KEY": "test-key",
-    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path, "KIMI_NATIVE_BRIDGE": stubBridgeURL.path
   ]
 )
 let hookFactoryConfigNoRulesJSON = hookFactoryConfigNoRules?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
@@ -3626,7 +3713,7 @@ let hookFactoryConfigWithRules = KimiHeadlessRuntimeFactory.makeConfiguration(
   environment: [
     "KIMI_RUNTIME_BINARY": "/bin/echo",
     "KIMI_API_KEY": "test-key",
-    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path, "KIMI_NATIVE_BRIDGE": stubBridgeURL.path
   ]
 )
 let hookFactoryConfigWithRulesJSON = hookFactoryConfigWithRules?.environment["OPENCODE_CONFIG_CONTENT"] ?? "{}"
@@ -3646,7 +3733,7 @@ let smallModelConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
   environment: [
     "KIMI_RUNTIME_BINARY": "/bin/echo",
     "KIMI_API_KEY": "test-key",
-    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs",
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path, "KIMI_NATIVE_BRIDGE": stubBridgeURL.path,
     "KIMI_SMALL_MODEL": "kimi-k2-lite"
   ],
   modelID: "kimi-k2.7-code"
@@ -3663,7 +3750,7 @@ let defaultSmallModelConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
   environment: [
     "KIMI_RUNTIME_BINARY": "/bin/echo",
     "KIMI_API_KEY": "test-key",
-    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs"
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path, "KIMI_NATIVE_BRIDGE": stubBridgeURL.path
   ],
   modelID: "kimi-k2.7-code"
 )
@@ -3676,7 +3763,7 @@ let sameAsMainConfig = KimiHeadlessRuntimeFactory.makeConfiguration(
   environment: [
     "KIMI_RUNTIME_BINARY": "/bin/echo",
     "KIMI_API_KEY": "test-key",
-    "KIMI_RUNTIME_PLUGIN": "/tmp/kimi-native-plugin.mjs",
+    "KIMI_RUNTIME_PLUGIN": stubPluginURL.path, "KIMI_NATIVE_BRIDGE": stubBridgeURL.path,
     "KIMI_SMALL_MODEL": " kimi-k2.7-code "
   ],
   modelID: "kimi-k2.7-code"
@@ -4313,7 +4400,7 @@ expect(historyState.recentProjects.first == "/tmp/history-proj", "新建会话�
 let factoryOverride = KimiHeadlessRuntimeFactory.makeConfiguration(
   resourcesDirectory: URL(fileURLWithPath: "/tmp", isDirectory: true),
   applicationSupportDirectory: URL(fileURLWithPath: "/tmp", isDirectory: true),
-  environment: ["KIMI_RUNTIME_BINARY": "/bin/sh"],
+  environment: ["KIMI_RUNTIME_BINARY": "/bin/sh", "KIMI_RUNTIME_PLUGIN": stubPluginURL.path, "KIMI_NATIVE_BRIDGE": stubBridgeURL.path],
   modelID: "kimi-k3",
   modelCatalog: ["kimi-k2.7-code", "kimi-k3"],
   endpointOverride: KimiRuntimeEndpoint(port: 43_999, token: "fixed-token")

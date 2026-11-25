@@ -125,6 +125,9 @@ public actor KimiAppKernel {
   private var state: KimiUIState
   private var operationSessions: [OperationID: String] = [:]
   private var sessionOperations: [String: OperationID] = [:]
+  /// Restored Harness operations have no engine continuation token. Keep them
+  /// explicit instead of allowing `resume` to replay the original prompt.
+  private var restartSuspendedOperations: Set<OperationID> = []
   private var permissionOperations: [UUID: OperationID] = [:]
   private var effectByToolCall: [String: UUID] = [:]
   private var eventTasks: [String: Task<Void, Never>] = [:]
@@ -272,7 +275,16 @@ public actor KimiAppKernel {
   }
 
   public func startRuntime() async {
-    try? await harness.restore()
+    var restoreError: String?
+    do {
+      try await harness.restore()
+    } catch {
+      // Recovery is best-effort, but never silent: a corrupt or partially
+      // unreadable journal must be visible before the user submits work.
+      restoreError = "本地执行记录恢复失败：\(error.localizedDescription)"
+    }
+    let restoredSnapshot = await harness.snapshot()
+    restartSuspendedOperations = Set(restoredSnapshot.operations.values.filter { $0.state == .suspended }.map(\.id))
     // Engine permission requests live only inside the engine process and the
     // in-memory operation mapping dies with the app, so a restored approval
     // card could never be answered. Drop it instead of leaving a dead button.
@@ -281,7 +293,7 @@ public actor KimiAppKernel {
     state.busySessionIDs.removeAll()
     guard let runtimeSupervisor else {
       state.runtimeState = .degraded
-      state.lastError = "后台执行引擎尚未打包或未配置。"
+      state.lastError = restoreError ?? "后台执行引擎尚未打包或未配置。"
       publish(.runtimeChanged(.degraded))
       publish(.error(state.lastError ?? "后台执行引擎尚未连接。"))
       persistState()
@@ -304,6 +316,14 @@ public actor KimiAppKernel {
       await refreshModelCatalog()
       if let commands = try? await sessionClient.fetchCommands(directory: nil), !commands.isEmpty {
         state.availableCommands = commands
+      }
+      if let restoreError {
+        state.lastError = restoreError
+        publish(.error(restoreError))
+      } else if !restartSuspendedOperations.isEmpty {
+        let message = "上次运行在应用退出时中断。为避免重复执行副作用，不能自动续行；请先中止该任务，再重新提交。"
+        state.lastError = message
+        publish(.error(message))
       }
       persistState()
     } catch {
@@ -531,6 +551,7 @@ public actor KimiAppKernel {
         try await sessionClient.abort(sessionID: sessionID, directory: directoryForSession(sessionID))
       }
       await harness.abort(operationID)
+      restartSuspendedOperations.remove(operationID)
 
     case let .approve(permissionID):
       await respondToPermission(permissionID, reply: "once")
@@ -621,6 +642,13 @@ public actor KimiAppKernel {
       try await send(.prompt(prompt))
 
     case .resume:
+      let harnessSnapshot = await harness.snapshot()
+      if let operationID = harnessSnapshot.lanes[.main]?.activeOperation, restartSuspendedOperations.contains(operationID) {
+        let message = "该任务是在应用重启前中断的，当前引擎没有安全的续行令牌。请先中止该任务，再重新提交。"
+        state.lastError = message
+        publish(.error(message))
+        break
+      }
       try await harness.resume(.main)
 
     case .openTerminal:

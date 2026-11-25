@@ -823,9 +823,12 @@ public actor AgentHarness {
   public func prompt(_ input: PromptInput, lane: LaneID = .main) async throws -> OperationID {
     guard !input.text.isEmpty else { throw HarnessError.invalidOperation(UUID()) }
     var laneState = snapshotValue.lanes[lane] ?? HarnessLaneState(id: lane)
-    if let active = laneState.activeOperation,
-       let operation = snapshotValue.operations[active],
-       !operation.state.isTerminal {
+    // An active operation reserves its lane until `run` observes that the
+    // driver has actually stopped and calls `releaseLane`. Terminal state is
+    // not sufficient here: abort() persists `.aborted` before cancellation
+    // cooperates, and admitting a new prompt at that point can race the old
+    // driver (and any in-flight tool effect).
+    if let active = laneState.activeOperation {
       throw HarnessError.laneBusy(lane, active)
     }
 
@@ -1062,7 +1065,20 @@ public actor AgentHarness {
             isError: true
           )
         )
-        try? await publish(.toolResultRecorded, operationID: operationID, lane: restored.operations[operationID]?.lane ?? .main, payload: try? JSONEncoder().encode(synthetic))
+        let lane = restored.operations[operationID]?.lane ?? .main
+        try? await publish(.toolResultRecorded, operationID: operationID, lane: lane, payload: try? JSONEncoder().encode(synthetic))
+
+        // `publish(.toolResultRecorded, ...)` persists the synthetic event but
+        // does not pass through `receive`, so keep the durable checkpoint in
+        // lockstep with the event log. The interrupted tool is explicitly
+        // failed/uncertain; it must not remain resumable as an active call.
+        if var checkpoint = snapshotValue.checkpoints[operationID] {
+          checkpoint.activeToolCallIDs.removeAll { $0 == call.call.id }
+          checkpoint.status = .failed
+          checkpoint.updatedAt = .now
+          snapshotValue.checkpoints[operationID] = checkpoint
+          try? await publish(.snapshotPublished, operationID: operationID, lane: lane, payload: try? JSONEncoder().encode(checkpoint))
+        }
       }
     }
   }
